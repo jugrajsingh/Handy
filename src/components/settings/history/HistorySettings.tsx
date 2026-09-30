@@ -2,10 +2,12 @@ import React, {
   useCallback,
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
 } from "react";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
 import {
   Check,
@@ -23,23 +25,34 @@ import { notify } from "@/stores/noticeStore";
 import {
   commands,
   events,
+  type HistoryCompareView,
   type HistoryEntry,
-  type HistoryUpdatePayload,
 } from "@/bindings";
 import { useOsType } from "@/hooks/useOsType";
 import {
   useTranscriptionJobsStore,
   type ActiveJobStatus,
 } from "@/stores/transcriptionJobsStore";
+import { useSettings } from "@/hooks/useSettings";
+import { useSettingsStore } from "@/stores/settingsStore";
+import { cleanedText, historyCopyText } from "@/lib/utils/historyPresentation";
 import { formatDateTime } from "@/utils/dateFormat";
 import { AudioPlayer, AudioPlayerGroup } from "../../ui/AudioPlayer";
 import { Button } from "../../ui/Button";
+import { Dropdown } from "../../ui/Dropdown";
 import { copyToClipboard } from "./clipboard";
 import {
   pickAndTranscribeFiles,
   useFileReadsStore,
   type FileRead,
 } from "./transcribeFiles";
+import { HistoryCompare } from "./HistoryCompare";
+import {
+  PageGeneration,
+  createHistoryActions,
+  createHistoryPageLoader,
+  reloadHistoryOnUpdate,
+} from "./pageGeneration";
 
 const IconButton: React.FC<{
   onClick: () => void;
@@ -129,6 +142,15 @@ export const HistorySettings: React.FC = () => {
   const osType = useOsType();
   const jobs = useTranscriptionJobsStore((state) => state.jobs);
   const reads = useFileReadsStore((state) => state.reads);
+  const { getSetting } = useSettings();
+  const changeCompareView = useSettingsStore(
+    (state) => state.changeHistoryCompareView,
+  );
+  const view = getSetting("history_compare_view") ?? "diff";
+  const [actionError, setActionError] = useState<string | null>(null);
+  const [clearing, setClearing] = useState(false);
+  const [changingView, setChangingView] = useState(false);
+  const generation = useRef(new PageGeneration());
   const [entries, setEntries] = useState<HistoryEntry[]>([]);
   const [loading, setLoading] = useState(true);
   const [hasMore, setHasMore] = useState(true);
@@ -141,37 +163,46 @@ export const HistorySettings: React.FC = () => {
     entriesRef.current = entries;
   }, [entries]);
 
-  const loadPage = useCallback(async (cursor?: number) => {
-    const isFirstPage = cursor === undefined;
-    if (!isFirstPage && loadingRef.current) return;
-    loadingRef.current = true;
+  const { loadPage, loadPageChecked } = useMemo(
+    () =>
+      createHistoryPageLoader({
+        generation: generation.current,
+        loadingRef,
+        fetchPage: commands.getHistoryEntries,
+        setEntries,
+        setLoading,
+        setHasMore,
+        setError: setActionError,
+      }),
+    [],
+  );
 
-    if (isFirstPage) setLoading(true);
-
-    try {
-      const result = await commands.getHistoryEntries(
-        cursor ?? null,
-        PAGE_SIZE,
-      );
-      if (result.status === "ok") {
-        const { entries: newEntries, has_more } = result.data;
-        setEntries((prev) => {
-          if (isFirstPage) return newEntries;
-          const existingIds = new Set(prev.map((entry) => entry.id));
-          return [
-            ...prev,
-            ...newEntries.filter((entry) => !existingIds.has(entry.id)),
-          ];
-        });
-        setHasMore(has_more);
-      }
-    } catch (error) {
-      console.error("Failed to load history entries:", error);
-    } finally {
-      setLoading(false);
-      loadingRef.current = false;
-    }
-  }, []);
+  const { clearHistory, changeView } = useMemo(
+    () =>
+      createHistoryActions({
+        getSummary: commands.getHistoryClearSummary,
+        clear: commands.clearHistory,
+        reload: loadPageChecked,
+        changeCompareView,
+        confirm: (summary) =>
+          ask(
+            t("settings.history.clearConfirmation", {
+              count: summary.entries,
+              recordings: summary.recordings,
+            }),
+            {
+              title: t("settings.history.clearHistory"),
+              kind: "warning",
+              okLabel: t("settings.history.clearHistory"),
+              cancelLabel: t("common.cancel"),
+            },
+          ),
+        setClearing,
+        setChangingView,
+        setError: setActionError,
+      }),
+    [changeCompareView, loadPageChecked, t],
+  );
 
   // Initial load
   useEffect(() => {
@@ -205,17 +236,7 @@ export const HistorySettings: React.FC = () => {
   // Listen for new entries added from the transcription pipeline
   useEffect(() => {
     const unlisten = events.historyUpdatePayload.listen((event) => {
-      const payload: HistoryUpdatePayload = event.payload;
-      if (payload.action === "added") {
-        setEntries((prev) => [
-          payload.entry,
-          ...prev.filter((entry) => entry.id !== payload.entry.id),
-        ]);
-      } else if (payload.action === "updated") {
-        setEntries((prev) =>
-          prev.map((e) => (e.id === payload.entry.id ? payload.entry : e)),
-        );
-      }
+      reloadHistoryOnUpdate(event.payload, loadPage);
       // "deleted" and "toggled" are handled by optimistic updates only,
       // so we intentionally ignore them here to avoid double-mutation.
     });
@@ -223,7 +244,7 @@ export const HistorySettings: React.FC = () => {
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, []);
+  }, [loadPage]);
 
   const toggleSaved = async (id: number) => {
     // Optimistic update
@@ -330,8 +351,10 @@ export const HistorySettings: React.FC = () => {
                 key={entry.id}
                 entry={entry}
                 job={jobs[entry.id]}
+                view={view}
                 onToggleSaved={() => toggleSaved(entry.id)}
-                onCopyText={() => copyToClipboard(entry.transcription_text)}
+                onCopyText={() => copyToClipboard(historyCopyText(entry))}
+                onCopyRaw={() => copyToClipboard(entry.transcription_text)}
                 getAudioUrl={getAudioUrl}
                 deleteAudio={deleteAudioEntry}
                 retryTranscription={commands.retryHistoryEntryTranscription}
@@ -349,18 +372,34 @@ export const HistorySettings: React.FC = () => {
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
       <div className="space-y-2">
-        <div className="px-4 flex items-center justify-between">
+        <div className="px-4 flex flex-wrap items-center justify-between gap-2">
           <div>
             <h2 className="text-xs font-medium text-ink-3 uppercase tracking-wide">
               {t("settings.history.title")}
             </h2>
           </div>
-          <div className="flex items-center gap-2">
-            <HeaderButton
-              onClick={transcribeFile}
-              label={t("settings.history.transcribeFile")}
-              icon={FilePlus}
+          <div className="flex flex-wrap items-center gap-2">
+            <Dropdown
+              options={(
+                ["diff", "side_by_side", "stacked"] as HistoryCompareView[]
+              ).map((value) => ({
+                value,
+                label: t(`settings.history.compare.${value}`),
+              }))}
+              selectedValue={view}
+              onSelect={(next) => void changeView(next)}
+              disabled={changingView}
+              placeholder={t("settings.history.compare.title")}
             />
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={clearing}
+              onClick={() => void clearHistory()}
+            >
+              {t("settings.history.clearHistory")}
+            </Button>
+            <HeaderButton onClick={transcribeFile} label={t("settings.history.transcribeFile")} icon={FilePlus} />
             <HeaderButton
               onClick={openRecordingsFolder}
               label={t("settings.history.openFolder")}
@@ -368,7 +407,12 @@ export const HistorySettings: React.FC = () => {
             />
           </div>
         </div>
-        <div className="bg-background border border-line rounded-lg overflow-visible">
+        {actionError && (
+          <p role="alert" className="px-4 text-sm text-red-500">
+            {actionError}
+          </p>
+        )}
+        <div className="bg-background border border-mid-gray/20 rounded-lg overflow-visible">
           {content}
         </div>
       </div>
@@ -379,8 +423,10 @@ export const HistorySettings: React.FC = () => {
 interface HistoryEntryProps {
   entry: HistoryEntry;
   job?: ActiveJobStatus;
+  view: HistoryCompareView;
   onToggleSaved: () => void;
   onCopyText: () => Promise<boolean>;
+  onCopyRaw: () => Promise<boolean>;
   getAudioUrl: (fileName: string) => Promise<string | null>;
   deleteAudio: (id: number) => Promise<void>;
   retryTranscription: (id: number) => Promise<void>;
@@ -390,8 +436,10 @@ interface HistoryEntryProps {
 const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   entry,
   job,
+  view,
   onToggleSaved,
   onCopyText,
+  onCopyRaw,
   getAudioUrl,
   deleteAudio,
   retryTranscription,
@@ -410,7 +458,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   useEffect(() => {
     if (!retrying) setCancelling(false);
   }, [retrying]);
-  const hasTranscription = entry.transcription_text.trim().length > 0;
+  const hasTranscription = historyCopyText(entry).trim().length > 0;
   const folded = hasTranscription && !retrying && !expanded;
 
   // Offer "Show more" only when the folded text is actually cut off.
@@ -534,6 +582,9 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
         </div>
       </div>
 
+      {!retrying && cleanedText(entry) !== null ? (
+        <HistoryCompare entry={entry} view={view} onCopyRaw={onCopyRaw} />
+      ) : (
       <div className="flex flex-col items-start gap-1 pb-2">
         <p
           ref={textRef}
@@ -579,6 +630,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
           </button>
         )}
       </div>
+      )}
 
       <AudioPlayer onLoadRequest={handleLoadAudio} className="w-full" />
     </div>
