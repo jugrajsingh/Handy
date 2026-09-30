@@ -9,6 +9,9 @@ pub mod manager;
 pub mod prompt;
 pub mod registry;
 
+#[cfg(test)]
+mod integration_tests;
+
 pub use manager::{LocalLlmManager, LocalLlmStatus};
 
 use crate::managers::audio::AudioRecordingManager;
