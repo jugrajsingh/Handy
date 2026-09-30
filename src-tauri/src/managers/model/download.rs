@@ -380,5 +380,34 @@ impl ModelManager {
     }
 }
 
+impl ModelManager {
+    /// Downloads verified bytes into the partial; returns false on cancellation and deletes mismatches.
+    pub(crate) async fn download_verified_artifact(
+        artifact_id: &str,
+        url: &str,
+        partial_path: &Path,
+        expected_size: u64,
+        expected_sha256: &str,
+        cancel_token: &CancellationToken,
+        on_progress: &(dyn Fn(&DownloadProgress) + Send + Sync),
+    ) -> Result<bool> {
+        let outcome = Self::download_http_resumable_with_events(
+            artifact_id,
+            url,
+            partial_path,
+            Some(expected_size),
+            Some(expected_sha256),
+            cancel_token,
+            &|event| {
+                if let HttpDownloadEvent::Progress(progress) = event {
+                    on_progress(progress);
+                }
+            },
+        )
+        .await?;
+        Ok(matches!(outcome, HttpDownloadOutcome::Completed))
+    }
+}
+
 #[cfg(test)]
 mod tests;
