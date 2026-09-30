@@ -1,19 +1,18 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   commands,
   type LocalLlmContext,
   type LocalLlmModelInfo,
-  type LocalLlmStatus,
   type LocalLlmStructure,
   type LocalLlmStyling,
 } from "@/bindings";
 import { Dropdown, SettingContainer } from "@/components/ui";
 import { Alert } from "../../ui/Alert";
-import { Button } from "../../ui/Button";
 import { useSettings } from "../../../hooks/useSettings";
+import { useLocalLlmStatus } from "../../../hooks/useLocalLlmStatus";
+import { LocalLlmModelList } from "./LocalLlmModelList";
 import {
   initializeLocalLlmDownloadProgress,
   useLocalLlmDownloadStore,
@@ -34,14 +33,14 @@ const CONTEXTS: LocalLlmContext[] = ["general", "email"];
 export const useLocalLlmModels = () => {
   const [models, setModels] = useState<LocalLlmModelInfo[]>([]);
   const version = useLocalLlmDownloadStore((state) => state.version);
-  const reload = useCallback(async () => {
-    await commands
-      .getLocalLlmModels()
-      .then(setModels)
-      .catch((error: unknown) => {
-        console.error("Failed to load local LLM models:", error);
-      });
+  const reloadChecked = useCallback(async () => {
+    setModels(await commands.getLocalLlmModels());
   }, []);
+  const reload = useCallback(async () => {
+    await reloadChecked().catch((error: unknown) => {
+      console.error("Failed to load local LLM models:", error);
+    });
+  }, [reloadChecked]);
   useEffect(() => {
     void initializeLocalLlmDownloadProgress().catch((error: unknown) => {
       console.error("Failed to listen for local LLM download progress:", error);
@@ -50,50 +49,26 @@ export const useLocalLlmModels = () => {
   useEffect(() => {
     void reload();
   }, [reload, version]);
-  return { models, reload };
+  return { models, reload, reloadChecked };
 };
 
 export const LocalLlmSettings: React.FC = () => {
   const { t } = useTranslation();
-  const { getSetting, updateSetting, refreshSettings } = useSettings();
-  const { models, reload } = useLocalLlmModels();
-  const [status, setStatus] = useState<LocalLlmStatus | null>(null);
+  const { getSetting, updateSetting, refreshSettingsChecked } = useSettings();
+  const { models, reloadChecked } = useLocalLlmModels();
+  const { status, error: statusError } = useLocalLlmStatus();
   const downloadModelId = useLocalLlmDownloadStore((state) => state.modelId);
   const percentage = useLocalLlmDownloadStore((state) => state.percentage);
   const downloadError = useLocalLlmDownloadStore((state) => state.error);
   const clearError = useLocalLlmDownloadStore((state) => state.clearError);
   const download = useLocalLlmDownloadStore((state) => state.download);
-  const [deleting, setDeleting] = useState(false);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
 
   const selectedId = getSetting("local_llm_model_id") ?? null;
   const selected = models.find((m) => m.id === selectedId) ?? null;
-  const busy = deleting || downloadModelId !== null;
-  const progress = downloadModelId === selectedId ? percentage : null;
-  const error = downloadError ?? actionError;
-
-  useEffect(() => {
-    void commands
-      .getLocalLlmStatus()
-      .then(setStatus)
-      .catch((error: unknown) => {
-        console.error("Failed to load local LLM status:", error);
-      });
-    const unlistenState = listen<LocalLlmStatus>(
-      "local-llm-state-changed",
-      (event) => setStatus(event.payload),
-    ).catch((error: unknown) => {
-      console.error("Failed to listen for local LLM state:", error);
-      return null;
-    });
-    return () => {
-      void unlistenState
-        .then((unlisten) => unlisten?.())
-        .catch((error: unknown) => {
-          console.error("Failed to stop listening for local LLM state:", error);
-        });
-    };
-  }, []);
+  const busy = deletingId !== null || downloadModelId !== null;
+  const error = downloadError ?? actionError ?? statusError;
 
   const handleSelect = async (id: string) => {
     clearError();
@@ -104,32 +79,34 @@ export const LocalLlmSettings: React.FC = () => {
         setActionError(result.error);
         return;
       }
-      await refreshSettings();
+      await refreshSettingsChecked();
     } catch (error: unknown) {
       setActionError(error instanceof Error ? error.message : String(error));
     }
   };
 
-  const handleDownload = async () => {
+  const handleDownload = async (id: string) => {
     clearError();
     setActionError(null);
-    if (!selected || busy) return;
-    await download(selected.id);
+    if (busy) return;
+    await download(id);
   };
 
-  const handleDelete = async () => {
+  const handleDelete = async (id: string) => {
     clearError();
     setActionError(null);
-    if (!selected || busy) return;
-    setDeleting(true);
+    if (busy) return;
+    setDeletingId(id);
     try {
-      const result = await commands.deleteLocalLlmModel(selected.id);
-      if (result.status === "error") setActionError(result.error);
+      const result = await commands.deleteLocalLlmModel(id);
+      if (result.status === "error") throw new Error(result.error);
+      useLocalLlmDownloadStore.getState().modelsChanged();
+      await reloadChecked();
+      await refreshSettingsChecked();
     } catch (error: unknown) {
       setActionError(error instanceof Error ? error.message : String(error));
     } finally {
-      setDeleting(false);
-      await reload();
+      setDeletingId(null);
     }
   };
 
@@ -147,52 +124,16 @@ export const LocalLlmSettings: React.FC = () => {
 
   return (
     <>
-      <SettingContainer
-        title={t("settings.postProcessing.localLlm.model.title")}
-        description={t("settings.postProcessing.localLlm.model.description")}
-        descriptionMode="tooltip"
-        layout="horizontal"
-        grouped={true}
-      >
-        <div className="flex items-center gap-2">
-          <Dropdown
-            options={models.map((m) => ({
-              value: m.id,
-              label: m.display_name,
-            }))}
-            selectedValue={selectedId}
-            onSelect={(value) => void handleSelect(value)}
-            disabled={busy}
-            placeholder={t(
-              "settings.postProcessing.localLlm.model.placeholder",
-            )}
-          />
-          {selected &&
-            (selected.downloaded ? (
-              <Button
-                onClick={() => void handleDelete()}
-                variant="secondary"
-                size="md"
-                disabled={busy}
-              >
-                {t("settings.postProcessing.localLlm.delete")}
-              </Button>
-            ) : (
-              <Button
-                onClick={() => void handleDownload()}
-                variant="primary"
-                size="md"
-                disabled={busy}
-              >
-                {progress === null
-                  ? t("settings.postProcessing.localLlm.download")
-                  : t("settings.postProcessing.localLlm.downloading", {
-                      percent: Math.round(progress),
-                    })}
-              </Button>
-            ))}
-        </div>
-      </SettingContainer>
+      <LocalLlmModelList
+        models={models}
+        selectedId={selectedId}
+        downloadId={downloadModelId}
+        percentage={percentage}
+        deletingId={deletingId}
+        onDownload={(id) => void handleDownload(id)}
+        onDelete={(id) => void handleDelete(id)}
+        onSelect={(id) => void handleSelect(id)}
+      />
 
       <SettingContainer
         title={t("settings.postProcessing.localLlm.status.title")}

@@ -8,7 +8,7 @@ import {
 import type { ModelOption } from "./types";
 import type { DropdownOption } from "../../ui/Dropdown";
 
-type PostProcessProviderState = {
+export type PostProcessProviderState = {
   providerOptions: DropdownOption[];
   selectedProviderId: string;
   selectedProvider: PostProcessProvider | undefined;
