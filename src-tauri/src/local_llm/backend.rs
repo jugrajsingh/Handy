@@ -28,8 +28,16 @@ pub struct GenerateRequest {
     pub timeout: Duration,
 }
 
+/// Thread-safe handle that forcibly stops the backend's running child, callable while another
+/// thread holds the backend for a blocking call.
+pub trait KillSwitch: Send + Sync {
+    fn trigger(&self);
+}
+
 /// A text-model runtime driven by `LocalLlmManager` under its mutex.
 pub trait TextModelBackend: Send {
+    /// Returns a handle independent of the backend's exclusive request lock.
+    fn kill_switch(&self) -> Arc<dyn KillSwitch>;
     /// Starts the model if it is not already running with `opts.model_path`.
     fn ensure_loaded(
         &mut self,
