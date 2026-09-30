@@ -1,3 +1,5 @@
+import { clearButtonState, shortcutLabelId } from "@/lib/utils/shortcutPresentation";
+import { notify } from "@/stores/noticeStore";
 import React, { useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { formatKeyCombination } from "../../lib/utils/keyboard";
@@ -26,7 +28,7 @@ export const ShortcutInput: React.FC<ShortcutInputProps> = ({
   disabled = false,
 }) => {
   const { t } = useTranslation();
-  const { getSetting, resetBinding, isUpdating, isLoading } = useSettings();
+  const { getSetting, resetBinding, clearBinding, isUpdating, isLoading } = useSettings();
   const osType = useOsType();
   const { capturing, partial, start, cancel } = useShortcutCapture(
     shortcutId,
@@ -87,8 +89,15 @@ export const ShortcutInput: React.FC<ShortcutInputProps> = ({
   }
 
   // Get translated name and description for the binding
+  const enabled = getSetting("post_process_enabled") ?? false;
+  const labelId = shortcutLabelId(shortcutId, enabled);
+  const clearState = clearButtonState({ enabled, id: shortcutId, isRecording: capturing, isUpdating: isUpdating(`binding_${shortcutId}`), disabled });
+  const handleClear = async () => {
+    try { await clearBinding(shortcutId); }
+    catch (error: unknown) { notify({ title: t("settings.general.shortcut.errors.set", { error: String(error) }) }); }
+  };
   const translatedName = t(
-    `settings.general.shortcut.bindings.${shortcutId}.name`,
+    `settings.general.shortcut.bindings.${labelId}.name`,
     binding.name,
   );
   const translatedDescription = t(
@@ -120,7 +129,7 @@ export const ShortcutInput: React.FC<ShortcutInputProps> = ({
             className="px-2 py-1 text-sm font-semibold bg-wash border border-line-strong hover:bg-logo-primary/10 rounded-md cursor-pointer hover:border-logo-primary"
             onClick={start}
           >
-            {formatKeyCombination(binding.current_binding, osType)}
+            {binding.current_binding ? formatKeyCombination(binding.current_binding, osType) : t("settings.general.shortcut.unassigned")}
           </div>
         )}
         <ResetButton
@@ -128,6 +137,9 @@ export const ShortcutInput: React.FC<ShortcutInputProps> = ({
           onClick={() => resetBinding(shortcutId)}
           disabled={isUpdating(`binding_${shortcutId}`)}
         />
+        {clearState.visible && (
+          <button type="button" disabled={clearState.disabled} onClick={() => void handleClear()} className="px-2 py-1 text-sm disabled:opacity-50">{t("common.clear")}</button>
+        )}
       </div>
     </SettingContainer>
   );
