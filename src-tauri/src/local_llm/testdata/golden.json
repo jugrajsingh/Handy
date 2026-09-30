@@ -1,0 +1,14 @@
+[
+  {
+    "input": "so um i need to like send the the report by uh friday no wait thursday",
+    "output": "So I need to send the report by Thursday."
+  },
+  {
+    "input": "hey can you remind me to call the dentist at three thirty tomorrow and also pick up milk",
+    "output": "Hey, can you remind me to call the dentist at 3:30 tomorrow and also pick up milk?"
+  },
+  {
+    "input": "the meeting is on october fifth at ten am in room two oh four please bring your laptop",
+    "output": "The meeting is on October 5th at 10am in room 204. Please bring your laptop."
+  }
+]
