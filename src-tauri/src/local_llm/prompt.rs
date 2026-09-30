@@ -215,9 +215,8 @@ pub fn chunk_transcript(transcript: &str, budget: u32) -> Vec<String> {
 
 /// Strips a leading think block and invisible characters, then trims.
 pub fn clean_output(raw: &str) -> String {
-    strip_invisible_chars(strip_think_block(raw))
-        .trim()
-        .to_string()
+    let visible = strip_invisible_chars(raw);
+    strip_think_block(&visible).trim().to_string()
 }
 
 /// Output guards: empty output only for inputs of at most 3 words; output
@@ -430,6 +429,10 @@ mod tests {
 
     #[test]
     fn clean_output_strips_think_block_and_invisible_chars() {
+        assert_eq!(
+            clean_output("\u{FEFF}<think>plan</think>\nHello world."),
+            "Hello world."
+        );
         assert_eq!(
             clean_output("<think>\nplan\n</think>\n\nHello\u{200B} world.\u{FEFF}\n"),
             "Hello world."
