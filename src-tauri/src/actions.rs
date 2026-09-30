@@ -2,6 +2,7 @@
 use crate::apple_intelligence;
 use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, SoundType};
 use crate::audio_toolkit::VadPolicy;
+use crate::local_llm::LocalLlmManager;
 use crate::managers::audio::{recording_notice_code, AudioRecordingManager};
 use crate::managers::history::HistoryManager;
 use crate::managers::model::ModelManager;
@@ -9,7 +10,7 @@ use crate::managers::transcription::policy::{live_decode, LiveDecode, ModelTrait
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::{Transcription, TranscriptionManager};
 use crate::notices::{self, Notice, NoticeCode, NoticeSource};
-use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
+use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID, LOCAL_LLM_PROVIDER_ID};
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
 use crate::utils::{
@@ -189,6 +190,26 @@ enum PostProcessOutcome {
     /// The user asked for it, but it couldn't run or produced nothing, so the
     /// transcript goes out as it is.
     Failed,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PostProcessRoute { LocalLlm, Remote }
+
+fn post_process_route(settings: &AppSettings) -> PostProcessRoute {
+    if settings.post_process_provider_id == LOCAL_LLM_PROVIDER_ID {
+        PostProcessRoute::LocalLlm
+    } else {
+        PostProcessRoute::Remote
+    }
+}
+
+async fn post_process_with_provider(app: &AppHandle, settings: &AppSettings, transcription: &str) -> PostProcessOutcome {
+    if is_blank_transcription(transcription) { return PostProcessOutcome::Skipped; }
+    if post_process_route(settings) == PostProcessRoute::LocalLlm {
+        let manager = app.try_state::<Arc<LocalLlmManager>>().map(|m| Arc::clone(m.inner()));
+        return crate::local_llm::post_process(manager, settings, transcription).await.map_or(PostProcessOutcome::Failed, PostProcessOutcome::Done);
+    }
+    post_process_transcription(settings, transcription).await
 }
 
 async fn post_process_transcription(
@@ -441,7 +462,7 @@ pub(crate) async fn process_transcription_output(
 
     if post_process {
         // A reply that's blank once cleaned is no better than none.
-        let outcome = match post_process_transcription(&settings, &final_text).await {
+        let outcome = match post_process_with_provider(app, &settings, &final_text).await {
             PostProcessOutcome::Done(text) => non_blank_post_processed_text(text)
                 .map_or(PostProcessOutcome::Failed, PostProcessOutcome::Done),
             outcome => outcome,
@@ -486,6 +507,7 @@ impl ShortcutAction for TranscribeAction {
         // Load ASR model and VAD model in parallel
         let kickoff_started = Instant::now();
         let load_started = tm.initiate_model_load(true);
+        if self.post_process { crate::local_llm::warm_up_for_recording(app); }
         let rm_clone = Arc::clone(&rm);
         std::thread::spawn(move || {
             if let Err(e) = rm_clone.preload_vad() {
@@ -1072,7 +1094,7 @@ mod tests {
     use super::{
         complete_unless_cancelled, is_blank_transcription, non_blank_post_processed_text,
         post_process_transcription, should_use_streaming_overlay, strip_invisible_chars,
-        strip_think_block, PostProcessOutcome,
+        strip_think_block, PostProcessOutcome, post_process_route, PostProcessRoute,
     };
     use crate::settings::{get_default_settings, AppSettings, OverlayStyle};
     use std::future;
@@ -1156,6 +1178,21 @@ mod tests {
             run_post_process(&post_process_settings(&url), "hello"),
             PostProcessOutcome::Failed
         );
+    }
+
+    #[test]
+    fn local_llm_provider_routes_locally_even_without_model_or_prompt() {
+        let mut settings = crate::settings::get_default_settings();
+        settings.post_process_provider_id = crate::settings::LOCAL_LLM_PROVIDER_ID.to_string();
+        settings
+            .post_process_models
+            .insert(settings.post_process_provider_id.clone(), String::new());
+        settings.post_process_selected_prompt_id = None;
+        assert_eq!(post_process_route(&settings), PostProcessRoute::LocalLlm);
+        for id in ["openai", "custom", "openrouter"] {
+            settings.post_process_provider_id = id.to_string();
+            assert_eq!(post_process_route(&settings), PostProcessRoute::Remote);
+        }
     }
 
     #[test]

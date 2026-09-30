@@ -203,6 +203,7 @@ pub enum HealthError {
 }
 
 /// Polls `GET /health` until 200, the child exits, the deadline passes or `cancel` is set.
+#[cfg(test)]
 pub fn wait_healthy(
     client: &reqwest::blocking::Client,
     port: u16,

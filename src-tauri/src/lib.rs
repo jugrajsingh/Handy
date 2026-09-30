@@ -214,12 +214,14 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     );
     let history_manager =
         Arc::new(HistoryManager::new(app_handle).expect("Failed to initialize history manager"));
+    let local_llm_manager = local_llm::create_manager(app_handle);
 
     // Add managers to Tauri's managed state
     app_handle.manage(recording_manager.clone());
     app_handle.manage(model_manager.clone());
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());
+    app_handle.manage(local_llm_manager);
     app_handle.manage(tray::TrayState::new());
     app_handle.manage(TranscriptionJobManager::new(app_handle));
 
@@ -816,6 +818,14 @@ pub fn run(cli_args: CliArgs) {
             notices::get_active_notices,
             notices::dismiss_notice,
             notices::dismiss_overlay_notice,
+            local_llm::commands::get_local_llm_models,
+            local_llm::commands::download_local_llm_model,
+            local_llm::commands::delete_local_llm_model,
+            local_llm::commands::get_local_llm_status,
+            local_llm::commands::set_local_llm_model,
+            local_llm::commands::change_local_llm_styling_setting,
+            local_llm::commands::change_local_llm_structure_setting,
+            local_llm::commands::change_local_llm_context_setting,
         ])
         .events(collect_events![
             managers::history::HistoryUpdatePayload,
@@ -1190,10 +1200,9 @@ pub fn run(cli_args: CliArgs) {
             }
             show_main_window(app);
         }
-        // No transcription teardown on exit: transcribe.cpp runs only in the
-        // worker process, which exits by itself as soon as this process's end
-        // of its stdin closes, even if it is hung. Waiting on an unload here
-        // could block quitting behind a hung model load.
+        tauri::RunEvent::Exit => {
+            if let Some(llm) = app.try_state::<Arc<local_llm::LocalLlmManager>>() { llm.shutdown(); }
+        }
         _ => {}
     });
 }
