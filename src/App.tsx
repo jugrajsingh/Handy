@@ -376,7 +376,9 @@ function App() {
           </div>
         </div>
         {/* Fixed footer at bottom */}
-        <Footer />
+        <Footer
+          onOpenPostProcessing={() => setCurrentSection("postprocessing")}
+        />
       </div>
     );
   }

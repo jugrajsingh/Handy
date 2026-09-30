@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import { RefreshCcw } from "lucide-react";
 import { commands } from "@/bindings";
+import { providerGroupKey } from "@/lib/utils/localLlmPresentation";
 
 import { Alert } from "../../ui/Alert";
 import {
@@ -461,9 +462,7 @@ export const PostProcessingSettings: React.FC = () => {
       </SettingsGroup>
       <SettingsGroup
         title={t(
-          getSetting("post_process_provider_id") === LOCAL_LLM_PROVIDER_ID
-            ? "settings.postProcessing.localLlm.groupTitle"
-            : "settings.postProcessing.api.title",
+          providerGroupKey(getSetting("post_process_provider_id") ?? "openai"),
         )}
       >
         <PostProcessingSettingsApi state={state} />

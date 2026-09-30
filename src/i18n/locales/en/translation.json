@@ -461,6 +461,7 @@
         "createFirst": "Click 'Create New Prompt' above to create your first post-processing prompt."
       },
       "localLlm": {
+        "noCleanupModel": "No cleanup model",
         "groupTitle": "Local model",
         "size": "{{size}} MiB",
         "downloaded": "Downloaded",
