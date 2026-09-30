@@ -14,6 +14,10 @@ import { Dropdown, SettingContainer } from "@/components/ui";
 import { Alert } from "../../ui/Alert";
 import { Button } from "../../ui/Button";
 import { useSettings } from "../../../hooks/useSettings";
+import {
+  initializeLocalLlmDownloadProgress,
+  useLocalLlmDownloadStore,
+} from "@/stores/localLlmDownloadStore";
 
 export const LOCAL_LLM_PROVIDER_ID = "local_llm";
 
@@ -26,22 +30,26 @@ const STYLINGS: LocalLlmStyling[] = [
 const STRUCTURES: LocalLlmStructure[] = ["prose", "lists"];
 const CONTEXTS: LocalLlmContext[] = ["general", "email"];
 
-type DownloadProgressPayload = {
-  model_id: string;
-  downloaded: number;
-  total: number;
-  percentage: number;
-};
-
 /** Registry entries with their download state; `reload` re-reads them. */
 export const useLocalLlmModels = () => {
   const [models, setModels] = useState<LocalLlmModelInfo[]>([]);
+  const version = useLocalLlmDownloadStore((state) => state.version);
   const reload = useCallback(async () => {
-    setModels(await commands.getLocalLlmModels());
+    await commands
+      .getLocalLlmModels()
+      .then(setModels)
+      .catch((error: unknown) => {
+        console.error("Failed to load local LLM models:", error);
+      });
+  }, []);
+  useEffect(() => {
+    void initializeLocalLlmDownloadProgress().catch((error: unknown) => {
+      console.error("Failed to listen for local LLM download progress:", error);
+    });
   }, []);
   useEffect(() => {
     void reload();
-  }, [reload]);
+  }, [reload, version]);
   return { models, reload };
 };
 
@@ -50,59 +58,75 @@ export const LocalLlmSettings: React.FC = () => {
   const { getSetting, updateSetting, refreshSettings } = useSettings();
   const { models, reload } = useLocalLlmModels();
   const [status, setStatus] = useState<LocalLlmStatus | null>(null);
-  const [progress, setProgress] = useState<number | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const downloadModelId = useLocalLlmDownloadStore((state) => state.modelId);
+  const percentage = useLocalLlmDownloadStore((state) => state.percentage);
+  const downloadError = useLocalLlmDownloadStore((state) => state.error);
+  const download = useLocalLlmDownloadStore((state) => state.download);
+  const [deleting, setDeleting] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const selectedId = getSetting("local_llm_model_id") ?? null;
   const selected = models.find((m) => m.id === selectedId) ?? null;
+  const busy = deleting || downloadModelId !== null;
+  const progress = downloadModelId === selectedId ? percentage : null;
+  const error = downloadError ?? actionError;
 
   useEffect(() => {
-    void commands.getLocalLlmStatus().then(setStatus);
+    void commands
+      .getLocalLlmStatus()
+      .then(setStatus)
+      .catch((error: unknown) => {
+        console.error("Failed to load local LLM status:", error);
+      });
     const unlistenState = listen<LocalLlmStatus>(
       "local-llm-state-changed",
       (event) => setStatus(event.payload),
-    );
-    const unlistenProgress = listen<DownloadProgressPayload>(
-      "local-llm-download-progress",
-      (event) => setProgress(event.payload.percentage),
-    );
+    ).catch((error: unknown) => {
+      console.error("Failed to listen for local LLM state:", error);
+      return null;
+    });
     return () => {
-      void unlistenState.then((unlisten) => unlisten());
-      void unlistenProgress.then((unlisten) => unlisten());
+      void unlistenState
+        .then((unlisten) => unlisten?.())
+        .catch((error: unknown) => {
+          console.error("Failed to stop listening for local LLM state:", error);
+        });
     };
   }, []);
 
   const handleSelect = async (id: string) => {
-    const result = await commands.setLocalLlmModel(id);
-    if (result.status === "error") {
-      setError(result.error);
-      return;
+    try {
+      const result = await commands.setLocalLlmModel(id);
+      if (result.status === "error") {
+        setActionError(result.error);
+        return;
+      }
+      setActionError(null);
+      await refreshSettings();
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : String(error));
     }
-    setError(null);
-    await refreshSettings();
   };
 
   const handleDownload = async () => {
-    if (!selected) return;
-    setBusy(true);
-    setError(null);
-    setProgress(0);
-    const result = await commands.downloadLocalLlmModel(selected.id);
-    setBusy(false);
-    setProgress(null);
-    if (result.status === "error") setError(result.error);
-    await reload();
+    if (!selected || busy) return;
+    setActionError(null);
+    await download(selected.id);
   };
 
   const handleDelete = async () => {
-    if (!selected) return;
-    setBusy(true);
-    setError(null);
-    const result = await commands.deleteLocalLlmModel(selected.id);
-    setBusy(false);
-    if (result.status === "error") setError(result.error);
-    await reload();
+    if (!selected || busy) return;
+    setDeleting(true);
+    setActionError(null);
+    try {
+      const result = await commands.deleteLocalLlmModel(selected.id);
+      if (result.status === "error") setActionError(result.error);
+    } catch (error: unknown) {
+      setActionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setDeleting(false);
+      await reload();
+    }
   };
 
   const statusLabel = (() => {
@@ -134,6 +158,7 @@ export const LocalLlmSettings: React.FC = () => {
             }))}
             selectedValue={selectedId}
             onSelect={(value) => void handleSelect(value)}
+            disabled={busy}
             placeholder={t(
               "settings.postProcessing.localLlm.model.placeholder",
             )}
@@ -177,7 +202,9 @@ export const LocalLlmSettings: React.FC = () => {
 
       {error && (
         <Alert variant="error" contained>
-          {error}
+          {t("settings.postProcessing.localLlm.status.error", {
+            reason: error,
+          })}
         </Alert>
       )}
 
@@ -266,7 +293,11 @@ export const LocalLlmSettings: React.FC = () => {
           <button
             type="button"
             className="underline"
-            onClick={() => void openUrl(selected.card_url)}
+            onClick={() =>
+              void openUrl(selected.card_url).catch((error: unknown) => {
+                console.error("Failed to open local LLM model card:", error);
+              })
+            }
           >
             {selected.attribution}
           </button>
