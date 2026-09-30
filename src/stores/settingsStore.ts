@@ -6,6 +6,9 @@ import type {
   AudioDevice,
   PostProcessApiFormat,
   ChineseScript,
+  LocalLlmContext,
+  LocalLlmStructure,
+  LocalLlmStyling,
   TranscribeAcceleratorSetting,
   ShortcutActivation,
   VadBackend,
@@ -217,6 +220,12 @@ const settingUpdaters: {
     commands.changeLanguageDetectionSetting(value as LanguageDetectionMode),
   language_detection_window_secs: (value) =>
     commands.changeLanguageDetectionWindowSetting(value as number),
+  local_llm_styling: (value) =>
+    commands.changeLocalLlmStylingSetting(value as LocalLlmStyling),
+  local_llm_structure: (value) =>
+    commands.changeLocalLlmStructureSetting(value as LocalLlmStructure),
+  local_llm_context: (value) =>
+    commands.changeLocalLlmContextSetting(value as LocalLlmContext),
 };
 
 export const useSettingsStore = create<SettingsStore>()(
