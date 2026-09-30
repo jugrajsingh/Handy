@@ -167,6 +167,16 @@ pub enum LocalLlmStructure {
     Lists,
 }
 
+/// Layout used to compare raw and cleaned history transcripts.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryCompareView {
+    #[default]
+    Diff,
+    SideBySide,
+    Stacked,
+}
+
 /// S1 control-line knob: general text or an email layout.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
 #[serde(rename_all = "snake_case")]
@@ -557,6 +567,8 @@ pub struct AppSettings {
     /// Inference threads for llama-server.
     #[serde(default = "default_local_llm_threads")]
     pub local_llm_threads: u8,
+    #[serde(default)]
+    pub history_compare_view: HistoryCompareView,
 }
 
 fn default_model() -> String {
@@ -1032,6 +1044,7 @@ pub fn get_default_settings() -> AppSettings {
         local_llm_structure: LocalLlmStructure::default(),
         local_llm_context: LocalLlmContext::default(),
         local_llm_threads: default_local_llm_threads(),
+        history_compare_view: HistoryCompareView::default(),
     }
 }
 
@@ -1337,6 +1350,36 @@ pub fn get_recording_retention_period(app: &AppHandle) -> RecordingRetentionPeri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_compare_defaults_for_an_old_store_and_serializes_all_modes() {
+        let mut json = serde_json::to_value(get_default_settings()).unwrap();
+        assert!(json
+            .as_object_mut()
+            .unwrap()
+            .remove("history_compare_view")
+            .is_some());
+        let old: AppSettings = serde_json::from_value(json).unwrap();
+        assert_eq!(old.history_compare_view, HistoryCompareView::Diff);
+        for (view, expected) in [
+            (HistoryCompareView::Diff, "diff"),
+            (HistoryCompareView::SideBySide, "side_by_side"),
+            (HistoryCompareView::Stacked, "stacked"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(view).unwrap(),
+                serde_json::json!(expected)
+            );
+            let settings = AppSettings {
+                history_compare_view: view,
+                ..get_default_settings()
+            };
+            let stored = serde_json::to_value(settings).unwrap();
+            assert_eq!(stored["history_compare_view"], serde_json::json!(expected));
+            let restored: AppSettings = serde_json::from_value(stored).unwrap();
+            assert_eq!(restored.history_compare_view, view);
+        }
+    }
 
     #[test]
     fn store_without_local_llm_keys_parses_with_local_llm_defaults() {

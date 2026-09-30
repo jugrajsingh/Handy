@@ -6,6 +6,18 @@ use crate::managers::{
 use std::sync::Arc;
 use tauri::{AppHandle, State};
 
+/// Persist the layout used to compare raw and cleaned history transcripts.
+#[tauri::command]
+#[specta::specta]
+pub fn change_history_compare_view_setting(
+    app: AppHandle,
+    view: crate::settings::HistoryCompareView,
+) -> Result<(), String> {
+    let mut settings = crate::settings::get_settings(&app);
+    settings.history_compare_view = view;
+    crate::settings::write_settings_checked(&app, settings)
+}
+
 #[tauri::command]
 #[specta::specta]
 pub async fn get_history_entries(

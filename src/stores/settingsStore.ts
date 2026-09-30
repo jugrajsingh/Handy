@@ -4,6 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   AppSettings as Settings,
   AudioDevice,
+  HistoryCompareView,
   LocalLlmContext,
   LocalLlmStructure,
   LocalLlmStyling,
@@ -39,6 +40,7 @@ interface SettingsStore {
   resetSetting: (key: keyof Settings) => Promise<void>;
   refreshSettings: () => Promise<void>;
   refreshSettingsChecked: () => Promise<void>;
+  changeHistoryCompareView: (view: HistoryCompareView) => Promise<void>;
   refreshAudioDevices: () => Promise<void>;
   refreshOutputDevices: () => Promise<void>;
   updateBinding: (id: string, binding: string) => Promise<void>;
@@ -160,6 +162,10 @@ const settingUpdaters: {
   auto_submit_key: (value) =>
     commands.changeAutoSubmitKeySetting(value as string),
   history_limit: (value) => commands.updateHistoryLimit(value as number),
+  history_compare_view: (value) =>
+    useSettingsStore
+      .getState()
+      .changeHistoryCompareView(value as HistoryCompareView),
   post_process_enabled: async (value) => {
     const result = await commands.changePostProcessEnabledSetting(
       value as boolean,
@@ -263,6 +269,18 @@ export const useSettingsStore = create<SettingsStore>()(
         selected_output_device: settings.selected_output_device ?? "Default",
       };
       set({ settings: normalizedSettings, isLoading: false });
+    },
+
+    changeHistoryCompareView: async (view) => {
+      const { setUpdating, refreshSettingsChecked } = get();
+      setUpdating("history_compare_view", true);
+      try {
+        const result = await commands.changeHistoryCompareViewSetting(view);
+        if (result.status === "error") throw new Error(result.error);
+        await refreshSettingsChecked();
+      } finally {
+        setUpdating("history_compare_view", false);
+      }
     },
 
     // Load audio devices

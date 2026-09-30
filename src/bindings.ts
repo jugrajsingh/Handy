@@ -870,6 +870,17 @@ async getHistoryEntries(cursor: number | null, limit: number | null) : Promise<R
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Persist the layout used to compare raw and cleaned history transcripts.
+ */
+async changeHistoryCompareViewSetting(view: HistoryCompareView) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_history_compare_view_setting", { view }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async toggleHistoryEntrySaved(id: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("toggle_history_entry_saved", { id }) };
@@ -1091,7 +1102,7 @@ local_llm_model_id?: string | null; local_llm_styling?: LocalLlmStyling; local_l
 /**
  * Inference threads for llama-server.
  */
-local_llm_threads?: number }
+local_llm_threads?: number; history_compare_view?: HistoryCompareView }
 export type AudioDevice = { index: string; name: string; is_default: boolean }
 export type AutoSubmitKey = "enter" | "ctrl_enter" | "cmd_enter"
 export type AvailableAccelerators = { transcribe: string[]; ort: string[]; gpu_devices: GpuDeviceOption[] }
@@ -1107,6 +1118,10 @@ export type EngineType =
 "TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere"
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
 export type HistoryClearSummary = { entries: number; recordings: number }
+/**
+ * Layout used to compare raw and cleaned history transcripts.
+ */
+export type HistoryCompareView = "diff" | "side_by_side" | "stacked"
 export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean; post_process_provider: string | null; post_process_model: string | null }
 export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number } | { action: "cleared" }
 /**
