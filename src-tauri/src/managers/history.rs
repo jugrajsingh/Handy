@@ -791,6 +791,81 @@ mod tests {
         assert_eq!(stored.post_process_model, entry.post_process_model);
     }
 
+    #[test]
+    fn pending_cleanup_stores_the_request_snapshot_after_settings_change() {
+        use crate::actions::process_transcription_output_with_dependencies;
+        use std::cell::{Cell, RefCell};
+        use std::future::{poll_fn, ready, Future};
+        use std::task::Poll;
+
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "raw", None);
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .unwrap();
+        let mut settings = crate::settings::get_default_settings();
+        settings.post_process_provider_id = "local_llm".into();
+        settings.local_llm_model_id = Some("s1-mini-q4km".into());
+        let source = RefCell::new(settings);
+        let reads = Cell::new(0);
+        let cleanup_started = Cell::new(false);
+        let (complete, response) = tokio::sync::oneshot::channel();
+
+        let processed = tauri::async_runtime::block_on(async {
+            let request = process_transcription_output_with_dependencies(
+                "raw",
+                true,
+                || {
+                    reads.set(reads.get() + 1);
+                    source.borrow().clone()
+                },
+                |snapshot, _| {
+                    assert_eq!(snapshot.post_process_provider_id, "local_llm");
+                    ready(None)
+                },
+                |snapshot, text| {
+                    cleanup_started.set(true);
+                    assert_eq!(text, "raw");
+                    assert_eq!(snapshot.post_process_provider_id, "local_llm");
+                    assert_eq!(snapshot.local_llm_model_id.as_deref(), Some("s1-mini-q4km"));
+                    async move { response.await.unwrap() }
+                },
+            );
+            let mut request = std::pin::pin!(request);
+            poll_fn(|cx| {
+                assert!(request.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert!(cleanup_started.get());
+            source.borrow_mut().post_process_provider_id = "custom".into();
+            source.borrow_mut().local_llm_model_id = Some("later-selection".into());
+            source
+                .borrow_mut()
+                .post_process_models
+                .insert("custom".into(), "later-api-model".into());
+            complete.send(Some("Clean.".into())).unwrap();
+            request.await
+        });
+
+        assert_eq!(reads.get(), 1);
+        assert_eq!(source.borrow().post_process_provider_id, "custom");
+        assert_eq!(processed.final_text, "Clean.");
+        assert_eq!(processed.post_processed_text.as_deref(), Some("Clean."));
+        let stored = HistoryManager::update_transcription_with_conn(
+            &conn,
+            entry.id,
+            "raw".into(),
+            processed.post_processed_text,
+            processed.post_process_prompt,
+            processed.provenance,
+        )
+        .unwrap();
+        assert_eq!(stored.post_processed_text.as_deref(), Some("Clean."));
+        assert_eq!(stored.post_process_provider.as_deref(), Some("local_llm"));
+        assert_eq!(stored.post_process_model.as_deref(), Some("s1-mini-q4km"));
+    }
+
     fn insert_entry(conn: &Connection, timestamp: i64, text: &str, post_processed: Option<&str>) {
         conn.execute(
             "INSERT INTO transcription_history (
