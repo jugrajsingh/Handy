@@ -61,6 +61,7 @@ export const LocalLlmSettings: React.FC = () => {
   const downloadModelId = useLocalLlmDownloadStore((state) => state.modelId);
   const percentage = useLocalLlmDownloadStore((state) => state.percentage);
   const downloadError = useLocalLlmDownloadStore((state) => state.error);
+  const clearError = useLocalLlmDownloadStore((state) => state.clearError);
   const download = useLocalLlmDownloadStore((state) => state.download);
   const [deleting, setDeleting] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -95,13 +96,14 @@ export const LocalLlmSettings: React.FC = () => {
   }, []);
 
   const handleSelect = async (id: string) => {
+    clearError();
+    setActionError(null);
     try {
       const result = await commands.setLocalLlmModel(id);
       if (result.status === "error") {
         setActionError(result.error);
         return;
       }
-      setActionError(null);
       await refreshSettings();
     } catch (error: unknown) {
       setActionError(error instanceof Error ? error.message : String(error));
@@ -109,15 +111,17 @@ export const LocalLlmSettings: React.FC = () => {
   };
 
   const handleDownload = async () => {
-    if (!selected || busy) return;
+    clearError();
     setActionError(null);
+    if (!selected || busy) return;
     await download(selected.id);
   };
 
   const handleDelete = async () => {
+    clearError();
+    setActionError(null);
     if (!selected || busy) return;
     setDeleting(true);
-    setActionError(null);
     try {
       const result = await commands.deleteLocalLlmModel(selected.id);
       if (result.status === "error") setActionError(result.error);
