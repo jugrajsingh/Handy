@@ -908,14 +908,66 @@ async updateRecordingRetentionPeriod(period: string) : Promise<Result<null, stri
 }
 },
 /**
- * Checks if the Mac is a laptop by detecting battery presence
- * 
- * This uses pmset to check for battery information.
- * Returns true if a battery is detected (laptop), false otherwise (desktop)
+ * Stub implementation for non-macOS platforms
+ * Always returns false since laptop detection is macOS-specific
  */
 async isLaptop() : Promise<Result<boolean, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("is_laptop") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getLocalLlmModels() : Promise<LocalLlmModelInfo[]> {
+    return await TAURI_INVOKE("get_local_llm_models");
+},
+async downloadLocalLlmModel(modelId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("download_local_llm_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteLocalLlmModel(modelId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_local_llm_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getLocalLlmStatus() : Promise<LocalLlmStatus> {
+    return await TAURI_INVOKE("get_local_llm_status");
+},
+async setLocalLlmModel(modelId: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_local_llm_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeLocalLlmStylingSetting(styling: LocalLlmStyling) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_local_llm_styling_setting", { styling }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeLocalLlmStructureSetting(structure: LocalLlmStructure) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_local_llm_structure_setting", { structure }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeLocalLlmContextSetting(context: LocalLlmContext) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_local_llm_context_setting", { context }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1004,7 +1056,15 @@ vad_backend?: VadBackend;
  * not gated on this — that follows model capability. Migrated from the old
  * `overlay_position` (position `none` → style `None`).
  */
-overlay_style?: OverlayStyle }
+overlay_style?: OverlayStyle;
+/**
+ * Registry id of the local LLM (provider `local_llm`); `None` until chosen.
+ */
+local_llm_model_id?: string | null; local_llm_styling?: LocalLlmStyling; local_llm_structure?: LocalLlmStructure; local_llm_context?: LocalLlmContext;
+/**
+ * Inference threads for llama-server.
+ */
+local_llm_threads?: number }
 export type AudioDevice = { index: string; name: string; is_default: boolean }
 export type AutoSubmitKey = "enter" | "ctrl_enter" | "cmd_enter"
 export type AvailableAccelerators = { transcribe: string[]; ort: string[]; gpu_devices: GpuDeviceOption[] }
@@ -1036,6 +1096,30 @@ export type KeyboardDiagnosticReport = { secure_input_enabled: boolean; culprit_
 key_down: number; key_up: number; flags_changed: number; mouse: number; duration_ms: number }
 export type KeyboardImplementation = "tauri" | "handy_keys"
 export type LLMPrompt = { id: string; name: string; prompt: string }
+/**
+ * S1 control-line knob: general text or an email layout.
+ */
+export type LocalLlmContext = "general" | "email"
+/**
+ * One registry entry as the UI sees it.
+ */
+export type LocalLlmModelInfo = { id: string; display_name: string; attribution: string; card_url: string; size_bytes: number; prompt_style: PromptStyle; downloaded: boolean }
+/**
+ * State name as sent to the UI.
+ */
+export type LocalLlmStateKind = "unloaded" | "starting" | "ready" | "stopping" | "failed"
+/**
+ * Payload of the `local-llm-state-changed` event and `get_local_llm_status`.
+ */
+export type LocalLlmStatus = { state: LocalLlmStateKind; model_id: string | null; error: string | null }
+/**
+ * S1 control-line knob: prose paragraphs or Markdown lists.
+ */
+export type LocalLlmStructure = "prose" | "lists"
+/**
+ * S1 control-line knob: how formal the cleaned text reads.
+ */
+export type LocalLlmStyling = "casual" | "semi_casual" | "semi_formal" | "formal"
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error"
 export type ModelInfo = { id: string; name: string; description: string; filename: string; source: ModelSource; size_mb: number; is_downloaded: boolean; is_downloading: boolean; partial_size: number; is_directory: boolean; engine_type: EngineType; accuracy_score: number; speed_score: number; supports_translation: boolean; is_recommended: boolean; supported_languages: string[]; supports_language_selection: boolean; is_custom: boolean; supports_streaming: boolean; supports_language_detection: boolean }
 export type ModelLoadStatus = { is_loaded: boolean; current_model: string | null }
@@ -1077,6 +1161,14 @@ export type PaginatedHistory = { entries: HistoryEntry[]; has_more: boolean }
 export type PasteMethod = "ctrl_v" | "direct" | "none" | "shift_insert" | "ctrl_shift_v" | "external_script"
 export type PermissionAccess = "allowed" | "denied" | "unknown"
 export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean }
+/**
+ * How the chat messages for a model are built.
+ */
+export type PromptStyle =
+/**
+ * S1-mini: fixed card system prompt, control line + transcript as the user turn.
+ */
+"s1_control_line"
 export type RecordingRetentionPeriod = "never" | "preserve_limit" | "days_3" | "weeks_2" | "months_3"
 export type SecretMap = Partial<{ [key in string]: string }>
 export type SecureInputStatus = { 

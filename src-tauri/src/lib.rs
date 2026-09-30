@@ -205,6 +205,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     );
     let history_manager =
         Arc::new(HistoryManager::new(app_handle).expect("Failed to initialize history manager"));
+    let local_llm_manager = local_llm::create_manager(app_handle);
 
     // Initialize the transcribe-cpp native backend (logging + backend module
     // registration) once, before any whisper model is loaded.
@@ -218,6 +219,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(model_manager.clone());
     app_handle.manage(transcription_manager.clone());
     app_handle.manage(history_manager.clone());
+    app_handle.manage(local_llm_manager);
     app_handle.manage(tray::TrayState::new());
 
     // Note: Shortcuts are NOT initialized here.
@@ -765,6 +767,14 @@ pub fn run(cli_args: CliArgs) {
             commands::history::update_history_limit,
             commands::history::update_recording_retention_period,
             helpers::clamshell::is_laptop,
+            local_llm::commands::get_local_llm_models,
+            local_llm::commands::download_local_llm_model,
+            local_llm::commands::delete_local_llm_model,
+            local_llm::commands::get_local_llm_status,
+            local_llm::commands::set_local_llm_model,
+            local_llm::commands::change_local_llm_styling_setting,
+            local_llm::commands::change_local_llm_structure_setting,
+            local_llm::commands::change_local_llm_context_setting,
         ])
         .events(collect_events![
             managers::history::HistoryUpdatePayload,
@@ -1116,6 +1126,9 @@ pub fn run(cli_args: CliArgs) {
         tauri::RunEvent::Exit => {
             if let Some(tm) = app.try_state::<Arc<TranscriptionManager>>() {
                 let _ = tm.unload_model();
+            }
+            if let Some(llm) = app.try_state::<Arc<local_llm::LocalLlmManager>>() {
+                llm.shutdown();
             }
         }
         _ => {}
