@@ -13,6 +13,8 @@ import { Alert } from "../../ui/Alert";
 import { useSettings } from "../../../hooks/useSettings";
 import { useLocalLlmStatus } from "../../../hooks/useLocalLlmStatus";
 import { LocalLlmModelList } from "./LocalLlmModelList";
+import { createLocalLlmActions } from "./localLlmActions";
+import { isLocalLlmBusy } from "./localLlmRowActions";
 import {
   initializeLocalLlmDownloadProgress,
   useLocalLlmDownloadStore,
@@ -67,48 +69,24 @@ export const LocalLlmSettings: React.FC = () => {
 
   const selectedId = getSetting("local_llm_model_id") ?? null;
   const selected = models.find((m) => m.id === selectedId) ?? null;
-  const busy = deletingId !== null || downloadModelId !== null;
   const error = downloadError ?? actionError ?? statusError;
 
-  const handleSelect = async (id: string) => {
-    clearError();
-    setActionError(null);
-    try {
-      const result = await commands.setLocalLlmModel(id);
-      if (result.status === "error") {
-        setActionError(result.error);
-        return;
-      }
-      await refreshSettingsChecked();
-    } catch (error: unknown) {
-      setActionError(error instanceof Error ? error.message : String(error));
-    }
-  };
-
-  const handleDownload = async (id: string) => {
-    clearError();
-    setActionError(null);
-    if (busy) return;
-    await download(id);
-  };
-
-  const handleDelete = async (id: string) => {
-    clearError();
-    setActionError(null);
-    if (busy) return;
-    setDeletingId(id);
-    try {
-      const result = await commands.deleteLocalLlmModel(id);
-      if (result.status === "error") throw new Error(result.error);
-      useLocalLlmDownloadStore.getState().modelsChanged();
-      await reloadChecked();
-      await refreshSettingsChecked();
-    } catch (error: unknown) {
-      setActionError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setDeletingId(null);
-    }
-  };
+  const actions = createLocalLlmActions({
+    isBusy: () =>
+      isLocalLlmBusy({
+        downloadId: useLocalLlmDownloadStore.getState().modelId,
+        deletingId,
+      }),
+    clearError,
+    setError: setActionError,
+    setDeletingId,
+    setLocalLlmModel: commands.setLocalLlmModel,
+    deleteLocalLlmModel: commands.deleteLocalLlmModel,
+    downloadLocalLlmModel: download,
+    refreshSettingsChecked,
+    reloadChecked,
+    modelsChanged: useLocalLlmDownloadStore.getState().modelsChanged,
+  });
 
   const statusLabel = (() => {
     if (status?.state === "ready")
@@ -130,9 +108,9 @@ export const LocalLlmSettings: React.FC = () => {
         downloadId={downloadModelId}
         percentage={percentage}
         deletingId={deletingId}
-        onDownload={(id) => void handleDownload(id)}
-        onDelete={(id) => void handleDelete(id)}
-        onSelect={(id) => void handleSelect(id)}
+        onDownload={(id) => void actions.download(id)}
+        onDelete={(id) => void actions.delete(id)}
+        onSelect={(id) => void actions.select(id)}
       />
 
       <SettingContainer
