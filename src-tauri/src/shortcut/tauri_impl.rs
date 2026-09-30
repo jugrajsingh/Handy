@@ -4,7 +4,9 @@
 //! global-shortcut plugin.
 
 use log::{debug, error, warn};
-use tauri::AppHandle;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use tauri::{AppHandle, Manager};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, Shortcut, ShortcutState};
 
 #[cfg(not(target_os = "linux"))]
@@ -12,6 +14,34 @@ use crate::settings::get_settings;
 use crate::settings::{self, ShortcutBinding};
 
 use super::handler::handle_shortcut_event;
+
+#[derive(Default)]
+struct RegisteredShortcuts(Mutex<HashMap<String, Shortcut>>);
+
+fn registration_state(app: &AppHandle) -> tauri::State<'_, RegisteredShortcuts> {
+    if app.try_state::<RegisteredShortcuts>().is_none() {
+        app.manage(RegisteredShortcuts::default());
+    }
+    app.state::<RegisteredShortcuts>()
+}
+
+/// Check that this binding owns the same shortcut and remains natively registered.
+pub(super) fn binding_is_registered(
+    app: &AppHandle,
+    binding: &ShortcutBinding,
+) -> Result<bool, String> {
+    let shortcut = binding
+        .current_binding
+        .parse::<Shortcut>()
+        .map_err(|error| error.to_string())?;
+    let state = registration_state(app);
+    let registered = state
+        .0
+        .lock()
+        .map_err(|error| format!("Shortcut ownership lock failed: {error}"))?;
+    Ok(registered.get(&binding.id) == Some(&shortcut)
+        && app.global_shortcut().is_registered(shortcut))
+}
 
 /// Initialize shortcuts using Tauri's global-shortcut plugin
 pub fn init_shortcuts(app: &impl super::policy::RegistrationContext) {
@@ -111,6 +141,12 @@ pub(super) fn register_nonempty_shortcut(
         }
     };
 
+    let state = registration_state(app);
+    let mut registered = state
+        .0
+        .lock()
+        .map_err(|error| format!("Shortcut ownership lock failed: {error}"))?;
+
     // Prevent duplicate registrations that would silently shadow one another
     if app.global_shortcut().is_registered(shortcut) {
         let error_msg = format!("Shortcut '{}' is already in use", binding.current_binding);
@@ -150,6 +186,7 @@ pub(super) fn register_nonempty_shortcut(
             error_msg
         })?;
 
+    registered.insert(binding.id, shortcut);
     Ok(())
 }
 
@@ -167,6 +204,12 @@ pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<
         }
     };
 
+    let state = registration_state(app);
+    let mut registered = state
+        .0
+        .lock()
+        .map_err(|error| format!("Shortcut ownership lock failed: {error}"))?;
+
     app.global_shortcut().unregister(shortcut).map_err(|e| {
         let error_msg = format!(
             "Failed to unregister shortcut '{}': {}",
@@ -176,6 +219,9 @@ pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<
         error_msg
     })?;
 
+    if registered.get(&binding.id) == Some(&shortcut) {
+        registered.remove(&binding.id);
+    }
     Ok(())
 }
 

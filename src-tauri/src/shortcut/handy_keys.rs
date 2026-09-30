@@ -53,6 +53,11 @@ enum ManagerCommand {
         binding_id: String,
         response: Sender<Result<(), String>>,
     },
+    IsRegistered {
+        binding_id: String,
+        hotkey_string: String,
+        response: Sender<Result<bool, String>>,
+    },
     Shutdown,
 }
 
@@ -165,6 +170,27 @@ impl HandyKeysState {
                         );
                         let _ = response.send(result);
                     }
+                    ManagerCommand::IsRegistered {
+                        binding_id,
+                        hotkey_string,
+                        response,
+                    } => {
+                        let result = hotkey_string
+                            .parse::<Hotkey>()
+                            .map(|requested| {
+                                binding_to_hotkey
+                                    .get(&binding_id)
+                                    .and_then(|id| hotkey_to_binding.get(id))
+                                    .and_then(|(_, registered)| registered.parse::<Hotkey>().ok())
+                                    .is_some_and(|registered| {
+                                        registered.to_handy_string() == requested.to_handy_string()
+                                    })
+                            })
+                            .map_err(|error| {
+                                format!("Invalid shortcut for ownership query: {error}")
+                            });
+                        let _ = response.send(result);
+                    }
                     ManagerCommand::Shutdown => {
                         info!("handy-keys manager thread shutting down");
                         break;
@@ -257,6 +283,21 @@ impl HandyKeysState {
 
         rx.recv()
             .map_err(|_| "Failed to receive unregister response")?
+    }
+
+    fn binding_is_registered(&self, binding: &ShortcutBinding) -> Result<bool, String> {
+        let (tx, rx) = mpsc::channel();
+        self.command_sender
+            .lock()
+            .map_err(|_| "Failed to lock command_sender")?
+            .send(ManagerCommand::IsRegistered {
+                binding_id: binding.id.clone(),
+                hotkey_string: binding.current_binding.clone(),
+                response: tx,
+            })
+            .map_err(|_| "Failed to send ownership query")?;
+        rx.recv()
+            .map_err(|_| "Failed to receive ownership response")?
     }
 
     /// Start recording mode for a specific binding
@@ -520,6 +561,17 @@ pub(super) fn register_nonempty_shortcut(
         .try_state::<HandyKeysState>()
         .ok_or("HandyKeysState not initialized")?;
     state.register(&binding)
+}
+
+/// Check that this binding owns the same shortcut in the manager thread.
+pub(super) fn binding_is_registered(
+    app: &AppHandle,
+    binding: &ShortcutBinding,
+) -> Result<bool, String> {
+    let state = app
+        .try_state::<HandyKeysState>()
+        .ok_or("HandyKeysState not initialized")?;
+    state.binding_is_registered(binding)
 }
 
 /// Unregister a shortcut

@@ -1078,9 +1078,19 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
         .store(crate::portable::store_path(SETTINGS_STORE_PATH))
         .expect("Failed to initialize store");
 
+    load_settings_with(store.get("settings"), |settings| {
+        store.set("settings", serde_json::to_value(settings).unwrap());
+    })
+}
+
+/// Load and migrate stored settings, persisting each required recovery.
+pub(crate) fn load_settings_with(
+    settings_value: Option<serde_json::Value>,
+    mut persist: impl FnMut(&AppSettings),
+) -> AppSettings {
     // Settings reads also persist one-time migrations. Migration helpers are
     // idempotent, so this converges after the first read of an older store.
-    let mut settings = if let Some(settings_value) = store.get("settings") {
+    let mut settings = if let Some(settings_value) = settings_value {
         let (mut settings, mut updated) =
             match serde_json::from_value::<AppSettings>(settings_value.clone()) {
                 Ok(settings) => (settings, false),
@@ -1108,18 +1118,18 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
         }
 
         if updated {
-            store.set("settings", serde_json::to_value(&settings).unwrap());
+            persist(&settings);
         }
 
         settings
     } else {
         let default_settings = get_default_settings();
-        store.set("settings", serde_json::to_value(&default_settings).unwrap());
+        persist(&default_settings);
         default_settings
     };
 
     if ensure_post_process_defaults(&mut settings) {
-        store.set("settings", serde_json::to_value(&settings).unwrap());
+        persist(&settings);
     }
 
     settings

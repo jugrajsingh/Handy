@@ -18,6 +18,55 @@ pub trait RegistrationContext {
     fn manage_handy_keys(&self, state: Self::HandyKeys);
 }
 
+/// Supplies native mutation, ownership queries and fallback synchronization for commands.
+pub trait CommandContext: RegistrationContext {
+    fn unregister_native(
+        &self,
+        implementation: KeyboardImplementation,
+        binding: ShortcutBinding,
+    ) -> Result<(), String>;
+    fn binding_is_registered(
+        &self,
+        implementation: KeyboardImplementation,
+        binding: &ShortcutBinding,
+    ) -> Result<bool, String>;
+    fn reconcile_fallback(&self);
+}
+
+impl CommandContext for tauri::AppHandle {
+    fn unregister_native(
+        &self,
+        implementation: KeyboardImplementation,
+        binding: ShortcutBinding,
+    ) -> Result<(), String> {
+        match implementation {
+            KeyboardImplementation::Tauri => super::tauri_impl::unregister_shortcut(self, binding),
+            KeyboardImplementation::HandyKeys => {
+                super::handy_keys::unregister_shortcut(self, binding)
+            }
+        }
+    }
+
+    fn binding_is_registered(
+        &self,
+        implementation: KeyboardImplementation,
+        binding: &ShortcutBinding,
+    ) -> Result<bool, String> {
+        match implementation {
+            KeyboardImplementation::Tauri => {
+                super::tauri_impl::binding_is_registered(self, binding)
+            }
+            KeyboardImplementation::HandyKeys => {
+                super::handy_keys::binding_is_registered(self, binding)
+            }
+        }
+    }
+
+    fn reconcile_fallback(&self) {
+        crate::secure_input::reconcile_fallback(self);
+    }
+}
+
 /// Registers a shortcut on the unmanaged HandyKeys state during startup.
 pub trait HandyKeysRegistration {
     fn register(&self, binding: &ShortcutBinding) -> Result<(), String>;
@@ -434,6 +483,372 @@ mod registration_path_tests {
                 context.settings().bindings["transcribe"].default_binding
             );
             assert_eq!(context.calls.borrow().len(), 2);
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_path_tests {
+    use super::*;
+    use crate::settings::get_default_settings;
+    use crate::shortcut::{
+        change_binding_with, change_post_process_enabled_with, clear_binding_command_with,
+    };
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    struct CommandTestContext {
+        directory: tempfile::TempDir,
+        registered: RefCell<HashMap<String, String>>,
+        operations: RefCell<Vec<String>>,
+        register_error: Cell<bool>,
+        unregister_error: Cell<bool>,
+    }
+
+    struct NoHandyKeys;
+
+    impl HandyKeysRegistration for NoHandyKeys {
+        fn register(&self, _binding: &ShortcutBinding) -> Result<(), String> {
+            panic!("command tests do not initialize native state")
+        }
+    }
+
+    impl CommandTestContext {
+        fn new(settings: AppSettings) -> Self {
+            let context = Self {
+                directory: tempfile::tempdir().unwrap(),
+                registered: RefCell::new(HashMap::new()),
+                operations: RefCell::new(Vec::new()),
+                register_error: Cell::new(false),
+                unregister_error: Cell::new(false),
+            };
+            context.save_settings(settings);
+            context
+        }
+
+        fn path(&self) -> std::path::PathBuf {
+            self.directory.path().join("settings.json")
+        }
+
+        fn stored(&self) -> String {
+            std::fs::read_to_string(self.path()).unwrap()
+        }
+
+        fn persisted(&self) -> AppSettings {
+            serde_json::from_str(&self.stored()).unwrap()
+        }
+
+        fn seed_dictation(&self) {
+            let settings = self.persisted();
+            for id in ["transcribe", "transcribe_with_post_process"] {
+                let binding = &settings.bindings[id];
+                if !binding.current_binding.trim().is_empty() {
+                    self.registered.borrow_mut().insert(
+                        id.into(),
+                        normalized_binding(
+                            &binding.current_binding,
+                            settings.keyboard_implementation,
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+    }
+
+    impl RegistrationContext for CommandTestContext {
+        type HandyKeys = NoHandyKeys;
+
+        fn settings(&self) -> AppSettings {
+            let value = serde_json::from_str(&self.stored()).unwrap();
+            crate::settings::load_settings_with(Some(value), |settings| {
+                self.save_settings(settings.clone())
+            })
+        }
+
+        fn save_settings(&self, settings: AppSettings) {
+            std::fs::write(self.path(), serde_json::to_vec(&settings).unwrap()).unwrap();
+        }
+
+        fn register_native(
+            &self,
+            implementation: KeyboardImplementation,
+            binding: ShortcutBinding,
+        ) -> Result<(), String> {
+            self.operations
+                .borrow_mut()
+                .push(format!("register:{}", binding.id));
+            if self.register_error.get() {
+                return Err("native registration failed".into());
+            }
+            let key = normalized_binding(&binding.current_binding, implementation)?;
+            if self
+                .registered
+                .borrow()
+                .values()
+                .any(|registered| registered == &key)
+            {
+                return Err("shortcut already in use".into());
+            }
+            self.registered.borrow_mut().insert(binding.id, key);
+            Ok(())
+        }
+
+        fn create_handy_keys(&self) -> Result<Self::HandyKeys, String> {
+            panic!("command tests do not initialize native state")
+        }
+
+        fn manage_handy_keys(&self, _state: Self::HandyKeys) {
+            panic!("command tests do not initialize native state")
+        }
+    }
+
+    impl CommandContext for CommandTestContext {
+        fn unregister_native(
+            &self,
+            _implementation: KeyboardImplementation,
+            binding: ShortcutBinding,
+        ) -> Result<(), String> {
+            self.operations
+                .borrow_mut()
+                .push(format!("unregister:{}", binding.id));
+            if self.unregister_error.get() {
+                return Err("native unregister failed".into());
+            }
+            self.registered.borrow_mut().remove(&binding.id);
+            Ok(())
+        }
+
+        fn binding_is_registered(
+            &self,
+            implementation: KeyboardImplementation,
+            binding: &ShortcutBinding,
+        ) -> Result<bool, String> {
+            self.operations
+                .borrow_mut()
+                .push(format!("query:{}", binding.id));
+            let key = normalized_binding(&binding.current_binding, implementation)?;
+            Ok(self.registered.borrow().get(&binding.id) == Some(&key))
+        }
+
+        fn reconcile_fallback(&self) {}
+    }
+
+    fn enabled_settings(implementation: KeyboardImplementation) -> AppSettings {
+        let mut settings = get_default_settings();
+        settings.keyboard_implementation = implementation;
+        settings.post_process_enabled = true;
+        settings
+    }
+
+    #[test]
+    fn disable_retains_active_raw_and_removes_clean() {
+        for implementation in [
+            KeyboardImplementation::Tauri,
+            KeyboardImplementation::HandyKeys,
+        ] {
+            let context = CommandTestContext::new(enabled_settings(implementation));
+            context.seed_dictation();
+            let raw = context.registered.borrow()["transcribe"].clone();
+            assert!(change_post_process_enabled_with(&context, false).is_ok());
+            assert!(!context.persisted().post_process_enabled);
+            assert_eq!(context.registered.borrow().get("transcribe"), Some(&raw));
+            assert!(!context
+                .registered
+                .borrow()
+                .contains_key("transcribe_with_post_process"));
+            assert!(!context
+                .operations
+                .borrow()
+                .contains(&"register:transcribe".into()));
+        }
+    }
+
+    #[test]
+    fn disable_registers_previously_cleared_raw() {
+        for implementation in [
+            KeyboardImplementation::Tauri,
+            KeyboardImplementation::HandyKeys,
+        ] {
+            let mut settings = enabled_settings(implementation);
+            settings
+                .bindings
+                .get_mut("transcribe")
+                .unwrap()
+                .current_binding
+                .clear();
+            let context = CommandTestContext::new(settings);
+            context.seed_dictation();
+            assert!(change_post_process_enabled_with(&context, false).is_ok());
+            let persisted = context.persisted();
+            assert!(!persisted.post_process_enabled);
+            assert_eq!(
+                persisted.bindings["transcribe"].current_binding,
+                persisted.bindings["transcribe"].default_binding
+            );
+            assert!(context.registered.borrow().contains_key("transcribe"));
+            assert!(!context
+                .registered
+                .borrow()
+                .contains_key("transcribe_with_post_process"));
+        }
+    }
+
+    #[test]
+    fn disable_exposes_native_registration_failure_and_foreign_owner_collision() {
+        for implementation in [
+            KeyboardImplementation::Tauri,
+            KeyboardImplementation::HandyKeys,
+        ] {
+            for foreign_owner in [false, true] {
+                let mut settings = enabled_settings(implementation);
+                let key = normalized_binding(
+                    &settings.bindings["transcribe"].default_binding,
+                    implementation,
+                )
+                .unwrap();
+                settings
+                    .bindings
+                    .get_mut("transcribe")
+                    .unwrap()
+                    .current_binding
+                    .clear();
+                let context = CommandTestContext::new(settings);
+                context.seed_dictation();
+                if foreign_owner {
+                    context
+                        .registered
+                        .borrow_mut()
+                        .insert("foreign".into(), key);
+                } else {
+                    context.register_error.set(true);
+                }
+                let error = change_post_process_enabled_with(&context, false).unwrap_err();
+                assert!(error.contains(if foreign_owner {
+                    "already in use"
+                } else {
+                    "native registration failed"
+                }));
+                assert!(!context.registered.borrow().contains_key("transcribe"));
+                assert!(!context.persisted().post_process_enabled);
+            }
+        }
+    }
+
+    #[test]
+    fn suspended_duplicates_and_cancel_collisions_are_refused_before_mutation() {
+        for implementation in [
+            KeyboardImplementation::Tauri,
+            KeyboardImplementation::HandyKeys,
+        ] {
+            let context = CommandTestContext::new(enabled_settings(implementation));
+            let before = context.stored();
+            let settings = context.persisted();
+            let raw = settings.bindings["transcribe"].current_binding.clone();
+            for id in ["transcribe_with_post_process", "cancel"] {
+                let error = change_binding_with(&context, id.into(), raw.clone())
+                    .err()
+                    .unwrap();
+                assert!(error.contains("transcribe"));
+                assert_eq!(context.stored(), before);
+                assert!(context.operations.borrow().is_empty());
+            }
+            let cancel = settings.bindings["cancel"].current_binding.clone();
+            assert!(change_binding_with(&context, "transcribe".into(), cancel)
+                .err()
+                .unwrap()
+                .contains("cancel"));
+            assert_eq!(context.stored(), before);
+            assert!(context.operations.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn enable_collision_leaves_feature_disabled_and_storage_unchanged() {
+        for implementation in [
+            KeyboardImplementation::Tauri,
+            KeyboardImplementation::HandyKeys,
+        ] {
+            let mut settings = enabled_settings(implementation);
+            settings.post_process_enabled = false;
+            settings
+                .bindings
+                .get_mut("transcribe_with_post_process")
+                .unwrap()
+                .current_binding = settings.bindings["transcribe"].current_binding.clone();
+            let context = CommandTestContext::new(settings);
+            let before = context.stored();
+            assert!(change_post_process_enabled_with(&context, true)
+                .unwrap_err()
+                .contains("transcribe"));
+            assert!(!context.persisted().post_process_enabled);
+            assert_eq!(context.stored(), before);
+            assert!(context.operations.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn clear_failure_does_not_write_storage_or_remove_raw() {
+        let context = CommandTestContext::new(enabled_settings(KeyboardImplementation::Tauri));
+        context.seed_dictation();
+        context.unregister_error.set(true);
+        let before = context.stored();
+        assert!(clear_binding_command_with(&context, "transcribe".into())
+            .unwrap_err()
+            .contains("native unregister failed"));
+        assert_eq!(context.stored(), before);
+        assert!(context.registered.borrow().contains_key("transcribe"));
+    }
+
+    #[test]
+    fn clear_success_persists_blank_raw_and_keeps_clean() {
+        let context = CommandTestContext::new(enabled_settings(KeyboardImplementation::Tauri));
+        context.seed_dictation();
+        let cleared = clear_binding_command_with(&context, "transcribe".into()).unwrap();
+        assert!(cleared.current_binding.is_empty());
+        assert!(context.persisted().bindings["transcribe"]
+            .current_binding
+            .is_empty());
+        assert!(!context.registered.borrow().contains_key("transcribe"));
+        assert!(context
+            .registered
+            .borrow()
+            .contains_key("transcribe_with_post_process"));
+    }
+
+    #[test]
+    fn settings_load_persists_raw_restoration_only_when_disabled() {
+        for enabled in [false, true] {
+            let mut settings = enabled_settings(KeyboardImplementation::Tauri);
+            settings.post_process_enabled = enabled;
+            settings
+                .bindings
+                .get_mut("transcribe")
+                .unwrap()
+                .current_binding
+                .clear();
+            let context = CommandTestContext::new(settings);
+            let before = context.stored();
+            let loaded = context.settings();
+            let expected = if enabled {
+                String::new()
+            } else {
+                loaded.bindings["transcribe"].default_binding.clone()
+            };
+            assert_eq!(
+                context.persisted().bindings["transcribe"].current_binding,
+                expected,
+                "settings load must persist Raw recovery"
+            );
+            assert_eq!(loaded.bindings["transcribe"].current_binding, expected);
+            if enabled {
+                assert_eq!(context.stored(), before);
+            } else {
+                assert_ne!(context.stored(), before);
+            }
+            let after = context.stored();
+            context.settings();
+            assert_eq!(context.stored(), after);
         }
     }
 }

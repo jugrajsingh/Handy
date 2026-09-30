@@ -94,15 +94,14 @@ pub fn register_shortcut(
 }
 
 /// Unregister a shortcut using the appropriate implementation
-pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
+pub fn unregister_shortcut(
+    app: &impl policy::CommandContext,
+    binding: ShortcutBinding,
+) -> Result<(), String> {
     if binding.current_binding.trim().is_empty() {
         return Ok(());
     }
-    let settings = get_settings(app);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
-        KeyboardImplementation::HandyKeys => handy_keys::unregister_shortcut(app, binding),
-    }
+    app.unregister_native(app.settings().keyboard_implementation, binding)
 }
 
 // ============================================================================
@@ -123,6 +122,14 @@ pub fn change_binding(
     id: String,
     binding: String,
 ) -> Result<BindingResponse, String> {
+    change_binding_with(&app, id, binding)
+}
+
+fn change_binding_with(
+    app: &impl policy::CommandContext,
+    id: String,
+    binding: String,
+) -> Result<BindingResponse, String> {
     let _guard = BINDING_MUTATION_LOCK
         .lock()
         .map_err(|error| format!("Shortcut settings lock failed: {error}"))?;
@@ -131,7 +138,7 @@ pub fn change_binding(
         return Err("Binding cannot be empty".to_string());
     }
 
-    let mut settings = settings::get_settings(&app);
+    let mut settings = app.settings();
 
     // Get the binding to modify, or create it from defaults if it doesn't exist
     let binding_to_modify = match settings.bindings.get(&id) {
@@ -169,8 +176,8 @@ pub fn change_binding(
         if let Some(mut b) = settings.bindings.get(&id).cloned() {
             b.current_binding = binding;
             settings.bindings.insert(id.clone(), b.clone());
-            settings::write_settings(&app, settings);
-            crate::secure_input::reconcile_fallback(&app);
+            app.save_settings(settings);
+            app.reconcile_fallback();
             return Ok(BindingResponse {
                 success: true,
                 binding: Some(b.clone()),
@@ -180,7 +187,7 @@ pub fn change_binding(
     }
 
     // Unregister the existing binding
-    if let Err(e) = unregister_shortcut(&app, binding_to_modify.clone()) {
+    if let Err(e) = unregister_shortcut(app, binding_to_modify.clone()) {
         let error_msg = format!("Failed to unregister shortcut: {}", e);
         error!("change_binding error: {}", error_msg);
     }
@@ -190,10 +197,10 @@ pub fn change_binding(
     updated_binding.current_binding = binding;
 
     // Register the new binding
-    if let Err(e) = register_shortcut(&app, updated_binding.clone()) {
+    if let Err(e) = register_shortcut(app, updated_binding.clone()) {
         let error_msg = format!("Failed to register shortcut: {}", e);
         error!("change_binding error: {}", error_msg);
-        restore_registration(&app, &binding_to_modify);
+        restore_registration(app, &binding_to_modify);
         return Ok(BindingResponse {
             success: false,
             binding: None,
@@ -205,8 +212,8 @@ pub fn change_binding(
     settings.bindings.insert(id, updated_binding.clone());
 
     // Save the settings and synchronize any active Secure Input shadows.
-    settings::write_settings(&app, settings);
-    crate::secure_input::reconcile_fallback(&app);
+    app.save_settings(settings);
+    app.reconcile_fallback();
 
     // Return the updated binding
     Ok(BindingResponse {
@@ -220,21 +227,28 @@ pub fn change_binding(
 #[tauri::command]
 #[specta::specta]
 pub fn clear_binding(app: AppHandle, id: String) -> Result<ShortcutBinding, String> {
+    clear_binding_command_with(&app, id)
+}
+
+fn clear_binding_command_with(
+    app: &impl policy::CommandContext,
+    id: String,
+) -> Result<ShortcutBinding, String> {
     let _guard = BINDING_MUTATION_LOCK
         .lock()
         .map_err(|error| format!("Shortcut settings lock failed: {error}"))?;
-    let mut settings = settings::get_settings(&app);
+    let mut settings = app.settings();
     let binding = policy::clear_binding_with(&mut settings, &id, |binding| {
-        unregister_shortcut(&app, binding.clone())
+        unregister_shortcut(app, binding.clone())
     })?;
-    settings::write_settings(&app, settings);
-    crate::secure_input::reconcile_fallback(&app);
+    app.save_settings(settings);
+    app.reconcile_fallback();
     Ok(binding)
 }
 
 /// Best-effort re-register of the previous binding after a failed change,
 /// so a failure leaves the user's shortcut working exactly as before.
-fn restore_registration(app: &AppHandle, binding: &ShortcutBinding) {
+fn restore_registration(app: &impl policy::RegistrationContext, binding: &ShortcutBinding) {
     if let Err(e) = register_shortcut(app, binding.clone()) {
         error!(
             "Failed to restore previous binding '{}' ({}): {}",
@@ -1006,10 +1020,17 @@ pub fn change_auto_submit_key_setting(app: AppHandle, key: String) -> Result<(),
 #[tauri::command]
 #[specta::specta]
 pub fn change_post_process_enabled_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+    change_post_process_enabled_with(&app, enabled)
+}
+
+fn change_post_process_enabled_with(
+    app: &impl policy::CommandContext,
+    enabled: bool,
+) -> Result<(), String> {
     let _guard = BINDING_MUTATION_LOCK
         .lock()
         .map_err(|error| format!("Shortcut settings lock failed: {error}"))?;
-    let mut settings = settings::get_settings(&app);
+    let mut settings = app.settings();
     let clean = settings
         .bindings
         .get("transcribe_with_post_process")
@@ -1022,25 +1043,30 @@ pub fn change_post_process_enabled_setting(app: AppHandle, enabled: bool) -> Res
         }
     }
     settings.post_process_enabled = enabled;
-    settings::write_settings(&app, settings);
+    app.save_settings(settings);
 
     let result = (|| {
         if let Some(binding) = clean {
             if enabled {
-                register_shortcut(&app, binding)?;
+                register_shortcut(app, binding)?;
             } else {
-                unregister_shortcut(&app, binding)?;
+                unregister_shortcut(app, binding)?;
             }
         }
         if !enabled {
-            let settings = settings::get_settings(&app);
+            let settings = app.settings();
             if let Some(binding) = settings.bindings.get("transcribe").cloned() {
-                register_shortcut(&app, binding)?;
+                policy::register_nonempty(binding, |binding| {
+                    if !app.binding_is_registered(settings.keyboard_implementation, &binding)? {
+                        register_shortcut(app, binding)?;
+                    }
+                    Ok(())
+                })?;
             }
         }
         Ok(())
     })();
-    crate::secure_input::reconcile_fallback(&app);
+    app.reconcile_fallback();
     result
 }
 
