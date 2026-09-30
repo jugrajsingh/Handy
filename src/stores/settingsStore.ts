@@ -14,6 +14,7 @@ import type {
 } from "@/bindings";
 import { commands } from "@/bindings";
 import { toast } from "sonner";
+import i18n from "@/i18n";
 
 interface SettingsStore {
   settings: Settings | null;
@@ -41,6 +42,7 @@ interface SettingsStore {
   refreshOutputDevices: () => Promise<void>;
   updateBinding: (id: string, binding: string) => Promise<void>;
   resetBinding: (id: string) => Promise<void>;
+  clearBinding: (id: string) => Promise<void>;
   getSetting: <K extends keyof Settings>(key: K) => Settings[K] | undefined;
   isUpdatingKey: (key: string) => boolean;
   playTestSound: (soundType: "start" | "stop") => Promise<void>;
@@ -157,8 +159,13 @@ const settingUpdaters: {
   auto_submit_key: (value) =>
     commands.changeAutoSubmitKeySetting(value as string),
   history_limit: (value) => commands.updateHistoryLimit(value as number),
-  post_process_enabled: (value) =>
-    commands.changePostProcessEnabledSetting(value as boolean),
+  post_process_enabled: async (value) => {
+    const result = await commands.changePostProcessEnabledSetting(
+      value as boolean,
+    );
+    if (result.status === "error") throw new Error(result.error);
+    await useSettingsStore.getState().refreshSettings();
+  },
   post_process_selected_prompt_id: (value) =>
     commands.setPostProcessSelectedPrompt(value as string),
   mute_while_recording: (value) =>
@@ -342,6 +349,13 @@ export const useSettingsStore = create<SettingsStore>()(
         }
       } catch (error) {
         console.error(`Failed to update setting ${String(key)}:`, error);
+        if (key === "post_process_enabled") {
+          toast.error(
+            i18n.t("settings.general.shortcut.errors.set", {
+              error: String(error),
+            }),
+          );
+        }
         if (settings) {
           set({ settings: { ...settings, [key]: originalValue } });
         }
@@ -401,7 +415,7 @@ export const useSettingsStore = create<SettingsStore>()(
         console.error(`Failed to update binding ${id}:`, error);
 
         // Rollback on error
-        if (originalBinding && get().settings) {
+        if (originalBinding !== undefined && get().settings) {
           set((state) => ({
             settings: state.settings
               ? {
@@ -433,12 +447,33 @@ export const useSettingsStore = create<SettingsStore>()(
       setUpdating(updateKey, true);
 
       try {
-        await commands.resetBinding(id);
+        const result = await commands.resetBinding(id);
+        if (result.status === "error") throw new Error(result.error);
+        if (!result.data.success) {
+          throw new Error(result.data.error ?? "Failed to reset binding");
+        }
         await refreshSettings();
-      } catch (error) {
-        console.error(`Failed to reset binding ${id}:`, error);
+      } catch (error: unknown) {
+        toast.error(
+          i18n.t("settings.general.shortcut.errors.set", {
+            error: String(error),
+          }),
+        );
       } finally {
         setUpdating(updateKey, false);
+      }
+    },
+
+    clearBinding: async (id) => {
+      const { setUpdating, refreshSettings } = get();
+      const key = `binding_${id}`;
+      setUpdating(key, true);
+      try {
+        const result = await commands.clearBinding(id);
+        if (result.status === "error") throw new Error(result.error);
+        await refreshSettings();
+      } finally {
+        setUpdating(key, false);
       }
     },
 

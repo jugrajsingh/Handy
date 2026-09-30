@@ -167,17 +167,21 @@
         "none": "No shortcuts configured",
         "notFound": "Shortcut not found",
         "pressKeys": "Press keys...",
+        "unassigned": "Unassigned",
         "bindings": {
           "transcribe": {
             "name": "Transcribe Shortcut",
             "description": "The keyboard shortcut to record and transcribe your voice."
+          },
+          "transcribe_raw": {
+            "name": "Raw Transcript Shortcut"
           },
           "cancel": {
             "name": "Cancel Shortcut",
             "description": "The keyboard shortcut to cancel the current recording."
           },
           "transcribe_with_post_process": {
-            "name": "Post-Processing Hotkey",
+            "name": "Clean Transcript Shortcut",
             "description": "Optional: A dedicated hotkey that always applies AI post-processing to your transcription."
           }
         },

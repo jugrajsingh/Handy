@@ -11,6 +11,10 @@ import { useSettings } from "../../hooks/useSettings";
 import { useOsType } from "../../hooks/useOsType";
 import { commands } from "@/bindings";
 import { toast } from "sonner";
+import {
+  canClearShortcut,
+  shortcutLabelId,
+} from "@/lib/utils/shortcutPresentation";
 
 interface GlobalShortcutInputProps {
   descriptionMode?: "inline" | "tooltip";
@@ -26,14 +30,19 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
   disabled = false,
 }) => {
   const { t } = useTranslation();
-  const { getSetting, updateBinding, resetBinding, isUpdating, isLoading } =
-    useSettings();
+  const {
+    getSetting,
+    updateBinding,
+    resetBinding,
+    clearBinding,
+    isUpdating,
+    isLoading,
+  } = useSettings();
   const [keyPressed, setKeyPressed] = useState<string[]>([]);
   const [recordedKeys, setRecordedKeys] = useState<string[]>([]);
   const [editingShortcutId, setEditingShortcutId] = useState<string | null>(
     null,
   );
-  const [originalBinding, setOriginalBinding] = useState<string>("");
   const shortcutRefs = useRef<Map<string, HTMLDivElement | null>>(new Map());
   const osType = useOsType();
 
@@ -112,16 +121,6 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
                 error: String(error),
               }),
             );
-
-            // Reset to original binding on error
-            if (originalBinding) {
-              try {
-                await updateBinding(editingShortcutId, originalBinding);
-              } catch (resetError) {
-                console.error("Failed to reset binding:", resetError);
-                toast.error(t("settings.general.shortcut.errors.reset"));
-              }
-            }
           }
 
           // Re-register all bindings (the one just committed is already
@@ -132,7 +131,6 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
           setEditingShortcutId(null);
           setKeyPressed([]);
           setRecordedKeys([]);
-          setOriginalBinding("");
         }
       }
     };
@@ -142,20 +140,10 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
       if (cleanup) return;
       const activeElement = shortcutRefs.current.get(editingShortcutId);
       if (activeElement && !activeElement.contains(e.target as Node)) {
-        // Cancel shortcut recording and restore original binding
-        if (editingShortcutId && originalBinding) {
-          try {
-            await updateBinding(editingShortcutId, originalBinding);
-          } catch (error) {
-            console.error("Failed to restore original binding:", error);
-            toast.error(t("settings.general.shortcut.errors.restore"));
-          }
-        }
         await commands.resumeAllBindings().catch(console.error);
         setEditingShortcutId(null);
         setKeyPressed([]);
         setRecordedKeys([]);
-        setOriginalBinding("");
       }
     };
 
@@ -174,7 +162,6 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
     recordedKeys,
     editingShortcutId,
     bindings,
-    originalBinding,
     updateBinding,
     osType,
   ]);
@@ -187,8 +174,6 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
     // keystrokes) while keys are being recorded
     await commands.suspendAllBindings().catch(console.error);
 
-    // Store the original binding to restore if canceled
-    setOriginalBinding(bindings[id]?.current_binding || "");
     setEditingShortcutId(id);
     setKeyPressed([]);
     setRecordedKeys([]);
@@ -257,8 +242,19 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
   }
 
   // Get translated name and description for the binding
+  const enabled = getSetting("post_process_enabled") ?? false;
+  const labelId = shortcutLabelId(shortcutId, enabled);
+  const handleClear = async () => {
+    try {
+      await clearBinding(shortcutId);
+    } catch (error: unknown) {
+      toast.error(
+        t("settings.general.shortcut.errors.set", { error: String(error) }),
+      );
+    }
+  };
   const translatedName = t(
-    `settings.general.shortcut.bindings.${shortcutId}.name`,
+    `settings.general.shortcut.bindings.${labelId}.name`,
     binding.name,
   );
   const translatedDescription = t(
@@ -288,13 +284,29 @@ export const GlobalShortcutInput: React.FC<GlobalShortcutInputProps> = ({
             className="px-2 py-1 text-sm font-semibold bg-mid-gray/10 border border-mid-gray/80 hover:bg-logo-primary/10 rounded-md cursor-pointer hover:border-logo-primary"
             onClick={() => startRecording(shortcutId)}
           >
-            {formatKeyCombination(binding.current_binding, osType)}
+            {binding.current_binding
+              ? formatKeyCombination(binding.current_binding, osType)
+              : t("settings.general.shortcut.unassigned")}
           </div>
         )}
         <ResetButton
           onClick={() => resetBinding(shortcutId)}
           disabled={isUpdating(`binding_${shortcutId}`)}
         />
+        {canClearShortcut(shortcutId, enabled) && (
+          <button
+            type="button"
+            disabled={
+              disabled ||
+              isUpdating(`binding_${shortcutId}`) ||
+              editingShortcutId !== null
+            }
+            onClick={() => void handleClear()}
+            className="px-2 py-1 text-sm disabled:opacity-50"
+          >
+            {t("common.clear")}
+          </button>
+        )}
       </div>
     </SettingContainer>
   );
