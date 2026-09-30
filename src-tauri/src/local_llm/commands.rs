@@ -104,21 +104,25 @@ pub async fn set_local_llm_model(
         Arc::clone(manager.inner()),
         model_id,
         || settings::get_settings(&app),
-        |s| settings::write_settings(&app, s),
+        |s| settings::write_settings_checked(&app, s),
+        || crate::tray::update_tray_menu(&app),
     )
     .await
 }
 
-async fn set_local_llm_model_with_settings(
+/// Persists selection and refreshes the tray before the blocking model reset.
+pub(crate) async fn set_local_llm_model_with_settings(
     manager: Arc<LocalLlmManager>,
     model_id: Option<String>,
     read_settings: impl FnOnce() -> AppSettings,
-    write_settings: impl FnOnce(AppSettings),
+    write_settings: impl FnOnce(AppSettings) -> Result<(), String>,
+    refresh_tray: impl FnOnce(),
 ) -> Result<(), String> {
     let mut s = read_settings();
     let changed = s.local_llm_model_id != model_id;
     s.local_llm_model_id = model_id;
-    write_settings(s);
+    write_settings(s)?;
+    refresh_tray();
     tauri::async_runtime::spawn_blocking(move || {
         if changed {
             manager.unload();
@@ -210,7 +214,11 @@ mod tests {
                 read.send(()).unwrap();
                 snapshot
             },
-            move |s| *write_store.lock().unwrap() = s,
+            move |s| {
+                *write_store.lock().unwrap() = s;
+                Ok(())
+            },
+            || {},
         ));
         tokio::time::timeout(Duration::from_secs(1), read_done)
             .await
