@@ -194,7 +194,7 @@ export const HistorySettings: React.FC = () => {
               title: t("settings.history.clearHistory"),
               kind: "warning",
               okLabel: t("settings.history.clearHistory"),
-              cancelLabel: t("common.cancel"),
+              cancelLabel: t("modelSelector.cancel"),
             },
           ),
         setClearing,

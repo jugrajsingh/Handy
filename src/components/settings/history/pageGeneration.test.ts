@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import type { HistoryEntry, PaginatedHistory, Result } from "@/bindings";
+import en from "../../../i18n/locales/en/translation.json";
 import {
   PageGeneration,
   createHistoryActions,
@@ -265,4 +267,41 @@ for (const failureMode of ["command", "refresh"] as const) {
 mode = "ok";
 await actions.changeView("diff");
 assert.equal(error, null);
+
+const pageSource = readFileSync(
+  new URL("./HistorySettings.tsx", import.meta.url),
+  "utf8",
+);
+const dialogSource = pageSource.match(
+  /confirm: \(summary\) =>([\s\S]*?)\n\s*setClearing,/u,
+)?.[1];
+assert.ok(dialogSource, "Clear History confirmation must be present");
+const dialogKeys = Array.from(
+  dialogSource.matchAll(/\bt\("([^"]+)"/gu),
+  (match) => match[1],
+);
+assert.equal(
+  dialogKeys.length,
+  4,
+  "Audit the message, title, OK and Cancel translations",
+);
+function englishValue(key: string): unknown {
+  let value: unknown = en;
+  for (const part of key.split(".")) {
+    if (typeof value !== "object" || value === null || !(part in value))
+      return undefined;
+    value = (value as Record<string, unknown>)[part];
+  }
+  return value;
+}
+for (const key of dialogKeys) {
+  assert.equal(
+    typeof englishValue(key),
+    "string",
+    `Missing English dialog translation: ${key}`,
+  );
+}
+const cancelKey = dialogSource.match(/cancelLabel:\s*t\("([^"]+)"\)/u)?.[1];
+assert.ok(cancelKey, "Clear History cancel label must use a translation");
+assert.equal(englishValue(cancelKey), "Cancel");
 console.log("pageGeneration: all assertions passed");
