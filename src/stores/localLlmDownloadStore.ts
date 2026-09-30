@@ -14,6 +14,7 @@ interface LocalLlmDownloadStore {
   percentage: number | null;
   error: string | null;
   version: number;
+  clearError: () => void;
   start: (modelId: string) => boolean;
   progress: (modelId: string, percentage: number) => void;
   finish: (modelId: string, error: string | null) => void;
@@ -47,6 +48,8 @@ export const useLocalLlmDownloadStore = create<LocalLlmDownloadStore>(
     percentage: null,
     error: null,
     version: 0,
+
+    clearError: () => set({ error: null }),
 
     start: (modelId) => {
       if (get().modelId !== null) return false;
