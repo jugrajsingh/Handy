@@ -21,10 +21,16 @@ import { ModelSelect } from "../PostProcessingSettingsApi/ModelSelect";
 import { usePostProcessProviderState } from "../PostProcessingSettingsApi/usePostProcessProviderState";
 import { ShortcutInput } from "../ShortcutInput";
 import { useSettings } from "../../../hooks/useSettings";
+import {
+  LOCAL_LLM_PROVIDER_ID,
+  LocalLlmSettings,
+  useLocalLlmModels,
+} from "./LocalLlmSettings";
 
 const PostProcessingSettingsApiComponent: React.FC = () => {
   const { t } = useTranslation();
   const state = usePostProcessProviderState();
+  const isLocalLlm = state.selectedProvider?.id === LOCAL_LLM_PROVIDER_ID;
 
   return (
     <>
@@ -44,7 +50,9 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
         </div>
       </SettingContainer>
 
-      {state.isAppleProvider ? (
+      {isLocalLlm ? (
+        <LocalLlmSettings />
+      ) : state.isAppleProvider ? (
         state.appleIntelligenceUnavailable ? (
           <Alert variant="error" contained>
             {t("settings.postProcessing.api.appleIntelligence.unavailable")}
@@ -96,7 +104,7 @@ const PostProcessingSettingsApiComponent: React.FC = () => {
         </>
       )}
 
-      {!state.isAppleProvider && (
+      {!state.isAppleProvider && !isLocalLlm && (
         <SettingContainer
           title={t("settings.postProcessing.api.model.title")}
           description={
@@ -426,6 +434,14 @@ PostProcessingSettingsPrompts.displayName = "PostProcessingSettingsPrompts";
 
 export const PostProcessingSettings: React.FC = () => {
   const { t } = useTranslation();
+  const { getSetting } = useSettings();
+  const { models } = useLocalLlmModels();
+  const localModel = models.find(
+    (m) => m.id === getSetting("local_llm_model_id"),
+  );
+  const hidePrompts =
+    getSetting("post_process_provider_id") === LOCAL_LLM_PROVIDER_ID &&
+    (localModel?.prompt_style ?? "s1_control_line") === "s1_control_line";
 
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
@@ -442,7 +458,13 @@ export const PostProcessingSettings: React.FC = () => {
       </SettingsGroup>
 
       <SettingsGroup title={t("settings.postProcessing.prompts.title")}>
-        <PostProcessingSettingsPrompts />
+        {hidePrompts ? (
+          <p className="px-4 py-3 text-sm text-mid-gray">
+            {t("settings.postProcessing.localLlm.promptHidden")}
+          </p>
+        ) : (
+          <PostProcessingSettingsPrompts />
+        )}
       </SettingsGroup>
     </div>
   );

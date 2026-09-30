@@ -4,6 +4,9 @@ import { listen } from "@tauri-apps/api/event";
 import type {
   AppSettings as Settings,
   AudioDevice,
+  LocalLlmContext,
+  LocalLlmStructure,
+  LocalLlmStyling,
   TranscribeAcceleratorSetting,
   OrtAcceleratorSetting,
   ShortcutActivation,
@@ -194,6 +197,12 @@ const settingUpdaters: {
     commands.changeTranscribeGpuDevice(value as string | null),
   extra_recording_buffer_ms: (value) =>
     commands.changeExtraRecordingBufferSetting(value as number),
+  local_llm_styling: (value) =>
+    commands.changeLocalLlmStylingSetting(value as LocalLlmStyling),
+  local_llm_structure: (value) =>
+    commands.changeLocalLlmStructureSetting(value as LocalLlmStructure),
+  local_llm_context: (value) =>
+    commands.changeLocalLlmContextSetting(value as LocalLlmContext),
 };
 
 export const useSettingsStore = create<SettingsStore>()(

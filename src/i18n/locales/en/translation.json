@@ -452,6 +452,51 @@
         "cancel": "Cancel",
         "selectToEdit": "Select a prompt above to view and edit its details.",
         "createFirst": "Click 'Create New Prompt' above to create your first post-processing prompt."
+      },
+      "localLlm": {
+        "model": {
+          "title": "Local model",
+          "description": "Runs on this computer's CPU through a bundled llama.cpp server. Transcripts never leave the machine.",
+          "placeholder": "Select a model"
+        },
+        "download": "Download",
+        "downloading": "Downloading {{percent}}%",
+        "delete": "Delete",
+        "status": {
+          "title": "Status",
+          "description": "The model loads when a post-processing dictation starts and unloads after the model unload timeout.",
+          "notLoaded": "Not loaded",
+          "loading": "Loading",
+          "ready": "Ready",
+          "error": "Error: {{reason}}"
+        },
+        "styling": {
+          "title": "Styling",
+          "description": "How formal the cleaned text reads.",
+          "options": {
+            "casual": "Casual",
+            "semi_casual": "Semi-casual",
+            "semi_formal": "Semi-formal",
+            "formal": "Formal"
+          }
+        },
+        "structure": {
+          "title": "Structure",
+          "description": "Prose paragraphs or Markdown lists.",
+          "options": {
+            "prose": "Prose",
+            "lists": "Lists"
+          }
+        },
+        "context": {
+          "title": "Context",
+          "description": "General text or an email layout.",
+          "options": {
+            "general": "General",
+            "email": "Email"
+          }
+        },
+        "promptHidden": "This model uses its own fixed prompt and the Styling, Structure and Context settings above, so the prompt editor is hidden."
       }
     },
     "history": {
