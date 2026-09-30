@@ -10,6 +10,8 @@ use tauri_plugin_store::StoreExt;
 
 pub const APPLE_INTELLIGENCE_PROVIDER_ID: &str = "apple_intelligence";
 pub const APPLE_INTELLIGENCE_DEFAULT_MODEL_ID: &str = "Apple Intelligence";
+/// Provider id of the in-app llama-server post-processor (`local_llm` module).
+pub const LOCAL_LLM_PROVIDER_ID: &str = "local_llm";
 
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
 #[serde(rename_all = "lowercase")]
@@ -143,6 +145,35 @@ pub enum ModelUnloadTimeout {
     Min15,
     Hour1,
     Sec15, // Debug mode only
+}
+
+/// S1 control-line knob: how formal the cleaned text reads.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalLlmStyling {
+    Casual,
+    SemiCasual,
+    #[default]
+    SemiFormal,
+    Formal,
+}
+
+/// S1 control-line knob: prose paragraphs or Markdown lists.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalLlmStructure {
+    #[default]
+    Prose,
+    Lists,
+}
+
+/// S1 control-line knob: general text or an email layout.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalLlmContext {
+    #[default]
+    General,
+    Email,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Type)]
@@ -514,10 +545,26 @@ pub struct AppSettings {
     /// `overlay_position` (position `none` → style `None`).
     #[serde(default = "default_overlay_style")]
     pub overlay_style: OverlayStyle,
+    /// Registry id of the local LLM (provider `local_llm`); `None` until chosen.
+    #[serde(default)]
+    pub local_llm_model_id: Option<String>,
+    #[serde(default)]
+    pub local_llm_styling: LocalLlmStyling,
+    #[serde(default)]
+    pub local_llm_structure: LocalLlmStructure,
+    #[serde(default)]
+    pub local_llm_context: LocalLlmContext,
+    /// Inference threads for llama-server.
+    #[serde(default = "default_local_llm_threads")]
+    pub local_llm_threads: u8,
 }
 
 fn default_model() -> String {
     "".to_string()
+}
+
+fn default_local_llm_threads() -> u8 {
+    4
 }
 
 const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 2;
@@ -723,6 +770,16 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         allow_base_url_edit: false,
         models_endpoint: Some("/models".to_string()),
         supports_structured_output: true,
+    });
+
+    // In-app llama-server post-processor (see `local_llm`); no HTTP base URL.
+    providers.push(PostProcessProvider {
+        id: LOCAL_LLM_PROVIDER_ID.to_string(),
+        label: "Local (in-app)".to_string(),
+        base_url: "local-llm://in-app".to_string(),
+        allow_base_url_edit: false,
+        models_endpoint: None,
+        supports_structured_output: false,
     });
 
     // Custom provider always comes last
@@ -970,6 +1027,11 @@ pub fn get_default_settings() -> AppSettings {
         vad_enabled: default_vad_enabled(),
         vad_backend: VadBackend::default(),
         overlay_style: default_overlay_style(),
+        local_llm_model_id: None,
+        local_llm_styling: LocalLlmStyling::default(),
+        local_llm_structure: LocalLlmStructure::default(),
+        local_llm_context: LocalLlmContext::default(),
+        local_llm_threads: default_local_llm_threads(),
     }
 }
 
@@ -1241,6 +1303,78 @@ pub fn get_recording_retention_period(app: &AppHandle) -> RecordingRetentionPeri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn store_without_local_llm_keys_parses_with_local_llm_defaults() {
+        let mut stored = default_settings_json();
+        let obj = stored.as_object_mut().unwrap();
+        for key in [
+            "local_llm_model_id",
+            "local_llm_styling",
+            "local_llm_structure",
+            "local_llm_context",
+            "local_llm_threads",
+        ] {
+            assert!(obj.remove(key).is_some(), "fixture must contain {key}");
+        }
+        let settings: AppSettings =
+            serde_json::from_value(stored).expect("a pre-local-llm store must parse strictly");
+        assert_eq!(settings.local_llm_model_id, None);
+        assert_eq!(settings.local_llm_styling, LocalLlmStyling::SemiFormal);
+        assert_eq!(settings.local_llm_structure, LocalLlmStructure::Prose);
+        assert_eq!(settings.local_llm_context, LocalLlmContext::General);
+        assert_eq!(settings.local_llm_threads, 4);
+    }
+
+    #[test]
+    fn local_llm_knobs_serialize_in_snake_case() {
+        assert_eq!(
+            serde_json::to_value(LocalLlmStyling::SemiCasual).unwrap(),
+            serde_json::json!("semi_casual")
+        );
+        assert_eq!(
+            serde_json::to_value(LocalLlmStructure::Lists).unwrap(),
+            serde_json::json!("lists")
+        );
+        assert_eq!(
+            serde_json::to_value(LocalLlmContext::Email).unwrap(),
+            serde_json::json!("email")
+        );
+    }
+
+    #[test]
+    fn local_llm_provider_is_listed_before_custom() {
+        let providers = default_post_process_providers();
+        let local = providers
+            .iter()
+            .position(|p| p.id == LOCAL_LLM_PROVIDER_ID)
+            .expect("local_llm provider missing");
+        let custom = providers.iter().position(|p| p.id == "custom").unwrap();
+        assert_eq!(local + 1, custom, "local_llm sits right before custom");
+        let p = &providers[local];
+        assert_eq!(p.label, "Local (in-app)");
+        assert!(!p.allow_base_url_edit);
+        assert!(p.models_endpoint.is_none());
+        assert!(!p.supports_structured_output);
+    }
+
+    #[test]
+    fn ensure_post_process_defaults_adds_local_llm_to_an_old_store() {
+        let mut settings = get_default_settings();
+        settings
+            .post_process_providers
+            .retain(|p| p.id != LOCAL_LLM_PROVIDER_ID);
+        settings.post_process_api_keys.remove(LOCAL_LLM_PROVIDER_ID);
+        settings.post_process_models.remove(LOCAL_LLM_PROVIDER_ID);
+        assert!(ensure_post_process_defaults(&mut settings));
+        assert!(settings
+            .post_process_provider(LOCAL_LLM_PROVIDER_ID)
+            .is_some());
+        assert_eq!(
+            settings.post_process_models.get(LOCAL_LLM_PROVIDER_ID),
+            Some(&String::new())
+        );
+    }
 
     #[test]
     fn stored_binding_returns_the_requested_binding() {
