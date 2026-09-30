@@ -435,6 +435,12 @@ impl LlamaServerBackend {
         }
     }
 
+    fn spawn_child(&self, cmd: Command) -> io::Result<Child> {
+        let child = spawn_from_supervisor(cmd)?;
+        self.kill.publish(&child);
+        Ok(child)
+    }
+
     fn start_once(&self, binary: &Path, opts: &BackendOpts, deadline: Instant) -> StartOutcome {
         let port = match pick_port() {
             Ok(p) => p,
@@ -465,7 +471,7 @@ impl LlamaServerBackend {
         .stderr(Stdio::piped());
         #[cfg(target_os = "linux")]
         set_parent_death_signal(&mut cmd);
-        let mut child = match spawn_from_supervisor(cmd) {
+        let mut child = match self.spawn_child(cmd) {
             Ok(c) => c,
             Err(e) => {
                 return StartOutcome::Error(LocalLlmError::StartFailed(format!(
@@ -474,7 +480,6 @@ impl LlamaServerBackend {
                 )))
             }
         };
-        self.kill.publish(&child);
         forward_output(&mut child);
         match wait_healthy_inner(
             &client,
@@ -669,9 +674,9 @@ mod tests {
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        let child = spawn_from_supervisor(cmd).unwrap();
+        let child = backend.spawn_child(cmd).unwrap();
         let pid = child.id() as i32;
-        backend.kill.pid.store(pid, Ordering::SeqCst);
+        let published_pid = backend.kill.pid.load(Ordering::SeqCst);
         backend.running = Some(Running {
             child,
             port: 0,
@@ -689,6 +694,10 @@ mod tests {
         }
         let killed = !backend.is_alive();
         backend.unload();
+        assert_eq!(
+            published_pid, pid,
+            "PID must be published before the kill switch triggers"
+        );
         assert!(killed, "SIGKILL must stop the child before normal unload");
         assert_eq!(backend.kill.pid.load(Ordering::SeqCst), 0);
         assert!(

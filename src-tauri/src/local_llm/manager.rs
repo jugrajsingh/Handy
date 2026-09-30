@@ -494,6 +494,8 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct FakeState {
         pub request_block: bool,
+        pub request_ignores_kill: bool,
+        pub request_killed: Arc<AtomicBool>,
         pub request_started: Arc<AtomicBool>,
         pub request_release: Arc<AtomicBool>,
         pub loads: u32,
@@ -519,7 +521,7 @@ pub(crate) mod tests {
 
     impl TextModelBackend for FakeBackend {
         fn kill_switch(&self) -> Arc<dyn KillSwitch> {
-            Arc::new(FakeKillSwitch(lock(&self.0).request_release.clone()))
+            Arc::new(FakeKillSwitch(lock(&self.0).request_killed.clone()))
         }
 
         fn ensure_loaded(
@@ -551,10 +553,12 @@ pub(crate) mod tests {
         }
 
         fn generate(&mut self, req: &GenerateRequest) -> Result<String, LocalLlmError> {
-            let (block, started, release) = {
+            let (block, ignores_kill, killed, started, release) = {
                 let s = lock(&self.0);
                 (
                     s.request_block,
+                    s.request_ignores_kill,
+                    s.request_killed.clone(),
                     s.request_started.clone(),
                     s.request_release.clone(),
                 )
@@ -562,7 +566,9 @@ pub(crate) mod tests {
             if block {
                 started.store(true, Ordering::SeqCst);
                 for _ in 0..500 {
-                    if release.load(Ordering::SeqCst) {
+                    if release.load(Ordering::SeqCst)
+                        || (!ignores_kill && killed.load(Ordering::SeqCst))
+                    {
                         return Err(LocalLlmError::Transport("request interrupted".into()));
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -978,5 +984,59 @@ pub(crate) mod tests {
             h.manager.process("hello again", &h.settings),
             Err(LocalLlmError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn shutdown_returns_after_three_seconds_when_a_request_ignores_kill() {
+        let h = harness();
+        h.manager.ensure_started(&h.settings).unwrap();
+        let (started, release, killed) = {
+            let mut fake = lock(&h.fake);
+            fake.request_block = true;
+            fake.request_ignores_kill = true;
+            (
+                fake.request_started.clone(),
+                fake.request_release.clone(),
+                fake.request_killed.clone(),
+            )
+        };
+        let manager = h.manager.clone();
+        let settings = h.settings.clone();
+        let request = std::thread::spawn(move || manager.process("hello there friend", &settings));
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(started.load(Ordering::SeqCst), "request must be in flight");
+        let (returned, result) = std::sync::mpsc::channel();
+        let manager = h.manager.clone();
+        let shutdown = std::thread::spawn(move || {
+            let t0 = Instant::now();
+            manager.shutdown();
+            returned.send(t0.elapsed()).unwrap();
+        });
+        let elapsed = result.recv_timeout(Duration::from_secs(4));
+        let request_still_running = !request.is_finished();
+        release.store(true, Ordering::SeqCst);
+        assert!(request.join().unwrap().is_err());
+        shutdown.join().unwrap();
+        let elapsed =
+            elapsed.expect("shutdown must return within 4 s even when the request ignores kill");
+        eprintln!("shutdown cap observed: {elapsed:?}");
+        assert!(
+            (Duration::from_secs(3)..Duration::from_millis(3500)).contains(&elapsed),
+            "shutdown must return within [3.0 s, 3.5 s), observed {elapsed:?}"
+        );
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "kill switch must have been triggered"
+        );
+        assert!(
+            request_still_running,
+            "request must remain blocked after shutdown returns"
+        );
+        assert_eq!(state(&h), LocalLlmStateKind::Unloaded);
     }
 }
