@@ -59,7 +59,8 @@
           "type": "none"
         },
         "files": {
-          "/usr/lib/Handy": "transcribe-libs"
+          "/usr/lib/Handy": "transcribe-libs",
+          "/usr/lib/Handy/llm": "llm-bin"
         }
       },
       "appimage": {
