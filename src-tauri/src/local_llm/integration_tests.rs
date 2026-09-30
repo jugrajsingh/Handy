@@ -4,12 +4,13 @@
 
 #![cfg(target_os = "linux")]
 
-use super::llama_server::LlamaServerBackend;
+use super::llama_server::{loopback_client, LlamaServerBackend};
 use super::manager::{IdleInputs, LocalLlmManager, ManagerConfig, ManagerHooks};
 use super::registry;
 use crate::settings::{get_default_settings, ModelUnloadTimeout, LOCAL_LLM_PROVIDER_ID};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[derive(serde::Deserialize)]
 struct Golden {
@@ -65,7 +66,7 @@ fn real_server_matches_goldens_and_is_gone_after_unload() {
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(&model, &dest).unwrap();
 
-    let manager = LocalLlmManager::new(
+    let manager = Arc::new(LocalLlmManager::new(
         Box::new(LlamaServerBackend::new()),
         Some(root.path().to_path_buf()),
         ManagerHooks {
@@ -79,7 +80,7 @@ fn real_server_matches_goldens_and_is_gone_after_unload() {
             start_timeout: Duration::from_secs(30),
             idle_tick: Duration::from_secs(3600),
         },
-    );
+    ));
     let mut settings = get_default_settings();
     settings.post_process_provider_id = LOCAL_LLM_PROVIDER_ID.to_string();
     settings.local_llm_model_id = Some(entry.id.to_string());
@@ -106,9 +107,58 @@ fn real_server_matches_goldens_and_is_gone_after_unload() {
         children[0],
         rss_kib(children[0])
     );
+    let cmdline = std::fs::read(format!("/proc/{}/cmdline", children[0])).unwrap();
+    let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
+    assert!(!args.contains(&b"--api-key".as_slice()));
+    let port = args
+        .windows(2)
+        .find(|pair| pair[0] == b"--port")
+        .map(|pair| {
+            std::str::from_utf8(pair[1])
+                .unwrap()
+                .parse::<u16>()
+                .unwrap()
+        })
+        .expect("server command must specify its port");
+    let response = loopback_client()
+        .unwrap()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .bearer_auth("wrong")
+        .timeout(Duration::from_secs(10))
+        .json(&serde_json::json!({
+            "messages": [{"role": "user", "content": "Hello."}],
+            "max_tokens": 1,
+            "stream": false,
+        }))
+        .send()
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::UNAUTHORIZED);
     manager.unload();
     assert!(
         llama_children().is_empty(),
         "llama-server must be gone after unload()"
+    );
+
+    manager.ensure_started(&settings).unwrap();
+    let request_manager = Arc::clone(&manager);
+    let request = std::thread::spawn(move || {
+        let transcript = "today we reviewed the project schedule and agreed to send the updated report to the entire team tomorrow morning. ".repeat(60);
+        request_manager.process(&transcript, &settings)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!request.is_finished(), "request must still be in flight");
+    let started = Instant::now();
+    manager.shutdown();
+    let elapsed = started.elapsed();
+    let children = llama_children();
+    let result = request.join().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "shutdown took {elapsed:?}"
+    );
+    assert!(result.is_err(), "shutdown must interrupt the request");
+    assert!(
+        children.is_empty(),
+        "shutdown must reap every llama-server child"
     );
 }
