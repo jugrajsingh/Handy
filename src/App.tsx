@@ -350,7 +350,7 @@ function App() {
           </div>
         </div>
         {/* Fixed footer at bottom */}
-        <Footer onShowHistory={showHistory} />
+        <Footer onShowHistory={showHistory} onOpenPostProcessing={() => setCurrentSection("postprocessing")} />
         <FileDropOverlay onDropped={showHistory} />
       </div>
     );

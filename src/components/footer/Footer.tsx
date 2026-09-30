@@ -2,15 +2,13 @@ import React, { useState, useEffect } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 
 import ModelSelector from "../model-selector";
+import { LocalLlmModelSelector } from "../model-selector/LocalLlmModelSelector";
 import UpdateChecker from "../update-checker";
 import NoticeChip from "./NoticeChip";
 import TranscriptionStatus from "./TranscriptionStatus";
 
-interface FooterProps {
-  onShowHistory: () => void;
-}
-
-const Footer: React.FC<FooterProps> = ({ onShowHistory }) => {
+interface FooterProps { onShowHistory: () => void; onOpenPostProcessing: () => void; }
+const Footer: React.FC<FooterProps> = ({ onShowHistory, onOpenPostProcessing }) => {
   const [version, setVersion] = useState("");
 
   useEffect(() => {
@@ -33,6 +31,7 @@ const Footer: React.FC<FooterProps> = ({ onShowHistory }) => {
         <div className="flex items-center gap-4">
           <ModelSelector />
           <TranscriptionStatus onShowHistory={onShowHistory} />
+          <LocalLlmModelSelector onOpenPostProcessing={onOpenPostProcessing} />
         </div>
 
         <div className="flex items-center gap-3">

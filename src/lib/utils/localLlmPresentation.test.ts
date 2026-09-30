@@ -1,0 +1,252 @@
+import assert from "node:assert/strict";
+import type { LocalLlmModelInfo, LocalLlmStatus, Result } from "@/bindings";
+import {
+  cleanupStatus,
+  cleanupPickerPresentation,
+  createCleanupModelPickerActions,
+  providerGroupKey,
+  selectedDownloadedModel,
+  type CleanupModelPickerDependencies,
+} from "./localLlmPresentation";
+
+const model: LocalLlmModelInfo = {
+  id: "s1-mini-q4km",
+  display_name: "S1-mini",
+  downloaded: true,
+  attribution: "Superwhisper",
+  card_url: "https://superwhisper.com",
+  size_bytes: 484219808,
+  prompt_style: "s1_control_line",
+};
+assert.equal(
+  selectedDownloadedModel([model], model.id)?.display_name,
+  "S1-mini",
+);
+assert.equal(
+  selectedDownloadedModel([{ ...model, downloaded: false }], model.id),
+  null,
+);
+assert.equal(selectedDownloadedModel([model], "deleted-id"), null);
+assert.equal(selectedDownloadedModel([], model.id), null);
+assert.equal(selectedDownloadedModel([model], null), null);
+for (const [state, expected] of [
+  ["ready", "ready"],
+  ["starting", "loading"],
+  ["stopping", "loading"],
+  ["failed", "error"],
+  ["unloaded", "unloaded"],
+] as const) {
+  const status: LocalLlmStatus = { state, model_id: model.id, error: null };
+  assert.equal(cleanupStatus(status), expected);
+}
+assert.equal(cleanupStatus(null), "unloaded");
+assert.equal(
+  providerGroupKey("local_llm"),
+  "settings.postProcessing.localLlm.groupTitle",
+);
+assert.equal(providerGroupKey("openai"), "settings.postProcessing.api.title");
+assert.equal(
+  providerGroupKey("apple_intelligence"),
+  "settings.postProcessing.api.title",
+);
+
+const models = [
+  model,
+  { ...model, id: "downloaded-b", display_name: "Alternative B" },
+  { ...model, id: "downloaded-c", display_name: "Alternative C" },
+  { ...model, id: "missing", downloaded: false },
+];
+const ready: LocalLlmStatus = {
+  state: "ready",
+  model_id: model.id,
+  error: null,
+};
+for (const selectedId of ["deleted-id", "missing", null]) {
+  const view = cleanupPickerPresentation(
+    models,
+    selectedId,
+    true,
+    "local_llm",
+    ready,
+  );
+  assert.equal(view.visible, true);
+  assert.equal(
+    view.selected,
+    null,
+    "stale or deleted selection is never Active",
+  );
+  assert.equal(view.status, "none");
+  assert.deepEqual(
+    view.downloaded.map((entry) => entry.id),
+    [model.id, "downloaded-b", "downloaded-c"],
+  );
+}
+for (const enabled of [false, true]) {
+  for (const provider of [
+    "local_llm",
+    "openai",
+    "apple_intelligence",
+    undefined,
+  ]) {
+    assert.equal(
+      cleanupPickerPresentation(models, model.id, enabled, provider, ready)
+        .visible,
+      enabled && provider === "local_llm",
+    );
+  }
+}
+assert.equal(
+  cleanupPickerPresentation(models, model.id, true, "local_llm", ready).status,
+  "ready",
+);
+
+const ok: Result<null, string> = { status: "ok", data: null };
+function setup(overrides: Partial<CleanupModelPickerDependencies> = {}) {
+  const calls: string[] = [];
+  const errors: (string | null)[] = [];
+  const selecting: boolean[] = [];
+  let open = false;
+  const deps: CleanupModelPickerDependencies = {
+    getModels: () => models,
+    getOpen: () => open,
+    setOpen: (value) => {
+      open = value;
+      calls.push(`open:${value}`);
+    },
+    setSelecting: (value) => selecting.push(value),
+    setError: (value) => errors.push(value),
+    onOpenPostProcessing: () => calls.push("navigate"),
+    setLocalLlmModel: async (id) => {
+      calls.push(`select:${id}`);
+      return ok;
+    },
+    refreshSettingsChecked: async () => {
+      calls.push("settings");
+    },
+    reloadChecked: async () => {
+      calls.push("registry");
+    },
+    ...overrides,
+  };
+  return {
+    actions: createCleanupModelPickerActions(deps),
+    calls,
+    errors,
+    selecting,
+    isOpen: () => open,
+  };
+}
+for (const entry of models.filter((entry) => entry.downloaded)) {
+  const state = setup();
+  await state.actions.toggle();
+  assert.deepEqual(state.calls, ["open:true", "registry"]);
+  await state.actions.select(entry.id);
+  assert.deepEqual(state.calls, [
+    "open:true",
+    "registry",
+    `select:${entry.id}`,
+    "settings",
+    "registry",
+    "open:false",
+  ]);
+  assert.deepEqual(state.selecting, [true, false]);
+  assert.deepEqual(state.errors, [null, null]);
+}
+for (const entries of [[], [{ ...model, downloaded: false }]]) {
+  const state = setup({ getModels: () => entries });
+  await state.actions.toggle();
+  assert.deepEqual(
+    state.calls,
+    ["navigate"],
+    "no downloads opens post-processing settings",
+  );
+  assert.equal(state.isOpen(), false);
+}
+const closing = setup();
+await closing.actions.toggle();
+await closing.actions.toggle();
+assert.deepEqual(closing.calls, ["open:true", "registry", "open:false"]);
+for (const failure of ["result", "transport", "refresh", "reload"] as const) {
+  const message = `${failure} failed`;
+  const operations: string[] = [];
+  const state = setup({
+    setLocalLlmModel: async (id) => {
+      operations.push(`select:${id}`);
+      if (failure === "transport") throw new Error(message);
+      if (failure === "result") return { status: "error", error: message };
+      return ok;
+    },
+    refreshSettingsChecked: async () => {
+      operations.push("settings");
+      if (failure === "refresh") throw new Error(message);
+    },
+    reloadChecked: async () => {
+      operations.push("registry");
+      if (failure === "reload") throw message;
+    },
+  });
+  await state.actions.toggle();
+  await state.actions.select("downloaded-b");
+  assert.equal(state.errors[state.errors.length - 1], message);
+  assert.equal(state.isOpen(), true, "failed actions keep the picker open");
+  assert.deepEqual(state.selecting, [true, false]);
+  assert.deepEqual(
+    operations,
+    [
+      "registry",
+      "select:downloaded-b",
+      ...(failure === "refresh" || failure === "reload" ? ["settings"] : []),
+      ...(failure === "reload" ? ["registry"] : []),
+    ],
+    "failed dependencies stop the remaining selection sequence",
+  );
+}
+const openFailure = setup({
+  reloadChecked: async () => {
+    throw new Error("open reload failed");
+  },
+});
+await openFailure.actions.toggle();
+assert.deepEqual(openFailure.errors, [null, "open reload failed"]);
+assert.equal(openFailure.isOpen(), true);
+for (const id of ["missing", "deleted-id"]) {
+  const state = setup();
+  await state.actions.select(id);
+  assert.deepEqual(
+    state.calls,
+    [],
+    "only downloaded registry entries can be selected",
+  );
+  assert.deepEqual(state.selecting, []);
+}
+let finishRefresh!: () => void;
+const pendingRefresh = new Promise<void>((resolve) => {
+  finishRefresh = resolve;
+});
+const busy = setup({ refreshSettingsChecked: () => pendingRefresh });
+await busy.actions.toggle();
+const pending = busy.actions.select(model.id);
+await Promise.resolve();
+assert.deepEqual(
+  busy.selecting,
+  [true],
+  "selection stays busy through refresh",
+);
+await busy.actions.select("downloaded-b");
+await busy.actions.toggle();
+assert.deepEqual(
+  busy.calls,
+  ["open:true", "registry", `select:${model.id}`],
+  "busy action cannot issue a second command",
+);
+finishRefresh();
+await pending;
+assert.deepEqual(busy.selecting, [true, false]);
+assert.equal(busy.isOpen(), false);
+await busy.actions.select("downloaded-c");
+assert.equal(
+  busy.calls.includes("select:downloaded-c"),
+  true,
+  "busy guard releases after completion",
+);
+console.log("localLlmPresentation: all assertions passed");
