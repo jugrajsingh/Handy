@@ -4,7 +4,7 @@ use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, S
 use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error, VadPolicy};
 use crate::local_llm::LocalLlmManager;
 use crate::managers::audio::AudioRecordingManager;
-use crate::managers::history::HistoryManager;
+use crate::managers::history::{HistoryManager, PostProcessProvenance};
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::TranscriptionManager;
@@ -427,6 +427,17 @@ pub(crate) struct ProcessedTranscription {
     pub final_text: String,
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
+    pub provenance: Option<PostProcessProvenance>,
+}
+
+fn cleanup_provenance(settings: &AppSettings) -> PostProcessProvenance {
+    let provider = settings.post_process_provider_id.clone();
+    let model = if provider == LOCAL_LLM_PROVIDER_ID {
+        settings.local_llm_model_id.clone()
+    } else {
+        settings.post_process_models.get(&provider).cloned()
+    };
+    PostProcessProvenance { provider, model }
 }
 
 /// Resolve the persisted language *intent* into the language the currently-loaded
@@ -459,6 +470,7 @@ pub(crate) async fn process_transcription_output(
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
+    let mut provenance = None;
 
     // Resolve the language the transcription actually ran in (the persisted
     // intent coerced against the loaded model's capabilities) so OpenCC keys off
@@ -473,6 +485,7 @@ pub(crate) async fn process_transcription_output(
     if post_process {
         if let Some(processed_text) = post_process_transcription(app, &settings, &final_text).await
         {
+            provenance = Some(cleanup_provenance(&settings));
             post_processed_text = Some(processed_text.clone());
             final_text = processed_text;
 
@@ -494,6 +507,7 @@ pub(crate) async fn process_transcription_output(
         final_text,
         post_processed_text,
         post_process_prompt,
+        provenance,
     }
 }
 
@@ -849,6 +863,7 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
+                                    processed.provenance.clone(),
                                 ) {
                                     error!("Failed to save history entry: {}", err);
                                 }
@@ -910,6 +925,7 @@ impl ShortcutAction for TranscribeAction {
                                     file_name,
                                     String::new(),
                                     post_process,
+                                    None,
                                     None,
                                     None,
                                 ) {
@@ -1000,7 +1016,7 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, post_process_route,
+        cleanup_provenance, complete_unless_cancelled, is_blank_transcription, post_process_route,
         should_use_streaming_overlay, strip_think_block, PostProcessRoute,
     };
     use crate::settings::OverlayStyle;
@@ -1009,6 +1025,27 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn provenance_keeps_the_request_snapshot_when_settings_change() {
+        let mut settings = crate::settings::get_default_settings();
+        settings.post_process_provider_id = "local_llm".into();
+        settings.local_llm_model_id = Some("s1-mini-q4km".into());
+        let request = settings.clone();
+        settings.local_llm_model_id = Some("later-selection".into());
+        let provenance = cleanup_provenance(&request);
+        assert_eq!(provenance.provider, "local_llm");
+        assert_eq!(provenance.model.as_deref(), Some("s1-mini-q4km"));
+        for provider in ["openai", "custom", "apple_intelligence"] {
+            settings.post_process_provider_id = provider.into();
+            settings
+                .post_process_models
+                .insert(provider.into(), "actual-api-model".into());
+            let provenance = cleanup_provenance(&settings);
+            assert_eq!(provenance.provider, provider);
+            assert_eq!(provenance.model.as_deref(), Some("actual-api-model"));
+        }
+    }
 
     #[test]
     fn local_llm_provider_routes_locally_even_without_model_or_prompt() {
