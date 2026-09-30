@@ -44,21 +44,13 @@ pub fn resolve_binary(
 }
 
 /// Command-line arguments for one spawn.
-pub fn server_args(
-    model_path: &Path,
-    port: u16,
-    api_key: &str,
-    threads: u8,
-    ctx: u32,
-) -> Vec<OsString> {
+pub fn server_args(model_path: &Path, port: u16, threads: u8, ctx: u32) -> Vec<OsString> {
     let mut args: Vec<OsString> = vec!["-m".into(), model_path.as_os_str().to_owned()];
     let rest = [
         "--host".to_string(),
         "127.0.0.1".to_string(),
         "--port".to_string(),
         port.to_string(),
-        "--api-key".to_string(),
-        api_key.to_string(),
         "-t".to_string(),
         threads.max(1).to_string(),
         "-c".to_string(),
@@ -74,6 +66,18 @@ pub fn server_args(
     ];
     args.extend(rest.into_iter().map(OsString::from));
     args
+}
+
+fn build_command(binary: &Path, opts: &BackendOpts, port: u16, api_key: &str) -> Command {
+    let mut cmd = Command::new(binary);
+    cmd.args(server_args(&opts.model_path, port, opts.threads, opts.ctx))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    cmd.env("LLAMA_API_KEY", api_key);
+    #[cfg(target_os = "linux")]
+    set_parent_death_signal(&mut cmd);
+    cmd
 }
 
 /// A currently free loopback port; `ensure_loaded` retries an early exit once.
@@ -351,6 +355,7 @@ impl ChildKillSwitch {
         }
     }
 
+    /// Also publishes the live child PID while polling for exit.
     fn try_wait(&self, child: &mut Child) -> io::Result<Option<std::process::ExitStatus>> {
         let _guard = lock(&self.gate);
         self.pid.store(0, Ordering::SeqCst);
@@ -459,19 +464,7 @@ impl LlamaServerBackend {
             Ok(c) => c,
             Err(e) => return StartOutcome::Error(e),
         };
-        let mut cmd = Command::new(binary);
-        cmd.args(server_args(
-            &opts.model_path,
-            port,
-            &api_key,
-            opts.threads,
-            opts.ctx,
-        ))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-        #[cfg(target_os = "linux")]
-        set_parent_death_signal(&mut cmd);
+        let cmd = build_command(binary, opts, port, &api_key);
         let mut child = match self.spawn_child(cmd) {
             Ok(c) => c,
             Err(e) => {
@@ -707,6 +700,46 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ensure_loaded_publishes_the_child_pid_and_the_kill_switch_stops_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let bin = fake_binary(
+            dir.path(),
+            &format!("echo $$ > '{}'\nexec sleep 30", pidfile.display()),
+        );
+        let mut backend = LlamaServerBackend::with_binary(bin);
+        let kill = Arc::clone(&backend.kill);
+        let options = opts(dir.path().join("m.gguf"), Duration::from_secs(10));
+        let (tx, rx) = mpsc::channel();
+        let start = std::thread::spawn(move || {
+            let result = backend.ensure_loaded(registry::find("s1-mini-q4km").unwrap(), &options);
+            tx.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut pid = None;
+        while Instant::now() < deadline {
+            pid = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|value| value.trim().parse::<i32>().ok());
+            if pid.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let published_pid = kill.pid.load(Ordering::SeqCst);
+        let stopped = Instant::now();
+        kill.trigger();
+        let result = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        start.join().unwrap();
+        let pid = pid.expect("fake server must write its PID within 2 s");
+        assert_eq!(published_pid, pid, "startup must publish the child PID");
+        assert!(matches!(result, Err(LocalLlmError::StartFailed(_))));
+        assert!(stopped.elapsed() < Duration::from_secs(2));
+        assert!(!Path::new(&format!("/proc/{pid}")).exists());
+    }
+
     #[test]
     fn env_override_wins_and_missing_binary_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -731,17 +764,28 @@ mod tests {
 
     #[test]
     fn server_args_match_the_card_contract() {
-        let args = server_args(Path::new("/m/s1.gguf"), 4242, "k3y", 4, 4096);
+        let args = server_args(Path::new("/m/s1.gguf"), 4242, 4, 4096);
         let args: Vec<String> = args.into_iter().map(|a| a.into_string().unwrap()).collect();
         assert_eq!(
             args.join(" "),
-            "-m /m/s1.gguf --host 127.0.0.1 --port 4242 --api-key k3y -t 4 -c 4096 -np 1 --temp 0 --jinja --chat-template-kwargs {\"enable_thinking\":false} --no-webui"
+            "-m /m/s1.gguf --host 127.0.0.1 --port 4242 -t 4 -c 4096 -np 1 --temp 0 --jinja --chat-template-kwargs {\"enable_thinking\":false} --no-webui"
         );
     }
 
     #[test]
+    fn api_key_travels_in_the_environment_not_argv() {
+        let options = opts(PathBuf::from("/m/s1.gguf"), Duration::from_secs(10));
+        let key = "test-only-key";
+        let cmd = build_command(Path::new("/llm/llama-server"), &options, 4242, key);
+        assert!(!cmd.get_args().any(|arg| arg == "--api-key" || arg == key));
+        assert!(cmd.get_envs().any(|(name, value)| {
+            name == "LLAMA_API_KEY" && value == Some(std::ffi::OsStr::new(key))
+        }));
+    }
+
+    #[test]
     fn server_args_clamp_zero_threads_to_one() {
-        let args = server_args(Path::new("/m/s1.gguf"), 4242, "k3y", 0, 4096);
+        let args = server_args(Path::new("/m/s1.gguf"), 4242, 0, 4096);
         let threads = args.iter().position(|arg| arg == "-t").unwrap();
         assert_eq!(args[threads + 1], OsString::from("1"));
     }
