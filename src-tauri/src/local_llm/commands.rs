@@ -3,7 +3,7 @@
 use super::registry::{self, PromptStyle};
 use super::{download, LocalLlmManager, LocalLlmStatus};
 use crate::managers::model::DownloadProgress;
-use crate::settings::{self, LocalLlmContext, LocalLlmStructure, LocalLlmStyling};
+use crate::settings::{self, AppSettings, LocalLlmContext, LocalLlmStructure, LocalLlmStyling};
 use serde::Serialize;
 use specta::Type;
 use std::sync::Arc;
@@ -100,9 +100,25 @@ pub async fn set_local_llm_model(
     if let Some(id) = &model_id {
         entry(id)?;
     }
-    let mut s = settings::get_settings(&app);
+    set_local_llm_model_with_settings(
+        Arc::clone(manager.inner()),
+        model_id,
+        || settings::get_settings(&app),
+        |s| settings::write_settings(&app, s),
+    )
+    .await
+}
+
+async fn set_local_llm_model_with_settings(
+    manager: Arc<LocalLlmManager>,
+    model_id: Option<String>,
+    read_settings: impl FnOnce() -> AppSettings,
+    write_settings: impl FnOnce(AppSettings),
+) -> Result<(), String> {
+    let mut s = read_settings();
     let changed = s.local_llm_model_id != model_id;
-    let manager = Arc::clone(manager.inner());
+    s.local_llm_model_id = model_id;
+    write_settings(s);
     tauri::async_runtime::spawn_blocking(move || {
         if changed {
             manager.unload();
@@ -111,8 +127,6 @@ pub async fn set_local_llm_model(
     })
     .await
     .map_err(|e| format!("local model selection worker failed: {e}"))?;
-    s.local_llm_model_id = model_id;
-    settings::write_settings(&app, s);
     Ok(())
 }
 
@@ -150,4 +164,70 @@ pub fn change_local_llm_context_setting(
     s.local_llm_context = context;
     settings::write_settings(&app, s);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::local_llm::manager::tests::harness;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn model_selection_preserves_settings_changed_during_unload() {
+        let h = harness();
+        let (started, release) = {
+            let mut fake = h.fake.lock().unwrap();
+            fake.request_block = true;
+            (fake.request_started.clone(), fake.request_release.clone())
+        };
+        let manager = h.manager.clone();
+        let settings = h.settings.clone();
+        let request = std::thread::spawn(move || manager.process("hello there friend", &settings));
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.load(Ordering::SeqCst), "request must be in flight");
+
+        let mut initial = h.settings.clone();
+        initial.local_llm_model_id = None;
+        let store = Arc::new(Mutex::new(initial));
+        let read_store = store.clone();
+        let write_store = store.clone();
+        let manager = h.manager.clone();
+        let model_id = h.settings.local_llm_model_id.clone();
+        let (read, read_done) = oneshot::channel();
+        let selection = tokio::spawn(set_local_llm_model_with_settings(
+            manager,
+            model_id.clone(),
+            move || {
+                let snapshot = read_store.lock().unwrap().clone();
+                read.send(()).unwrap();
+                snapshot
+            },
+            move |s| *write_store.lock().unwrap() = s,
+        ));
+        tokio::time::timeout(Duration::from_secs(1), read_done)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!selection.is_finished(), "unload must wait for the request");
+        store.lock().unwrap().local_llm_styling = LocalLlmStyling::Formal;
+        release.store(true, Ordering::SeqCst);
+        assert!(request.join().unwrap().is_err());
+        tokio::time::timeout(Duration::from_secs(1), selection)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let saved = store.lock().unwrap();
+        assert_eq!(saved.local_llm_model_id, model_id);
+        assert_eq!(saved.local_llm_styling, LocalLlmStyling::Formal);
+    }
 }
