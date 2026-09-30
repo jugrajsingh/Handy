@@ -25,24 +25,6 @@ fn registration_state(app: &AppHandle) -> tauri::State<'_, RegisteredShortcuts> 
     app.state::<RegisteredShortcuts>()
 }
 
-/// Check that this binding owns the same shortcut and remains natively registered.
-pub(super) fn binding_is_registered(
-    app: &AppHandle,
-    binding: &ShortcutBinding,
-) -> Result<bool, String> {
-    let shortcut = binding
-        .current_binding
-        .parse::<Shortcut>()
-        .map_err(|error| error.to_string())?;
-    let state = registration_state(app);
-    let registered = state
-        .0
-        .lock()
-        .map_err(|error| format!("Shortcut ownership lock failed: {error}"))?;
-    Ok(registered.get(&binding.id) == Some(&shortcut)
-        && app.global_shortcut().is_registered(shortcut))
-}
-
 /// Initialize shortcuts using Tauri's global-shortcut plugin
 pub fn init_shortcuts(app: &impl super::policy::RegistrationContext) {
     let user_settings = app.load_settings();

@@ -18,18 +18,13 @@ pub trait RegistrationContext {
     fn manage_handy_keys(&self, state: Self::HandyKeys);
 }
 
-/// Supplies native mutation, ownership queries and fallback synchronization for commands.
+/// Supplies native mutation and fallback synchronization for commands.
 pub trait CommandContext: RegistrationContext {
     fn unregister_native(
         &self,
         implementation: KeyboardImplementation,
         binding: ShortcutBinding,
     ) -> Result<(), String>;
-    fn binding_is_registered(
-        &self,
-        implementation: KeyboardImplementation,
-        binding: &ShortcutBinding,
-    ) -> Result<bool, String>;
     fn reconcile_fallback(&self);
 }
 
@@ -43,21 +38,6 @@ impl CommandContext for tauri::AppHandle {
             KeyboardImplementation::Tauri => super::tauri_impl::unregister_shortcut(self, binding),
             KeyboardImplementation::HandyKeys => {
                 super::handy_keys::unregister_shortcut(self, binding)
-            }
-        }
-    }
-
-    fn binding_is_registered(
-        &self,
-        implementation: KeyboardImplementation,
-        binding: &ShortcutBinding,
-    ) -> Result<bool, String> {
-        match implementation {
-            KeyboardImplementation::Tauri => {
-                super::tauri_impl::binding_is_registered(self, binding)
-            }
-            KeyboardImplementation::HandyKeys => {
-                super::handy_keys::binding_is_registered(self, binding)
             }
         }
     }
@@ -578,7 +558,7 @@ mod command_path_tests {
             self.operations
                 .borrow_mut()
                 .push(format!("register:{}", binding.id));
-            if self.register_error.get() {
+            if self.register_error.replace(false) {
                 return Err("native registration failed".into());
             }
             let key = normalized_binding(&binding.current_binding, implementation)?;
@@ -617,18 +597,6 @@ mod command_path_tests {
             }
             self.registered.borrow_mut().remove(&binding.id);
             Ok(())
-        }
-
-        fn binding_is_registered(
-            &self,
-            implementation: KeyboardImplementation,
-            binding: &ShortcutBinding,
-        ) -> Result<bool, String> {
-            self.operations
-                .borrow_mut()
-                .push(format!("query:{}", binding.id));
-            let key = normalized_binding(&binding.current_binding, implementation)?;
-            Ok(self.registered.borrow().get(&binding.id) == Some(&key))
         }
 
         fn reconcile_fallback(&self) {}
@@ -723,6 +691,7 @@ mod command_path_tests {
                 } else {
                     context.register_error.set(true);
                 }
+                let before = context.stored();
                 let error = change_post_process_enabled_with(&context, false).unwrap_err();
                 assert!(error.contains(if foreign_owner {
                     "already in use"
@@ -730,8 +699,51 @@ mod command_path_tests {
                     "native registration failed"
                 }));
                 assert!(!context.registered.borrow().contains_key("transcribe"));
-                assert!(!context.persisted().post_process_enabled);
+                assert!(context.persisted().post_process_enabled);
+                assert!(context
+                    .registered
+                    .borrow()
+                    .contains_key("transcribe_with_post_process"));
+                assert!(context.persisted().bindings["transcribe"]
+                    .current_binding
+                    .is_empty());
+                assert_eq!(context.stored(), before);
+                assert_eq!(
+                    *context.operations.borrow(),
+                    [
+                        "unregister:transcribe_with_post_process",
+                        "register:transcribe",
+                        "register:transcribe_with_post_process",
+                    ]
+                );
             }
+        }
+    }
+
+    #[test]
+    fn enable_native_failure_leaves_feature_disabled_and_storage_unchanged() {
+        for implementation in [
+            KeyboardImplementation::Tauri,
+            KeyboardImplementation::HandyKeys,
+        ] {
+            let mut settings = enabled_settings(implementation);
+            settings.post_process_enabled = false;
+            let context = CommandTestContext::new(settings);
+            let before = context.stored();
+            context.register_error.set(true);
+            assert!(change_post_process_enabled_with(&context, true)
+                .unwrap_err()
+                .contains("native registration failed"));
+            assert!(!context.persisted().post_process_enabled);
+            assert!(!context
+                .registered
+                .borrow()
+                .contains_key("transcribe_with_post_process"));
+            assert_eq!(context.stored(), before);
+            assert_eq!(
+                *context.operations.borrow(),
+                ["register:transcribe_with_post_process"]
+            );
         }
     }
 

@@ -9,7 +9,7 @@ use tauri::{AppHandle, State};
 /// Persist the layout used to compare raw and cleaned history transcripts.
 #[tauri::command]
 #[specta::specta]
-pub fn change_history_compare_view_setting(
+pub async fn change_history_compare_view_setting(
     app: AppHandle,
     view: crate::settings::HistoryCompareView,
 ) -> Result<(), String> {

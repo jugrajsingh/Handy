@@ -1030,7 +1030,7 @@ fn change_post_process_enabled_with(
     let _guard = BINDING_MUTATION_LOCK
         .lock()
         .map_err(|error| format!("Shortcut settings lock failed: {error}"))?;
-    let mut settings = app.settings();
+    let settings = app.settings();
     let clean = settings
         .bindings
         .get("transcribe_with_post_process")
@@ -1042,28 +1042,28 @@ fn change_post_process_enabled_with(
             }
         }
     }
-    settings.post_process_enabled = enabled;
-    app.save_settings(settings);
-
     let result = (|| {
-        if let Some(binding) = clean {
+        let mut next = settings.clone();
+        next.post_process_enabled = enabled;
+        let raw_restored = policy::restore_raw_binding(&mut next);
+        if let Some(binding) = &clean {
             if enabled {
-                register_shortcut(app, binding)?;
+                register_shortcut(app, binding.clone())?;
             } else {
-                unregister_shortcut(app, binding)?;
+                unregister_shortcut(app, binding.clone())?;
             }
         }
-        if !enabled {
-            let settings = app.settings();
-            if let Some(binding) = settings.bindings.get("transcribe").cloned() {
-                policy::register_nonempty(binding, |binding| {
-                    if !app.binding_is_registered(settings.keyboard_implementation, &binding)? {
-                        register_shortcut(app, binding)?;
+        if raw_restored {
+            if let Some(binding) = next.bindings.get("transcribe").cloned() {
+                if let Err(error) = register_shortcut(app, binding) {
+                    if let Some(clean) = &clean {
+                        restore_registration(app, clean);
                     }
-                    Ok(())
-                })?;
+                    return Err(error);
+                }
             }
         }
+        app.save_settings(next);
         Ok(())
     })();
     app.reconcile_fallback();
@@ -1153,7 +1153,7 @@ pub fn change_post_process_model_setting(
 
 #[tauri::command]
 #[specta::specta]
-pub fn set_post_process_provider(app: AppHandle, provider_id: String) -> Result<(), String> {
+pub async fn set_post_process_provider(app: AppHandle, provider_id: String) -> Result<(), String> {
     set_post_process_provider_with_settings(
         provider_id,
         || settings::get_settings(&app),
