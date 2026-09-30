@@ -25,7 +25,7 @@ use crate::managers::history::{HistoryEntry, HistoryManager};
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::TranscriptionManager;
 use crate::settings;
-use crate::tray_i18n::get_tray_translations;
+use crate::tray_i18n::{get_tray_translations, TrayStrings};
 use log::{debug, error, info, trace, warn};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -68,6 +68,26 @@ fn tray_label<'a>(localized: &'a str, english: &'a str) -> &'a str {
     } else {
         localized
     }
+}
+
+fn cleanup_status_label(
+    state: LocalLlmStateKind,
+    model_name: &str,
+    strings: &TrayStrings,
+    english: &TrayStrings,
+) -> String {
+    let state_label = match state {
+        LocalLlmStateKind::Ready => tray_label(&strings.cleanup_ready, &english.cleanup_ready),
+        LocalLlmStateKind::Starting | LocalLlmStateKind::Stopping => {
+            tray_label(&strings.cleanup_loading, &english.cleanup_loading)
+        }
+        LocalLlmStateKind::Failed => tray_label(&strings.cleanup_error, &english.cleanup_error),
+        LocalLlmStateKind::Unloaded => {
+            tray_label(&strings.cleanup_not_loaded, &english.cleanup_not_loaded)
+        }
+    };
+    let prefix = tray_label(&strings.cleanup, &english.cleanup);
+    format!("{prefix}: {model_name} ({state_label})")
 }
 
 fn cleanup_menu(
@@ -626,22 +646,8 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
 
         let cleanup_items = if let Some(cleanup) = &inputs.cleanup {
             let english = get_tray_translations(Some("en".to_string()));
-            let state_label = match cleanup.state {
-                LocalLlmStateKind::Ready => {
-                    tray_label(&strings.cleanup_ready, &english.cleanup_ready)
-                }
-                LocalLlmStateKind::Starting | LocalLlmStateKind::Stopping => {
-                    tray_label(&strings.cleanup_loading, &english.cleanup_loading)
-                }
-                LocalLlmStateKind::Failed => {
-                    tray_label(&strings.cleanup_error, &english.cleanup_error)
-                }
-                LocalLlmStateKind::Unloaded => {
-                    tray_label(&strings.cleanup_not_loaded, &english.cleanup_not_loaded)
-                }
-            };
-            let prefix = tray_label(&strings.cleanup, &english.cleanup);
-            let label = format!("{prefix}: {} ({state_label})", cleanup.model_name);
+            let label =
+                cleanup_status_label(cleanup.state, &cleanup.model_name, &strings, &english);
             Some((
                 MenuItem::with_id(app, "cleanup_status", &label, false, None::<&str>)?,
                 MenuItem::with_id(
@@ -988,6 +994,191 @@ mod tests {
         });
         worker.join().unwrap();
         assert_ne!(receiver.recv().unwrap(), caller);
+    }
+
+    fn unloaded_cleanup_snapshot(saved: &settings::AppSettings) -> Option<CleanupMenu> {
+        cleanup_menu(
+            false,
+            &saved.post_process_provider_id,
+            saved.local_llm_model_id.as_deref(),
+            "No cleanup model",
+            || {
+                Some(LocalLlmStatus {
+                    state: LocalLlmStateKind::Unloaded,
+                    model_id: None,
+                    error: None,
+                })
+            },
+        )
+    }
+
+    #[test]
+    fn provider_selection_refreshes_saved_snapshot_and_failed_persist_does_not_refresh() {
+        let mut initial = settings::get_default_settings();
+        initial.post_process_provider_id = "openai".into();
+        initial.local_llm_model_id = Some("s1-mini-q4km".into());
+        let store = Mutex::new(initial);
+        let refreshed = Mutex::new(Vec::new());
+        for provider in [settings::LOCAL_LLM_PROVIDER_ID, "openai"] {
+            crate::shortcut::set_post_process_provider_with_settings(
+                provider.into(),
+                || store.lock().unwrap().clone(),
+                |saved| {
+                    *store.lock().unwrap() = saved;
+                    Ok(())
+                },
+                || {
+                    let saved = store.lock().unwrap();
+                    refreshed.lock().unwrap().push((
+                        saved.post_process_provider_id.clone(),
+                        unloaded_cleanup_snapshot(&saved),
+                    ));
+                },
+            )
+            .unwrap();
+        }
+        let snapshots = refreshed.lock().unwrap();
+        assert_eq!(
+            snapshots.len(),
+            2,
+            "each successful provider persist must refresh"
+        );
+        assert_eq!(snapshots[0].0, settings::LOCAL_LLM_PROVIDER_ID);
+        assert_eq!(
+            snapshots[0].1,
+            Some(CleanupMenu {
+                state: LocalLlmStateKind::Unloaded,
+                model_name: registry::find("s1-mini-q4km").unwrap().display_name.into()
+            })
+        );
+        assert_eq!(snapshots[1], ("openai".into(), None));
+        drop(snapshots);
+        let before = store.lock().unwrap().clone();
+        let result = crate::shortcut::set_post_process_provider_with_settings(
+            settings::LOCAL_LLM_PROVIDER_ID.into(),
+            || store.lock().unwrap().clone(),
+            |_| Err("persist failed".into()),
+            || panic!("failed provider persist must not refresh"),
+        );
+        assert_eq!(result, Err("persist failed".into()));
+        assert_eq!(
+            store.lock().unwrap().post_process_provider_id,
+            before.post_process_provider_id
+        );
+        assert_eq!(refreshed.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unloaded_model_selection_and_clear_refresh_saved_snapshot_without_state_events() {
+        let h = crate::local_llm::manager::tests::harness();
+        let mut initial = h.settings.clone();
+        initial.local_llm_model_id = None;
+        let store = Mutex::new(initial);
+        let refreshed = Mutex::new(Vec::new());
+        for model in [Some("s1-mini-q4km".to_string()), None] {
+            crate::local_llm::commands::set_local_llm_model_with_settings(
+                h.manager.clone(),
+                model.clone(),
+                || store.lock().unwrap().clone(),
+                |saved| {
+                    *store.lock().unwrap() = saved;
+                    Ok(())
+                },
+                || {
+                    let saved = store.lock().unwrap();
+                    refreshed.lock().unwrap().push((
+                        saved.local_llm_model_id.clone(),
+                        unloaded_cleanup_snapshot(&saved),
+                    ));
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(h.manager.status().state, LocalLlmStateKind::Unloaded);
+            assert!(
+                h.events.lock().unwrap().is_empty(),
+                "unloaded manager emits no compensating refresh event"
+            );
+        }
+        {
+            let snapshots = refreshed.lock().unwrap();
+            assert_eq!(
+                snapshots.len(),
+                2,
+                "select and clear must each refresh after persistence"
+            );
+            assert_eq!(snapshots[0].0.as_deref(), Some("s1-mini-q4km"));
+            assert_eq!(
+                snapshots[0].1.as_ref().unwrap().model_name,
+                registry::find("s1-mini-q4km").unwrap().display_name
+            );
+            assert_eq!(snapshots[1].0, None);
+            assert_eq!(
+                snapshots[1].1,
+                Some(CleanupMenu {
+                    state: LocalLlmStateKind::Unloaded,
+                    model_name: "No cleanup model".into()
+                })
+            );
+        }
+        let result = crate::local_llm::commands::set_local_llm_model_with_settings(
+            h.manager.clone(),
+            Some("s1-mini-q4km".into()),
+            || store.lock().unwrap().clone(),
+            |_| Err("persist failed".into()),
+            || panic!("failed model persist must not refresh"),
+        )
+        .await;
+        assert_eq!(result, Err("persist failed".into()));
+        assert_eq!(store.lock().unwrap().local_llm_model_id, None);
+        assert_eq!(refreshed.lock().unwrap().len(), 2);
+        assert!(h.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn cleanup_status_label_maps_every_state_and_falls_back_to_english() {
+        let english = get_tray_translations(Some("en".into()));
+        let missing = get_tray_translations(Some("de".into()));
+        for (state, text) in [
+            (LocalLlmStateKind::Ready, "ready"),
+            (LocalLlmStateKind::Unloaded, "not loaded"),
+            (LocalLlmStateKind::Starting, "loading"),
+            (LocalLlmStateKind::Stopping, "loading"),
+            (LocalLlmStateKind::Failed, "error"),
+        ] {
+            let expected = format!("Cleanup: S1-mini ({text})");
+            assert_eq!(
+                cleanup_status_label(state, "S1-mini", &english, &english),
+                expected
+            );
+            assert_eq!(
+                cleanup_status_label(state, "S1-mini", &missing, &english),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_status_label_preserves_localized_prefix_state_and_model_name() {
+        let english = get_tray_translations(Some("en".into()));
+        let mut localized = english.clone();
+        localized.cleanup = "Bereinigung".into();
+        localized.cleanup_ready = "bereit".into();
+        localized.cleanup_not_loaded = "nicht geladen".into();
+        localized.cleanup_loading = "laden".into();
+        localized.cleanup_error = "Fehler".into();
+        for (state, text) in [
+            (LocalLlmStateKind::Ready, "bereit"),
+            (LocalLlmStateKind::Unloaded, "nicht geladen"),
+            (LocalLlmStateKind::Starting, "laden"),
+            (LocalLlmStateKind::Stopping, "laden"),
+            (LocalLlmStateKind::Failed, "Fehler"),
+        ] {
+            assert_eq!(
+                cleanup_status_label(state, "Another model", &localized, &english),
+                format!("Bereinigung: Another model ({text})")
+            );
+        }
     }
 
     #[test]

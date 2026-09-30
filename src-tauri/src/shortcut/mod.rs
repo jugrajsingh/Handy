@@ -1154,10 +1154,26 @@ pub fn change_post_process_model_setting(
 #[tauri::command]
 #[specta::specta]
 pub fn set_post_process_provider(app: AppHandle, provider_id: String) -> Result<(), String> {
-    let mut settings = settings::get_settings(&app);
+    set_post_process_provider_with_settings(
+        provider_id,
+        || settings::get_settings(&app),
+        |saved| settings::write_settings_checked(&app, saved),
+        || tray::update_tray_menu(&app),
+    )
+}
+
+/// Refreshes the tray after the selected provider is persisted.
+pub(crate) fn set_post_process_provider_with_settings(
+    provider_id: String,
+    read_settings: impl FnOnce() -> settings::AppSettings,
+    persist: impl FnOnce(settings::AppSettings) -> Result<(), String>,
+    refresh_tray: impl FnOnce(),
+) -> Result<(), String> {
+    let mut settings = read_settings();
     validate_provider_exists(&settings, &provider_id)?;
     settings.post_process_provider_id = provider_id;
-    settings::write_settings(&app, settings);
+    persist(settings)?;
+    refresh_tray();
     Ok(())
 }
 

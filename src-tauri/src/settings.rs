@@ -1282,6 +1282,26 @@ pub fn update_checks_effectively_enabled(settings: &AppSettings) -> bool {
     settings.update_checks_enabled && !update_checks_forced_disabled()
 }
 
+/// Persists settings and restores the previous cached value if saving fails.
+pub fn write_settings_checked(app: &AppHandle, settings: AppSettings) -> Result<(), String> {
+    let value = serde_json::to_value(&settings)
+        .map_err(|error| format!("Failed to serialize settings: {error}"))?;
+    let store = app
+        .store(crate::portable::store_path(SETTINGS_STORE_PATH))
+        .map_err(|error| format!("Failed to initialize settings store: {error}"))?;
+    let previous = store.get("settings");
+    store.set("settings", value);
+    if let Err(error) = store.save() {
+        if let Some(previous) = previous {
+            store.set("settings", previous);
+        } else {
+            store.delete("settings");
+        }
+        return Err(format!("Failed to save settings: {error}"));
+    }
+    Ok(())
+}
+
 pub fn write_settings(app: &AppHandle, settings: AppSettings) {
     let store = app
         .store(crate::portable::store_path(SETTINGS_STORE_PATH))
