@@ -324,6 +324,12 @@ fn initialize_core_logic(app_handle: &AppHandle) {
                 transcription_manager.request_unload();
                 log::info!("Model unloaded via tray.");
             }
+            "unload_post_processing_model" => {
+                if let Some(manager) = app.try_state::<Arc<local_llm::LocalLlmManager>>() {
+                    let manager = Arc::clone(manager.inner());
+                    tray::unload_cleanup_on_worker(move || manager.unload());
+                }
+            }
             "cancel" => {
                 use crate::utils::cancel_current_operation;
 
@@ -391,6 +397,11 @@ fn initialize_core_logic(app_handle: &AppHandle) {
             tray::update_tray_menu(&app_handle_for_listener);
         });
     }
+
+    let cleanup_app = app_handle.clone();
+    app_handle.listen(local_llm::STATE_EVENT, move |_| {
+        tray::update_tray_menu(&cleanup_app);
+    });
 
     // Apply the autostart preference (SMAppService login item on macOS 13+,
     // tauri-plugin-autostart elsewhere)
