@@ -1,6 +1,8 @@
 //! Local in-app LLM post-processing: a Handy-managed `llama-server` child
 //! process cleans transcripts with a small CPU model (S1-mini first).
 
+pub mod backend;
+pub mod llama_server;
 pub mod prompt;
 pub mod registry;
 
