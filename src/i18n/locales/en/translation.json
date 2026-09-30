@@ -11,9 +11,9 @@
   },
   "sidebar": {
     "general": "General",
-    "models": "Models",
+    "models": "Transcription Models",
     "advanced": "Advanced",
-    "postProcessing": "Post Process",
+    "postProcessing": "Post-processing Models",
     "history": "History",
     "debug": "Debug",
     "about": "About"
@@ -405,6 +405,9 @@
       }
     },
     "postProcessing": {
+      "provider": {
+        "title": "Provider"
+      },
       "hotkey": {
         "title": "Hotkey"
       },
@@ -458,6 +461,10 @@
         "createFirst": "Click 'Create New Prompt' above to create your first post-processing prompt."
       },
       "localLlm": {
+        "groupTitle": "Local model",
+        "size": "{{size}} MiB",
+        "downloaded": "Downloaded",
+        "use": "Use",
         "model": {
           "title": "Local model",
           "description": "Runs on this computer's CPU through a bundled llama.cpp server. Transcripts never leave the machine.",

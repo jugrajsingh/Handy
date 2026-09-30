@@ -38,6 +38,7 @@ interface SettingsStore {
   ) => Promise<void>;
   resetSetting: (key: keyof Settings) => Promise<void>;
   refreshSettings: () => Promise<void>;
+  refreshSettingsChecked: () => Promise<void>;
   refreshAudioDevices: () => Promise<void>;
   refreshOutputDevices: () => Promise<void>;
   updateBinding: (id: string, binding: string) => Promise<void>;
@@ -243,26 +244,25 @@ export const useSettingsStore = create<SettingsStore>()(
     // Load settings from store
     refreshSettings: async () => {
       try {
-        const result = await commands.getAppSettings();
-        if (result.status === "ok") {
-          const settings = result.data;
-          const normalizedSettings: Settings = {
-            ...settings,
-            always_on_microphone: settings.always_on_microphone ?? false,
-            selected_microphone: settings.selected_microphone ?? "Default",
-            clamshell_microphone: settings.clamshell_microphone ?? "Default",
-            selected_output_device:
-              settings.selected_output_device ?? "Default",
-          };
-          set({ settings: normalizedSettings, isLoading: false });
-        } else {
-          console.error("Failed to load settings:", result.error);
-          set({ isLoading: false });
-        }
+        await get().refreshSettingsChecked();
       } catch (error) {
         console.error("Failed to load settings:", error);
         set({ isLoading: false });
       }
+    },
+
+    refreshSettingsChecked: async () => {
+      const result = await commands.getAppSettings();
+      if (result.status === "error") throw new Error(result.error);
+      const settings = result.data;
+      const normalizedSettings: Settings = {
+        ...settings,
+        always_on_microphone: settings.always_on_microphone ?? false,
+        selected_microphone: settings.selected_microphone ?? "Default",
+        clamshell_microphone: settings.clamshell_microphone ?? "Default",
+        selected_output_device: settings.selected_output_device ?? "Default",
+      };
+      set({ settings: normalizedSettings, isLoading: false });
     },
 
     // Load audio devices
