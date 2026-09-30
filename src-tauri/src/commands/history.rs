@@ -13,9 +13,22 @@ pub fn change_history_compare_view_setting(
     app: AppHandle,
     view: crate::settings::HistoryCompareView,
 ) -> Result<(), String> {
-    let mut settings = crate::settings::get_settings(&app);
+    change_history_compare_view_with(
+        view,
+        || crate::settings::get_settings(&app),
+        |settings| crate::settings::write_settings_checked(&app, settings),
+    )
+}
+
+/// Update the comparison view through the supplied settings load and save operations.
+pub(crate) fn change_history_compare_view_with(
+    view: crate::settings::HistoryCompareView,
+    load: impl FnOnce() -> crate::settings::AppSettings,
+    save: impl FnOnce(crate::settings::AppSettings) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut settings = load();
     settings.history_compare_view = view;
-    crate::settings::write_settings_checked(&app, settings)
+    save(settings)
 }
 
 #[tauri::command]
@@ -191,4 +204,32 @@ pub async fn update_recording_retention_period(
         .map_err(|e| e.to_string())?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn compare_view_loads_before_saving_once() {
+        let calls = RefCell::new(Vec::new());
+        change_history_compare_view_with(
+            crate::settings::HistoryCompareView::Stacked,
+            || {
+                calls.borrow_mut().push("load");
+                crate::settings::get_default_settings()
+            },
+            |settings| {
+                calls.borrow_mut().push("save");
+                assert_eq!(
+                    settings.history_compare_view,
+                    crate::settings::HistoryCompareView::Stacked
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*calls.borrow(), ["load", "save"]);
+    }
 }

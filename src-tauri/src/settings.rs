@@ -1352,6 +1352,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn history_compare_command_persists_requested_views_and_preserves_other_settings() {
+        use crate::commands::history::change_history_compare_view_with;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = AppSettings {
+            history_limit: 321,
+            local_llm_model_id: Some("fixture-cleanup-model".to_string()),
+            ..get_default_settings()
+        };
+        let mut unrelated = serde_json::to_value(&original).unwrap();
+        unrelated
+            .as_object_mut()
+            .unwrap()
+            .remove("history_compare_view");
+
+        for view in [HistoryCompareView::SideBySide, HistoryCompareView::Stacked] {
+            std::fs::write(&path, serde_json::to_vec(&original).unwrap()).unwrap();
+            change_history_compare_view_with(
+                view,
+                || serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap(),
+                |settings| {
+                    assert_eq!(settings.history_compare_view, view);
+                    assert_eq!(settings.history_limit, 321);
+                    std::fs::write(&path, serde_json::to_vec(&settings).unwrap())
+                        .map_err(|error| error.to_string())
+                },
+            )
+            .unwrap();
+
+            let reloaded: AppSettings =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(reloaded.history_compare_view, view);
+            let mut persisted = serde_json::to_value(reloaded).unwrap();
+            persisted
+                .as_object_mut()
+                .unwrap()
+                .remove("history_compare_view");
+            assert_eq!(persisted, unrelated);
+        }
+    }
+
+    #[test]
+    fn history_compare_command_returns_save_error() {
+        use crate::commands::history::change_history_compare_view_with;
+
+        let result = change_history_compare_view_with(
+            HistoryCompareView::Stacked,
+            get_default_settings,
+            |settings| {
+                assert_eq!(settings.history_compare_view, HistoryCompareView::Stacked);
+                Err("fixture save failed".to_string())
+            },
+        );
+        assert_eq!(result, Err("fixture save failed".to_string()));
+    }
+
+    #[test]
     fn history_compare_defaults_for_an_old_store_and_serializes_all_modes() {
         let mut json = serde_json::to_value(get_default_settings()).unwrap();
         assert!(json
