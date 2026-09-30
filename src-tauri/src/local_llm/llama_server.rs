@@ -1,7 +1,7 @@
 //! `LlamaServerBackend`: runs llama.cpp's `llama-server` as a child process on
 //! a loopback port with a per-spawn API key.
 
-use super::backend::{BackendOpts, GenerateRequest, TextModelBackend};
+use super::backend::{BackendOpts, GenerateRequest, KillSwitch, TextModelBackend};
 use super::registry::ModelEntry;
 use super::LocalLlmError;
 use log::{debug, info, warn};
@@ -10,8 +10,8 @@ use std::io::{self, BufRead, BufReader, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{mpsc, Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Dev-only override for the binary path.
@@ -210,12 +210,27 @@ pub fn wait_healthy(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<(), HealthError> {
+    wait_healthy_inner(client, port, child, deadline, cancel, None)
+}
+
+fn wait_healthy_inner(
+    client: &reqwest::blocking::Client,
+    port: u16,
+    child: &mut Child,
+    deadline: Instant,
+    cancel: &AtomicBool,
+    kill: Option<&ChildKillSwitch>,
+) -> Result<(), HealthError> {
     let url = format!("http://127.0.0.1:{port}/health");
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Err(HealthError::Cancelled);
         }
-        match child.try_wait() {
+        let exited = match kill {
+            Some(kill) => kill.try_wait(child),
+            None => child.try_wait(),
+        };
+        match exited {
             Ok(Some(status)) => return Err(HealthError::Exited(status.to_string())),
             Ok(None) => {}
             Err(e) => return Err(HealthError::Exited(e.to_string())),
@@ -289,6 +304,87 @@ pub fn loopback_client() -> Result<reqwest::blocking::Client, LocalLlmError> {
         .map_err(|e| LocalLlmError::StartFailed(format!("http client: {e}")))
 }
 
+/// Serializes signalling with PID publication and reaping.
+struct ChildKillSwitch {
+    pid: Arc<AtomicI32>,
+    gate: Mutex<()>,
+    cancel: Mutex<Arc<AtomicBool>>,
+    triggered: AtomicBool,
+}
+
+impl ChildKillSwitch {
+    fn new() -> Self {
+        Self {
+            pid: Arc::new(AtomicI32::new(0)),
+            gate: Mutex::new(()),
+            cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
+            triggered: AtomicBool::new(false),
+        }
+    }
+
+    fn use_cancel(&self, cancel: &Arc<AtomicBool>) {
+        *lock(&self.cancel) = Arc::clone(cancel);
+        if self.triggered.load(Ordering::SeqCst) {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn publish(&self, child: &Child) {
+        let _guard = lock(&self.gate);
+        self.pid.store(child.id() as i32, Ordering::SeqCst);
+        if self.triggered.load(Ordering::SeqCst) {
+            self.signal_locked();
+        }
+    }
+
+    fn signal_locked(&self) {
+        #[cfg(target_os = "linux")]
+        {
+            let pid = self.pid.load(Ordering::SeqCst);
+            if pid != 0 {
+                // SAFETY: the gate prevents the owner from reaping this PID during signalling.
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    fn try_wait(&self, child: &mut Child) -> io::Result<Option<std::process::ExitStatus>> {
+        let _guard = lock(&self.gate);
+        self.pid.store(0, Ordering::SeqCst);
+        let result = child.try_wait();
+        if matches!(result, Ok(None)) {
+            self.pid.store(child.id() as i32, Ordering::SeqCst);
+        }
+        result
+    }
+
+    fn stop(&self, child: &mut Child) {
+        {
+            let _guard = lock(&self.gate);
+            self.pid.store(0, Ordering::SeqCst);
+        }
+        stop_child(child);
+    }
+}
+
+impl KillSwitch for ChildKillSwitch {
+    fn trigger(&self) {
+        self.triggered.store(true, Ordering::SeqCst);
+        lock(&self.cancel).store(true, Ordering::SeqCst);
+        let _guard = lock(&self.gate);
+        self.signal_locked();
+    }
+}
+
+/// Recovers mutex data if a thread panicked while holding it.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct Running {
     child: Child,
     port: u16,
@@ -308,6 +404,7 @@ pub struct LlamaServerBackend {
     binary_env: Option<OsString>,
     installed: PathBuf,
     running: Option<Running>,
+    kill: Arc<ChildKillSwitch>,
 }
 
 impl Default for LlamaServerBackend {
@@ -323,6 +420,7 @@ impl LlamaServerBackend {
             binary_env: std::env::var_os(BINARY_ENV),
             installed: PathBuf::from(INSTALLED_BINARY),
             running: None,
+            kill: Arc::new(ChildKillSwitch::new()),
         }
     }
 
@@ -333,6 +431,7 @@ impl LlamaServerBackend {
             binary_env: None,
             installed: binary,
             running: None,
+            kill: Arc::new(ChildKillSwitch::new()),
         }
     }
 
@@ -375,8 +474,16 @@ impl LlamaServerBackend {
                 )))
             }
         };
+        self.kill.publish(&child);
         forward_output(&mut child);
-        match wait_healthy(&client, port, &mut child, deadline, &opts.cancel) {
+        match wait_healthy_inner(
+            &client,
+            port,
+            &mut child,
+            deadline,
+            &opts.cancel,
+            Some(&self.kill),
+        ) {
             Ok(()) => StartOutcome::Ready(Running {
                 child,
                 port,
@@ -389,11 +496,11 @@ impl LlamaServerBackend {
                 StartOutcome::ExitedEarly(format!("llama-server exited during start ({status})"))
             }
             Err(HealthError::Timeout) => {
-                stop_child(&mut child);
+                self.kill.stop(&mut child);
                 StartOutcome::Error(LocalLlmError::StartTimeout)
             }
             Err(HealthError::Cancelled) => {
-                stop_child(&mut child);
+                self.kill.stop(&mut child);
                 StartOutcome::Error(LocalLlmError::StartFailed(
                     "start cancelled: shutting down".into(),
                 ))
@@ -403,13 +510,24 @@ impl LlamaServerBackend {
 }
 
 impl TextModelBackend for LlamaServerBackend {
+    fn kill_switch(&self) -> Arc<dyn KillSwitch> {
+        self.kill.clone()
+    }
+
     fn ensure_loaded(
         &mut self,
         model: &ModelEntry,
         opts: &BackendOpts,
     ) -> Result<(), LocalLlmError> {
+        self.kill.use_cancel(&opts.cancel);
+        if opts.cancel.load(Ordering::SeqCst) {
+            return Err(LocalLlmError::StartFailed(
+                "start cancelled: shutting down".into(),
+            ));
+        }
         if let Some(running) = self.running.as_mut() {
-            if running.model_path == opts.model_path && matches!(running.child.try_wait(), Ok(None))
+            if running.model_path == opts.model_path
+                && matches!(self.kill.try_wait(&mut running.child), Ok(None))
             {
                 return Ok(());
             }
@@ -451,14 +569,14 @@ impl TextModelBackend for LlamaServerBackend {
 
     fn unload(&mut self) {
         if let Some(mut running) = self.running.take() {
-            stop_child(&mut running.child);
+            self.kill.stop(&mut running.child);
             info!("local-llm: llama-server stopped");
         }
     }
 
     fn is_alive(&mut self) -> bool {
         let alive = match self.running.as_mut() {
-            Some(running) => matches!(running.child.try_wait(), Ok(None)),
+            Some(running) => matches!(self.kill.try_wait(&mut running.child), Ok(None)),
             None => false,
         };
         if !alive {
@@ -539,6 +657,44 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_switch_kills_a_running_child_and_owner_reaps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_binary(dir.path(), "exec sleep 30");
+        let mut backend = LlamaServerBackend::with_binary(bin.clone());
+        let mut cmd = Command::new(bin);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = spawn_from_supervisor(cmd).unwrap();
+        let pid = child.id() as i32;
+        backend.kill.pid.store(pid, Ordering::SeqCst);
+        backend.running = Some(Running {
+            child,
+            port: 0,
+            api_key: String::new(),
+            model_path: dir.path().join("m.gguf"),
+            client: loopback_client().unwrap(),
+        });
+        let switch = backend.kill_switch();
+        switch.trigger();
+        for _ in 0..100 {
+            if !backend.is_alive() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let killed = !backend.is_alive();
+        backend.unload();
+        assert!(killed, "SIGKILL must stop the child before normal unload");
+        assert_eq!(backend.kill.pid.load(Ordering::SeqCst), 0);
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "child must be reaped"
+        );
     }
 
     #[test]

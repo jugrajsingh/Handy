@@ -3,6 +3,7 @@
 
 pub mod backend;
 pub mod llama_server;
+pub mod manager;
 pub mod prompt;
 pub mod registry;
 
