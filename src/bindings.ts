@@ -13,6 +13,17 @@ async changeBinding(id: string, binding: string) : Promise<Result<BindingRespons
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Clear an optional dictation shortcut while preserving another assigned binding.
+ */
+async clearBinding(id: string) : Promise<Result<ShortcutBinding, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_binding", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async resetBinding(id: string) : Promise<Result<BindingResponse, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("reset_binding", { id }) };
@@ -1056,11 +1067,11 @@ vad_backend?: VadBackend;
  * not gated on this — that follows model capability. Migrated from the old
  * `overlay_position` (position `none` → style `None`).
  */
-overlay_style?: OverlayStyle;
+overlay_style?: OverlayStyle; 
 /**
  * Registry id of the local LLM (provider `local_llm`); `None` until chosen.
  */
-local_llm_model_id?: string | null; local_llm_styling?: LocalLlmStyling; local_llm_structure?: LocalLlmStructure; local_llm_context?: LocalLlmContext;
+local_llm_model_id?: string | null; local_llm_styling?: LocalLlmStyling; local_llm_structure?: LocalLlmStructure; local_llm_context?: LocalLlmContext; 
 /**
  * Inference threads for llama-server.
  */
@@ -1164,7 +1175,7 @@ export type PostProcessProvider = { id: string; label: string; base_url: string;
 /**
  * How the chat messages for a model are built.
  */
-export type PromptStyle =
+export type PromptStyle = 
 /**
  * S1-mini: fixed card system prompt, control line + transcript as the user turn.
  */

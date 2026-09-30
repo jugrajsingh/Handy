@@ -11,6 +11,7 @@
 
 mod handler;
 pub mod handy_keys;
+pub(crate) mod policy;
 pub mod tauri_impl;
 
 use log::{debug, error, info, warn};
@@ -27,7 +28,7 @@ use crate::settings::{
 };
 use crate::tray;
 
-// Note: Commands are accessed via shortcut::handy_keys:: in lib.rs
+static BINDING_MUTATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Initialize shortcuts using the configured implementation
 pub fn init_shortcuts(app: &AppHandle) {
@@ -80,16 +81,23 @@ pub fn unregister_cancel_shortcut(app: &AppHandle) {
 }
 
 /// Register a shortcut using the appropriate implementation
-pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
-    let settings = get_settings(app);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
-        KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
-    }
+pub fn register_shortcut(
+    app: &impl policy::RegistrationContext,
+    binding: ShortcutBinding,
+) -> Result<(), String> {
+    policy::register_nonempty(binding, |binding| {
+        match app.settings().keyboard_implementation {
+            KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
+            KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
+        }
+    })
 }
 
 /// Unregister a shortcut using the appropriate implementation
 pub fn unregister_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
+    if binding.current_binding.trim().is_empty() {
+        return Ok(());
+    }
     let settings = get_settings(app);
     match settings.keyboard_implementation {
         KeyboardImplementation::Tauri => tauri_impl::unregister_shortcut(app, binding),
@@ -115,7 +123,10 @@ pub fn change_binding(
     id: String,
     binding: String,
 ) -> Result<BindingResponse, String> {
-    // Reject empty bindings — every shortcut should have a value
+    let _guard = BINDING_MUTATION_LOCK
+        .lock()
+        .map_err(|error| format!("Shortcut settings lock failed: {error}"))?;
+    // Empty bindings are handled by clear_binding.
     if binding.trim().is_empty() {
         return Err("Binding cannot be empty".to_string());
     }
@@ -149,6 +160,9 @@ pub fn change_binding(
         }
     };
 
+    validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)?;
+    policy::reject_duplicate(&settings, &id, &binding)?;
+
     // If this is the cancel binding, just update the settings and return
     // It's managed dynamically, so we don't register/unregister here
     if id == "cancel" {
@@ -169,14 +183,6 @@ pub fn change_binding(
     if let Err(e) = unregister_shortcut(&app, binding_to_modify.clone()) {
         let error_msg = format!("Failed to unregister shortcut: {}", e);
         error!("change_binding error: {}", error_msg);
-    }
-
-    // Validate the new shortcut for the current keyboard implementation
-    if let Err(e) = validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)
-    {
-        warn!("change_binding validation error: {}", e);
-        restore_registration(&app, &binding_to_modify);
-        return Err(e);
     }
 
     // Create an updated binding
@@ -208,6 +214,22 @@ pub fn change_binding(
         binding: Some(updated_binding),
         error: None,
     })
+}
+
+/// Clear an optional dictation shortcut while preserving another assigned binding.
+#[tauri::command]
+#[specta::specta]
+pub fn clear_binding(app: AppHandle, id: String) -> Result<ShortcutBinding, String> {
+    let _guard = BINDING_MUTATION_LOCK
+        .lock()
+        .map_err(|error| format!("Shortcut settings lock failed: {error}"))?;
+    let mut settings = settings::get_settings(&app);
+    let binding = policy::clear_binding_with(&mut settings, &id, |binding| {
+        unregister_shortcut(&app, binding.clone())
+    })?;
+    settings::write_settings(&app, settings);
+    crate::secure_input::reconcile_fallback(&app);
+    Ok(binding)
 }
 
 /// Best-effort re-register of the previous binding after a failed change,
@@ -249,8 +271,8 @@ pub fn suspend_all_shortcuts(app: &AppHandle) {
 /// Re-register every binding from settings after shortcut recording ends.
 /// Registering an already-registered shortcut fails cleanly in both
 /// implementations, so this is idempotent and safe on every exit path.
-pub fn resume_all_shortcuts(app: &AppHandle) {
-    let settings = get_settings(app);
+pub fn resume_all_shortcuts(app: &impl policy::RegistrationContext) {
+    let settings = app.settings();
     for (id, binding) in &settings.bindings {
         if id == "cancel" {
             continue;
@@ -433,53 +455,39 @@ fn unregister_all_shortcuts(app: &AppHandle, implementation: KeyboardImplementat
 
 /// Register all shortcuts for a specific implementation, validating and resetting invalid ones
 fn register_all_shortcuts_for_implementation(
-    app: &AppHandle,
+    app: &impl policy::RegistrationContext,
     implementation: KeyboardImplementation,
 ) -> Vec<String> {
+    let mut current_settings = app.settings();
     let mut reset_bindings = Vec::new();
     let default_bindings = settings::get_default_settings().bindings;
-    let mut current_settings = settings::get_settings(app);
-
     for (id, default_binding) in &default_bindings {
-        // Skip cancel shortcut as it's dynamically registered
-        if id == "cancel" {
+        if id == "cancel"
+            || (id == "transcribe_with_post_process" && !current_settings.post_process_enabled)
+        {
             continue;
         }
-
-        // Skip post-processing shortcut when the feature is disabled
-        if id == "transcribe_with_post_process" && !current_settings.post_process_enabled {
-            continue;
-        }
-
-        let mut binding = current_settings
+        let binding = current_settings
             .bindings
             .get(id)
             .cloned()
             .unwrap_or_else(|| default_binding.clone());
-
-        // Validate the shortcut for the target implementation
-        if let Err(e) =
-            validate_shortcut_for_implementation(&binding.current_binding, implementation)
-        {
-            info!(
-                "Shortcut '{}' ({}) is invalid for {:?}: {}. Resetting to default.",
-                id, binding.current_binding, implementation, e
-            );
-
-            // Reset to default
-            binding.current_binding = default_binding.current_binding.clone();
-            current_settings
-                .bindings
-                .insert(id.clone(), binding.clone());
-            reset_bindings.push(id.clone());
-        }
-
-        // Register with the appropriate implementation
-        let result = match implementation {
-            KeyboardImplementation::Tauri => tauri_impl::register_shortcut(app, binding),
-            KeyboardImplementation::HandyKeys => handy_keys::register_shortcut(app, binding),
-        };
-
+        let result = policy::register_nonempty(binding, |mut binding| {
+            if let Err(e) =
+                validate_shortcut_for_implementation(&binding.current_binding, implementation)
+            {
+                info!(
+                    "Shortcut '{}' ({}) is invalid for {:?}: {}. Resetting to default.",
+                    id, binding.current_binding, implementation, e
+                );
+                binding.current_binding = default_binding.current_binding.clone();
+                current_settings
+                    .bindings
+                    .insert(id.clone(), binding.clone());
+                reset_bindings.push(id.clone());
+            }
+            app.register_native(implementation, binding)
+        });
         if let Err(e) = result {
             error!(
                 "Failed to register shortcut '{}' for {:?}: {}",
@@ -487,12 +495,9 @@ fn register_all_shortcuts_for_implementation(
             );
         }
     }
-
-    // Save settings if any bindings were reset
     if !reset_bindings.is_empty() {
-        settings::write_settings(app, current_settings);
+        app.save_settings(current_settings);
     }
-
     reset_bindings
 }
 
@@ -1001,25 +1006,42 @@ pub fn change_auto_submit_key_setting(app: AppHandle, key: String) -> Result<(),
 #[tauri::command]
 #[specta::specta]
 pub fn change_post_process_enabled_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
+    let _guard = BINDING_MUTATION_LOCK
+        .lock()
+        .map_err(|error| format!("Shortcut settings lock failed: {error}"))?;
     let mut settings = settings::get_settings(&app);
-    settings.post_process_enabled = enabled;
-    settings::write_settings(&app, settings.clone());
-
-    // Register or unregister the post-processing shortcut
-    if let Some(binding) = settings
+    let clean = settings
         .bindings
         .get("transcribe_with_post_process")
-        .cloned()
-    {
-        if enabled {
-            let _ = register_shortcut(&app, binding);
-        } else {
-            let _ = unregister_shortcut(&app, binding);
+        .cloned();
+    if enabled {
+        if let Some(binding) = &clean {
+            if !binding.current_binding.trim().is_empty() {
+                policy::reject_duplicate(&settings, &binding.id, &binding.current_binding)?;
+            }
         }
     }
+    settings.post_process_enabled = enabled;
+    settings::write_settings(&app, settings);
 
+    let result = (|| {
+        if let Some(binding) = clean {
+            if enabled {
+                register_shortcut(&app, binding)?;
+            } else {
+                unregister_shortcut(&app, binding)?;
+            }
+        }
+        if !enabled {
+            let settings = settings::get_settings(&app);
+            if let Some(binding) = settings.bindings.get("transcribe").cloned() {
+                register_shortcut(&app, binding)?;
+            }
+        }
+        Ok(())
+    })();
     crate::secure_input::reconcile_fallback(&app);
-    Ok(())
+    result
 }
 
 #[tauri::command]
