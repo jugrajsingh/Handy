@@ -577,3 +577,67 @@ async fn http_cancel_during_stalled_body_keeps_partial() {
         "bytes received before the cancel must be kept for resume"
     );
 }
+
+// ── Verified artifact adapter (local LLM downloads) ───────────────────────
+
+#[tokio::test]
+async fn verified_artifact_download_completes_and_reports_progress() {
+    let body = b"local llm weights";
+    let (url, server) = serve_once(http_response(
+        "200 OK",
+        &[format!("Content-Length: {}", body.len())],
+        body,
+    ))
+    .await;
+    let dir = TempDir::new().unwrap();
+    let partial = dir.path().join("m.gguf.partial");
+    let seen = std::sync::Mutex::new(Vec::new());
+
+    let done = ModelManager::download_verified_artifact(
+        "s1-mini-q4km",
+        &url,
+        &partial,
+        body.len() as u64,
+        &sha_hex(body),
+        &CancellationToken::new(),
+        &|p: &DownloadProgress| seen.lock().unwrap().push(p.downloaded),
+    )
+    .await
+    .unwrap();
+
+    assert!(done);
+    assert_eq!(fs::read(&partial).unwrap(), body);
+    assert_eq!(
+        seen.lock().unwrap().last().copied(),
+        Some(body.len() as u64)
+    );
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn verified_artifact_with_a_wrong_hash_is_deleted() {
+    let body = b"tampered weights";
+    let (url, server) = serve_once(http_response(
+        "200 OK",
+        &[format!("Content-Length: {}", body.len())],
+        body,
+    ))
+    .await;
+    let dir = TempDir::new().unwrap();
+    let partial = dir.path().join("m.gguf.partial");
+
+    let result = ModelManager::download_verified_artifact(
+        "s1-mini-q4km",
+        &url,
+        &partial,
+        body.len() as u64,
+        &"0".repeat(64),
+        &CancellationToken::new(),
+        &|_: &DownloadProgress| {},
+    )
+    .await;
+
+    assert!(result.is_err());
+    assert!(!partial.exists(), "a mismatched download must be deleted");
+    server.await.unwrap();
+}

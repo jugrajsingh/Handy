@@ -2,6 +2,7 @@
 //! process cleans transcripts with a small CPU model (S1-mini first).
 
 pub mod backend;
+pub mod download;
 pub mod llama_server;
 pub mod manager;
 pub mod prompt;
