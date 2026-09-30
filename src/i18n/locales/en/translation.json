@@ -520,6 +520,18 @@
     },
     "history": {
       "title": "History",
+      "cleaned": "Cleaned",
+      "cleanedWith": "Cleaned with {{model}}",
+      "raw": "Raw",
+      "copyRaw": "Copy raw",
+      "compare": {
+        "title": "Compare view",
+        "diff": "Diff",
+        "side_by_side": "Side by side",
+        "stacked": "Stacked"
+      },
+      "clearHistory": "Clear History",
+      "clearConfirmation": "Remove {{count}} unstarred history entries and {{recordings}} recordings? Starred entries and their recordings will be kept.",
       "openFolder": "Open Recordings Folder",
       "loading": "Loading history...",
       "empty": "No transcriptions yet. Start recording to build your history!",
