@@ -894,6 +894,22 @@ async deleteHistoryEntry(id: number) : Promise<Result<null, string>> {
     else return { status: "error", error: e  as any };
 }
 },
+async getHistoryClearSummary(keepSaved: boolean) : Promise<Result<HistoryClearSummary, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_history_clear_summary", { keepSaved }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async clearHistory(keepSaved: boolean) : Promise<Result<HistoryClearSummary, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_history", { keepSaved }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async retryHistoryEntryTranscription(id: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("retry_history_entry_transcription", { id }) };
@@ -1090,8 +1106,9 @@ export type EngineType =
  */
 "TranscribeCpp" | "Parakeet" | "Moonshine" | "MoonshineStreaming" | "SenseVoice" | "GigaAM" | "Canary" | "Cohere"
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
+export type HistoryClearSummary = { entries: number; recordings: number }
 export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean; post_process_provider: string | null; post_process_model: string | null }
-export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
+export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number } | { action: "cleared" }
 /**
  * Result of changing keyboard implementation
  */

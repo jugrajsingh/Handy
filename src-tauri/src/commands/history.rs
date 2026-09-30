@@ -1,6 +1,6 @@
 use crate::actions::process_transcription_output;
 use crate::managers::{
-    history::{HistoryManager, PaginatedHistory},
+    history::{HistoryClearSummary, HistoryManager, PaginatedHistory},
     transcription::TranscriptionManager,
 };
 use std::sync::Arc;
@@ -27,10 +27,37 @@ pub async fn toggle_history_entry_saved(
     history_manager: State<'_, Arc<HistoryManager>>,
     id: i64,
 ) -> Result<(), String> {
-    history_manager
-        .toggle_saved_status(id)
+    let manager = Arc::clone(history_manager.inner());
+    tauri::async_runtime::spawn_blocking(move || manager.toggle_saved_status(id))
         .await
+        .map_err(|error| format!("History saved-status worker failed: {error}"))?
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn get_history_clear_summary(
+    history_manager: State<'_, Arc<HistoryManager>>,
+    keep_saved: bool,
+) -> Result<HistoryClearSummary, String> {
+    let manager = Arc::clone(history_manager.inner());
+    tauri::async_runtime::spawn_blocking(move || manager.history_clear_summary(keep_saved))
+        .await
+        .map_err(|error| format!("History count worker failed: {error}"))?
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn clear_history(
+    history_manager: State<'_, Arc<HistoryManager>>,
+    keep_saved: bool,
+) -> Result<HistoryClearSummary, String> {
+    let manager = Arc::clone(history_manager.inner());
+    tauri::async_runtime::spawn_blocking(move || manager.clear_history(keep_saved))
+        .await
+        .map_err(|error| format!("History clear worker failed: {error}"))?
+        .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

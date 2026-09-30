@@ -1,12 +1,12 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, Utc};
 use log::{debug, error, info};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
 use specta::Type;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::AppHandle;
 use tauri_specta::Event;
 
@@ -41,6 +41,12 @@ pub struct PaginatedHistory {
     pub has_more: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Type)]
+pub struct HistoryClearSummary {
+    pub entries: usize,
+    pub recordings: usize,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Type, tauri_specta::Event)]
 #[serde(tag = "action")]
 pub enum HistoryUpdatePayload {
@@ -52,6 +58,8 @@ pub enum HistoryUpdatePayload {
     Deleted { id: i64 },
     #[serde(rename = "toggled")]
     Toggled { id: i64 },
+    #[serde(rename = "cleared")]
+    Cleared {},
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -204,7 +212,9 @@ impl HistoryManager {
     }
 
     fn get_connection(&self) -> Result<Connection> {
-        Ok(Connection::open(&self.db_path)?)
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        Ok(conn)
     }
 
     fn map_history_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
@@ -391,33 +401,86 @@ impl HistoryManager {
     }
 
     fn delete_entries_and_files(&self, entries: &[(i64, String)]) -> Result<usize> {
-        if entries.is_empty() {
-            return Ok(0);
-        }
-
         let conn = self.get_connection()?;
-        let mut deleted_count = 0;
+        let removed =
+            Self::delete_entries_and_files_with_conn(&conn, &self.recordings_dir, entries)?;
+        Ok(removed.recordings)
+    }
 
+    fn clear_candidates(conn: &Connection, keep_saved: bool) -> Result<Vec<(i64, String)>> {
+        let mut statement = conn.prepare(
+            "SELECT id, file_name FROM transcription_history WHERE (?1 = 0 OR saved = 0) ORDER BY id",
+        )?;
+        let rows =
+            statement.query_map(params![keep_saved], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    fn delete_entries_and_files_with_conn(
+        conn: &Connection,
+        recordings_dir: &Path,
+        entries: &[(i64, String)],
+    ) -> Result<HistoryClearSummary> {
+        let mut removed = HistoryClearSummary::default();
         for (id, file_name) in entries {
-            // Delete database entry
-            conn.execute(
+            let path = recordings_dir.join(file_name);
+            match fs::remove_file(&path) {
+                Ok(()) => removed.recordings += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => error!("Failed to delete WAV file {}: {}", file_name, error),
+            }
+            removed.entries += conn.execute(
                 "DELETE FROM transcription_history WHERE id = ?1",
                 params![id],
             )?;
-
-            // Delete WAV file
-            let file_path = self.recordings_dir.join(file_name);
-            if file_path.exists() {
-                if let Err(e) = fs::remove_file(&file_path) {
-                    error!("Failed to delete WAV file {}: {}", file_name, e);
-                } else {
-                    debug!("Deleted old WAV file: {}", file_name);
-                    deleted_count += 1;
-                }
-            }
         }
+        Ok(removed)
+    }
 
-        Ok(deleted_count)
+    fn clear_history_with_connection(
+        conn: &mut Connection,
+        recordings_dir: &Path,
+        keep_saved: bool,
+    ) -> Result<HistoryClearSummary> {
+        Self::with_clear_transaction(conn, |transaction| {
+            let entries = Self::clear_candidates(transaction, keep_saved)?;
+            Self::delete_entries_and_files_with_conn(transaction, recordings_dir, &entries)
+        })
+    }
+
+    fn with_clear_transaction<T>(
+        conn: &mut Connection,
+        operation: impl FnOnce(&Connection) -> Result<T>,
+    ) -> Result<T> {
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let result = operation(&transaction)?;
+        transaction.commit()?;
+        Ok(result)
+    }
+
+    /// Count all eligible history rows and their existing recordings for confirmation.
+    pub fn history_clear_summary(&self, keep_saved: bool) -> Result<HistoryClearSummary> {
+        let conn = self.get_connection()?;
+        let entries = Self::clear_candidates(&conn, keep_saved)?;
+        let recordings = entries
+            .iter()
+            .filter(|(_, name)| self.recordings_dir.join(name).is_file())
+            .count();
+        Ok(HistoryClearSummary {
+            entries: entries.len(),
+            recordings,
+        })
+    }
+
+    /// Clear a serialized snapshot of history and emit one update after commit.
+    pub fn clear_history(&self, keep_saved: bool) -> Result<HistoryClearSummary> {
+        let mut conn = self.get_connection()?;
+        let removed =
+            Self::clear_history_with_connection(&mut conn, &self.recordings_dir, keep_saved)?;
+        if let Err(error) = (HistoryUpdatePayload::Cleared {}).emit(&self.app_handle) {
+            error!("Failed to emit cleared history event: {error}");
+        }
+        Ok(removed)
     }
 
     fn cleanup_by_count(&self, limit: usize) -> Result<()> {
@@ -601,11 +664,24 @@ impl HistoryManager {
         Ok(entry)
     }
 
-    pub async fn toggle_saved_status(&self, id: i64) -> Result<()> {
-        let conn = self.get_connection()?;
+    /// Toggle a star in an immediate transaction and emit its update after commit.
+    pub fn toggle_saved_status(&self, id: i64) -> Result<()> {
+        let mut conn = self.get_connection()?;
+        let new_saved = Self::toggle_saved_status_with_conn(&mut conn, id)?;
 
-        // Get current saved status
-        let current_saved: bool = conn.query_row(
+        debug!("Toggled saved status for entry {}: {}", id, new_saved);
+
+        if let Err(e) = (HistoryUpdatePayload::Toggled { id }).emit(&self.app_handle) {
+            error!("Failed to emit history-updated event: {}", e);
+        }
+
+        Ok(())
+    }
+
+    fn toggle_saved_status_with_conn(conn: &mut Connection, id: i64) -> Result<bool> {
+        let transaction = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+
+        let current_saved: bool = transaction.query_row(
             "SELECT saved FROM transcription_history WHERE id = ?1",
             params![id],
             |row| row.get("saved"),
@@ -613,19 +689,13 @@ impl HistoryManager {
 
         let new_saved = !current_saved;
 
-        conn.execute(
+        transaction.execute(
             "UPDATE transcription_history SET saved = ?1 WHERE id = ?2",
             params![new_saved, id],
         )?;
 
-        debug!("Toggled saved status for entry {}: {}", id, new_saved);
-
-        // Emit history updated event
-        if let Err(e) = (HistoryUpdatePayload::Toggled { id }).emit(&self.app_handle) {
-            error!("Failed to emit history-updated event: {}", e);
-        }
-
-        Ok(())
+        transaction.commit()?;
+        Ok(new_saved)
     }
 
     pub fn get_audio_file_path(&self, file_name: &str) -> PathBuf {
@@ -702,6 +772,8 @@ impl HistoryManager {
 mod tests {
     use super::*;
     use rusqlite::{params, Connection};
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     fn setup_conn() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
@@ -709,6 +781,166 @@ mod tests {
             .to_latest(&mut conn)
             .unwrap();
         conn
+    }
+
+    #[test]
+    fn clear_keeps_starred_rows_and_their_files_and_handles_missing_files() {
+        let mut conn = setup_conn();
+        let dir = tempfile::tempdir().unwrap();
+        for timestamp in [100, 200, 300] {
+            insert_entry(&conn, timestamp, "raw", None);
+        }
+        conn.execute(
+            "UPDATE transcription_history SET saved = 1 WHERE timestamp = 200",
+            [],
+        )
+        .unwrap();
+        fs::write(dir.path().join("handy-100.wav"), b"audio").unwrap();
+        fs::write(dir.path().join("handy-200.wav"), b"starred").unwrap();
+        let removed =
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true).unwrap();
+        assert_eq!(
+            removed,
+            HistoryClearSummary {
+                entries: 2,
+                recordings: 1
+            }
+        );
+        assert!(!dir.path().join("handy-100.wav").exists());
+        assert!(dir.path().join("handy-200.wav").exists());
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM transcription_history", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 1);
+        let all =
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), false).unwrap();
+        assert_eq!(
+            all,
+            HistoryClearSummary {
+                entries: 1,
+                recordings: 1
+            }
+        );
+        assert_eq!(
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true).unwrap(),
+            HistoryClearSummary::default()
+        );
+    }
+
+    #[test]
+    fn clear_and_save_are_serialized_without_orphaning_a_recording() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let recordings = dir.path().join("recordings");
+        fs::create_dir(&recordings).unwrap();
+        let mut conn = Connection::open(&path).unwrap();
+        conn.busy_timeout(Duration::from_secs(30)).unwrap();
+        Migrations::new(MIGRATIONS.to_vec())
+            .to_latest(&mut conn)
+            .unwrap();
+        insert_entry(&conn, 100, "before clear", None);
+        fs::write(recordings.join("handy-100.wav"), b"before").unwrap();
+        let mut pending = HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .unwrap();
+        pending.file_name = "handy-200.wav".into();
+        pending.timestamp = 200;
+        pending.transcription_text = "after clear".into();
+        let (attempted_tx, attempted_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer_dir = recordings.clone();
+        let (removed, writer) = HistoryManager::with_clear_transaction(&mut conn, |transaction| {
+            let writer = std::thread::spawn(move || {
+                let conn = Connection::open(path).unwrap();
+                conn.busy_timeout(Duration::ZERO).unwrap();
+                fs::write(writer_dir.join(&pending.file_name), b"in flight").unwrap();
+                let attempt = HistoryManager::insert_history_entry_with_conn(&conn, &pending);
+                let blocked = matches!(attempt.as_ref().err().and_then(|error| error.downcast_ref::<rusqlite::Error>()),
+                    Some(rusqlite::Error::SqliteFailure(error, _)) if error.code == rusqlite::ErrorCode::DatabaseBusy);
+                attempted_tx.send(blocked).unwrap();
+                if attempt.is_err() {
+                    conn.busy_timeout(Duration::from_secs(30)).unwrap();
+                    HistoryManager::insert_history_entry_with_conn(&conn, &pending).unwrap();
+                }
+                done_tx.send(()).unwrap();
+            });
+            assert!(attempted_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+                "writer must reach SQLite and encounter Clear's write lock");
+            assert!(matches!(done_rx.recv_timeout(Duration::from_millis(50)), Err(mpsc::RecvTimeoutError::Timeout)));
+            let candidates = HistoryManager::clear_candidates(transaction, true).unwrap();
+            let removed = HistoryManager::delete_entries_and_files_with_conn(transaction, &recordings, &candidates).unwrap();
+            assert_eq!(removed.entries, 1);
+            Ok((removed, writer))
+        }).unwrap();
+        assert_eq!(removed.recordings, 1);
+        done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        writer.join().unwrap();
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.transcription_text, "after clear");
+        assert!(recordings.join(&entry.file_name).exists());
+        assert!(!recordings.join("handy-100.wav").exists());
+    }
+
+    #[test]
+    fn clear_removes_file_before_attempting_database_delete() {
+        let conn = setup_conn();
+        let dir = tempfile::tempdir().unwrap();
+        insert_entry(&conn, 100, "raw", None);
+        fs::write(dir.path().join("handy-100.wav"), b"audio").unwrap();
+        conn.execute_batch("CREATE TRIGGER stop_delete BEFORE DELETE ON transcription_history BEGIN SELECT RAISE(ABORT, 'blocked'); END;").unwrap();
+        let candidates = HistoryManager::clear_candidates(&conn, true).unwrap();
+        assert!(
+            HistoryManager::delete_entries_and_files_with_conn(&conn, dir.path(), &candidates)
+                .is_err()
+        );
+        assert!(!dir.path().join("handy-100.wav").exists());
+    }
+
+    #[test]
+    fn toggle_saved_commits_before_clear_and_deleted_entries_stay_deleted() {
+        let mut conn = setup_conn();
+        let dir = tempfile::tempdir().unwrap();
+        insert_entry(&conn, 100, "raw", None);
+        let id = conn.last_insert_rowid();
+        fs::write(dir.path().join("handy-100.wav"), b"audio").unwrap();
+        assert!(HistoryManager::toggle_saved_status_with_conn(&mut conn, id).unwrap());
+        assert_eq!(
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true).unwrap(),
+            HistoryClearSummary::default()
+        );
+        assert!(!HistoryManager::toggle_saved_status_with_conn(&mut conn, id).unwrap());
+        assert_eq!(
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true)
+                .unwrap()
+                .entries,
+            1
+        );
+        assert!(HistoryManager::toggle_saved_status_with_conn(&mut conn, id).is_err());
+        let error = HistoryManager::update_transcription_with_conn(
+            &conn,
+            id,
+            "retry".into(),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), format!("History entry {id} not found"));
+        assert!(HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn cleared_event_uses_existing_action_protocol() {
+        assert_eq!(
+            serde_json::to_value(HistoryUpdatePayload::Cleared {}).unwrap(),
+            serde_json::json!({"action": "cleared"})
+        );
     }
 
     #[test]
