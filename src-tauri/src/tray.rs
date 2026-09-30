@@ -20,6 +20,7 @@
 //! a hidden tray relies on tray-icon recreating it from the last applied
 //! icon/menu/tooltip, so those must only ever be set through the applier.
 
+use crate::local_llm::{manager::LocalLlmStateKind, registry, LocalLlmManager, LocalLlmStatus};
 use crate::managers::history::{HistoryEntry, HistoryManager};
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::TranscriptionManager;
@@ -51,11 +52,60 @@ impl TrayIconState {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CleanupMenu {
+    state: LocalLlmStateKind,
+    model_name: String,
+}
+
+fn cleanup_unload_enabled(cleanup: &CleanupMenu) -> bool {
+    cleanup.state == LocalLlmStateKind::Ready
+}
+
+fn tray_label<'a>(localized: &'a str, english: &'a str) -> &'a str {
+    if localized.is_empty() {
+        english
+    } else {
+        localized
+    }
+}
+
+fn cleanup_menu(
+    busy: bool,
+    provider: &str,
+    selected_model: Option<&str>,
+    no_cleanup_model: &str,
+    status: impl FnOnce() -> Option<LocalLlmStatus>,
+) -> Option<CleanupMenu> {
+    if busy || provider != settings::LOCAL_LLM_PROVIDER_ID {
+        return None;
+    }
+    status().map(|status| {
+        let id = status.model_id.as_deref().or(selected_model);
+        let model_name = id
+            .and_then(registry::find)
+            .map(|entry| entry.display_name.to_string())
+            .unwrap_or_else(|| no_cleanup_model.to_string());
+        CleanupMenu {
+            state: status.state,
+            model_name,
+        }
+    })
+}
+
+/// Dispatches the blocking cleanup unload on a std thread.
+pub(crate) fn unload_cleanup_on_worker(
+    unload: impl FnOnce() + Send + 'static,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(unload)
+}
+
 /// Everything the tray *menu* (and tooltip) depends on. When two snapshots
 /// compare equal the menu is not rebuilt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct MenuInputs {
     busy: bool,
+    cleanup: Option<CleanupMenu>,
     warning: bool,
     model_loaded: bool,
     selected_model: String,
@@ -93,6 +143,25 @@ struct TrayInner {
     next_seq: u64,
     /// Sequence number of the request that produced `desired`.
     desired_seq: u64,
+}
+
+impl TrayInner {
+    fn accept_desired(&mut self, seq: u64, desired: TrayDesired) -> bool {
+        if seq < self.desired_seq {
+            trace!(
+                "tray sync: request {seq} superseded by {}",
+                self.desired_seq
+            );
+            return false;
+        }
+        self.desired = Some(desired);
+        self.desired_seq = seq;
+        !std::mem::replace(&mut self.pending, true)
+    }
+
+    fn menu_needs_rebuild(&self, desired: &MenuInputs) -> bool {
+        self.applied_menu.as_ref() != Some(desired)
+    }
 }
 
 /// Tauri managed state owning the tray's desired/applied snapshots.
@@ -286,20 +355,7 @@ fn sync_tray_with(app: &AppHandle, update: impl FnOnce(&mut TrayInner)) {
         if let Some(image) = loaded_icon {
             inner.icons.insert(desired.icon_path, image);
         }
-        if seq < inner.desired_seq {
-            // A request triggered after this one already stored its snapshot
-            // (and scheduled an apply). Ours is stale; drop it.
-            trace!(
-                "tray sync: request {seq} superseded by {}",
-                inner.desired_seq
-            );
-            return;
-        }
-        inner.desired = Some(desired);
-        inner.desired_seq = seq;
-        // If an apply is already pending it will read the snapshot we just
-        // stored; otherwise schedule one.
-        !std::mem::replace(&mut inner.pending, true)
+        inner.accept_desired(seq, desired)
     };
 
     if schedule {
@@ -324,10 +380,24 @@ fn compute_desired(app: &AppHandle, icon_state: TrayIconState) -> TrayDesired {
         .collect();
     downloaded_models.sort_by(|a, b| a.1.cmp(&b.1));
 
+    let strings = get_tray_translations(Some(settings.app_language.clone()));
+    let english = get_tray_translations(Some("en".to_string()));
+    let cleanup = cleanup_menu(
+        icon_state.is_busy(),
+        &settings.post_process_provider_id,
+        settings.local_llm_model_id.as_deref(),
+        tray_label(&strings.no_cleanup_model, &english.no_cleanup_model),
+        || {
+            app.try_state::<Arc<LocalLlmManager>>()
+                .map(|manager| manager.status())
+        },
+    );
+
     TrayDesired {
         icon_path: get_icon_path(theme, icon_state, warning),
         menu: MenuInputs {
             busy: icon_state.is_busy(),
+            cleanup,
             warning,
             model_loaded,
             selected_model: settings.selected_model,
@@ -367,7 +437,7 @@ fn apply_on_main(app: &AppHandle) {
             return;
         };
         let icon_changed = inner.applied_icon != Some(desired.icon_path);
-        let menu_changed = inner.applied_menu.as_ref() != Some(&desired.menu);
+        let menu_changed = inner.menu_needs_rebuild(&desired.menu);
         if !icon_changed && !menu_changed {
             trace!("tray apply: nothing changed");
             return;
@@ -554,7 +624,42 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
             None::<&str>,
         )?;
 
-        Menu::with_items(
+        let cleanup_items = if let Some(cleanup) = &inputs.cleanup {
+            let english = get_tray_translations(Some("en".to_string()));
+            let state_label = match cleanup.state {
+                LocalLlmStateKind::Ready => {
+                    tray_label(&strings.cleanup_ready, &english.cleanup_ready)
+                }
+                LocalLlmStateKind::Starting | LocalLlmStateKind::Stopping => {
+                    tray_label(&strings.cleanup_loading, &english.cleanup_loading)
+                }
+                LocalLlmStateKind::Failed => {
+                    tray_label(&strings.cleanup_error, &english.cleanup_error)
+                }
+                LocalLlmStateKind::Unloaded => {
+                    tray_label(&strings.cleanup_not_loaded, &english.cleanup_not_loaded)
+                }
+            };
+            let prefix = tray_label(&strings.cleanup, &english.cleanup);
+            let label = format!("{prefix}: {} ({state_label})", cleanup.model_name);
+            Some((
+                MenuItem::with_id(app, "cleanup_status", &label, false, None::<&str>)?,
+                MenuItem::with_id(
+                    app,
+                    "unload_post_processing_model",
+                    tray_label(
+                        &strings.unload_post_processing_model,
+                        &english.unload_post_processing_model,
+                    ),
+                    cleanup_unload_enabled(cleanup),
+                    None::<&str>,
+                )?,
+            ))
+        } else {
+            None
+        };
+
+        let menu = Menu::with_items(
             app,
             &[
                 &version_i,
@@ -569,7 +674,12 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
                 &separator()?,
                 &quit_i,
             ],
-        )?
+        )?;
+        if let Some((status_item, unload_item)) = cleanup_items {
+            menu.insert(&status_item, 6)?;
+            menu.insert(&unload_item, 7)?;
+        }
+        menu
     };
 
     // When update checks are forced off (e.g. HANDY_DISABLE_UPDATER, set by
@@ -668,7 +778,8 @@ pub fn copy_last_transcript(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{last_transcript_text, load_tray_icon, MenuInputs, TrayDesired, TrayIconState};
+    use super::*;
+    use crate::local_llm::manager::LocalLlmStateKind;
     use crate::managers::history::HistoryEntry;
 
     fn build_entry(transcription: &str, post_processed: Option<&str>) -> HistoryEntry {
@@ -688,6 +799,7 @@ mod tests {
     fn inputs(busy: bool) -> MenuInputs {
         MenuInputs {
             busy,
+            cleanup: None,
             warning: false,
             model_loaded: true,
             selected_model: "small".to_string(),
@@ -695,6 +807,187 @@ mod tests {
             locale: "en".to_string(),
             update_checks_enabled: true,
         }
+    }
+
+    fn cleanup(state: LocalLlmStateKind) -> CleanupMenu {
+        CleanupMenu {
+            state,
+            model_name: "S1-mini".into(),
+        }
+    }
+
+    #[test]
+    fn cleanup_unload_is_enabled_only_in_ready_and_snapshot_tracks_status() {
+        for state in [
+            LocalLlmStateKind::Unloaded,
+            LocalLlmStateKind::Starting,
+            LocalLlmStateKind::Stopping,
+            LocalLlmStateKind::Failed,
+        ] {
+            assert!(!cleanup_unload_enabled(&cleanup(state)));
+        }
+        assert!(cleanup_unload_enabled(&cleanup(LocalLlmStateKind::Ready)));
+        let mut ready = inputs(false);
+        ready.cleanup = Some(cleanup(LocalLlmStateKind::Ready));
+        let mut unloaded = ready.clone();
+        unloaded.cleanup = Some(cleanup(LocalLlmStateKind::Unloaded));
+        assert_ne!(ready, unloaded);
+        assert_eq!(
+            tray_label("", "Unload Post-processing Model"),
+            "Unload Post-processing Model"
+        );
+        assert_eq!(tray_label("Localized", "English"), "Localized");
+    }
+
+    #[test]
+    fn cleanup_event_burst_coalesces_and_last_snapshot_wins() {
+        let state = TrayState::new();
+        let mut scheduled = 0;
+        for seq in 1..=100 {
+            let mut menu = inputs(false);
+            menu.cleanup = Some(cleanup(if seq == 100 {
+                LocalLlmStateKind::Ready
+            } else {
+                LocalLlmStateKind::Starting
+            }));
+            let desired = TrayDesired {
+                icon_path: "resources/tray_idle.png",
+                menu,
+            };
+            if state.lock().accept_desired(seq, desired) {
+                scheduled += 1;
+            }
+        }
+        assert_eq!(scheduled, 1);
+        let mut inner = state.lock();
+        let newest = inner.desired.clone().unwrap();
+        assert_eq!(newest.menu.cleanup, Some(cleanup(LocalLlmStateKind::Ready)));
+        assert!(!inner.accept_desired(
+            99,
+            TrayDesired {
+                icon_path: "resources/tray_idle.png",
+                menu: inputs(false),
+            }
+        ));
+        assert_eq!(inner.desired, Some(newest.clone()));
+        inner.pending = false;
+        assert!(inner.accept_desired(101, newest));
+    }
+
+    #[test]
+    fn equal_cleanup_snapshots_do_not_rebuild_and_status_changes_do() {
+        let state = TrayState::new();
+        let mut ready = inputs(false);
+        ready.cleanup = Some(cleanup(LocalLlmStateKind::Ready));
+        let mut inner = state.lock();
+        inner.applied_menu = Some(ready.clone());
+        assert!(!inner.menu_needs_rebuild(&ready));
+        let mut unloaded = ready.clone();
+        unloaded.cleanup = Some(cleanup(LocalLlmStateKind::Unloaded));
+        assert!(inner.menu_needs_rebuild(&unloaded));
+    }
+
+    #[test]
+    fn cleanup_snapshot_is_idle_and_local_only_and_uses_registry_or_fallback() {
+        for (busy, provider) in [(true, settings::LOCAL_LLM_PROVIDER_ID), (false, "openai")] {
+            assert_eq!(
+                cleanup_menu(busy, provider, None, "No cleanup model", || {
+                    panic!("irrelevant cleanup status must not be read")
+                }),
+                None
+            );
+        }
+        let status = LocalLlmStatus {
+            state: LocalLlmStateKind::Ready,
+            model_id: Some("s1-mini-q4km".into()),
+            error: None,
+        };
+        let snapshot = cleanup_menu(
+            false,
+            settings::LOCAL_LLM_PROVIDER_ID,
+            Some("unknown"),
+            "No cleanup model",
+            || Some(status.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.model_name,
+            registry::find("s1-mini-q4km").unwrap().display_name
+        );
+        let unloaded = LocalLlmStatus {
+            state: LocalLlmStateKind::Unloaded,
+            model_id: None,
+            error: None,
+        };
+        let snapshot = cleanup_menu(
+            false,
+            settings::LOCAL_LLM_PROVIDER_ID,
+            Some("s1-mini-q4km"),
+            "No cleanup model",
+            || Some(unloaded.clone()),
+        )
+        .unwrap();
+        assert_eq!(
+            snapshot.model_name,
+            registry::find("s1-mini-q4km").unwrap().display_name
+        );
+        let missing = cleanup_menu(
+            false,
+            settings::LOCAL_LLM_PROVIDER_ID,
+            None,
+            "No cleanup model",
+            || Some(unloaded),
+        )
+        .unwrap();
+        assert_eq!(missing.model_name, "No cleanup model");
+        let failed = LocalLlmStatus {
+            state: LocalLlmStateKind::Failed,
+            model_id: Some("unknown".into()),
+            error: Some("first error".into()),
+        };
+        let snapshot = cleanup_menu(
+            false,
+            settings::LOCAL_LLM_PROVIDER_ID,
+            None,
+            "No cleanup model",
+            || Some(failed.clone()),
+        )
+        .unwrap();
+        assert_eq!(snapshot.state, LocalLlmStateKind::Failed);
+        assert_eq!(snapshot.model_name, "No cleanup model");
+        let mut other_error = failed;
+        other_error.error = Some("second error".into());
+        assert_eq!(
+            Some(snapshot),
+            cleanup_menu(
+                false,
+                settings::LOCAL_LLM_PROVIDER_ID,
+                None,
+                "No cleanup model",
+                || Some(other_error)
+            )
+        );
+        assert_eq!(
+            cleanup_menu(
+                false,
+                settings::LOCAL_LLM_PROVIDER_ID,
+                None,
+                "No cleanup model",
+                || None
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn cleanup_unload_runs_on_a_different_thread() {
+        let caller = std::thread::current().id();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = unload_cleanup_on_worker(move || {
+            sender.send(std::thread::current().id()).unwrap();
+        });
+        worker.join().unwrap();
+        assert_ne!(receiver.recv().unwrap(), caller);
     }
 
     #[test]
