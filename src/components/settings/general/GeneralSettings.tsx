@@ -15,6 +15,7 @@ import { ModelSettingsCard } from "./ModelSettingsCard";
 import { PreferredLanguages } from "../PreferredLanguages";
 import { ChineseScriptSetting } from "../ChineseScript";
 import { isChinese } from "@/lib/utils/languageSuggestions";
+import { dictationShortcutIds } from "@/lib/utils/shortcutPresentation";
 
 export const GeneralSettings: React.FC = () => {
   const { t } = useTranslation();
@@ -27,7 +28,11 @@ export const GeneralSettings: React.FC = () => {
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">
       <SettingsGroup title={t("settings.general.title")}>
-        <ShortcutInput shortcutId="transcribe" grouped={true} />
+        {dictationShortcutIds(getSetting("post_process_enabled") ?? false).map(
+          (id) => (
+            <ShortcutInput key={id} shortcutId={id} grouped={true} />
+          ),
+        )}
         <ShortcutActivationSetting descriptionMode="tooltip" grouped={true} />
         {/* Cancel shortcut remains hidden on Linux because of dynamic shortcut instability. */}
         {!isLinux && <ShortcutInput shortcutId="cancel" grouped={true} />}

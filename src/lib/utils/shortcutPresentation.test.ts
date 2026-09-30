@@ -1,0 +1,20 @@
+import assert from "node:assert/strict";
+import {
+  canClearShortcut,
+  dictationShortcutIds,
+  shortcutLabelId,
+} from "./shortcutPresentation";
+
+assert.deepEqual(dictationShortcutIds(false), ["transcribe"]);
+assert.deepEqual(dictationShortcutIds(true), [
+  "transcribe_with_post_process",
+  "transcribe",
+]);
+assert.equal(shortcutLabelId("transcribe", false), "transcribe");
+assert.equal(shortcutLabelId("transcribe", true), "transcribe_raw");
+for (const id of ["transcribe", "transcribe_with_post_process"]) {
+  assert.equal(canClearShortcut(id, true), true);
+  assert.equal(canClearShortcut(id, false), false);
+}
+assert.equal(canClearShortcut("cancel", true), false);
+console.log("shortcutPresentation: all assertions passed");
