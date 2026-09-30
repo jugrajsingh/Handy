@@ -11,7 +11,7 @@ import { toast } from "sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { SECURE_INPUT_HELP_URL } from "../SecureInputWarning";
 import {
-  canClearShortcut,
+  clearButtonState,
   shortcutLabelId,
 } from "@/lib/utils/shortcutPresentation";
 
@@ -284,6 +284,13 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
   // Get translated name and description for the binding
   const enabled = getSetting("post_process_enabled") ?? false;
   const labelId = shortcutLabelId(shortcutId, enabled);
+  const clearState = clearButtonState({
+    enabled,
+    id: shortcutId,
+    isRecording,
+    isUpdating: isUpdating(`binding_${shortcutId}`),
+    disabled,
+  });
   const handleClear = async () => {
     try {
       await clearBinding(shortcutId);
@@ -333,12 +340,10 @@ export const HandyKeysShortcutInput: React.FC<HandyKeysShortcutInputProps> = ({
           onClick={() => resetBinding(shortcutId)}
           disabled={isUpdating(`binding_${shortcutId}`)}
         />
-        {canClearShortcut(shortcutId, enabled) && (
+        {clearState.visible && (
           <button
             type="button"
-            disabled={
-              disabled || isUpdating(`binding_${shortcutId}`) || isRecording
-            }
+            disabled={clearState.disabled}
             onClick={() => void handleClear()}
             className="px-2 py-1 text-sm disabled:opacity-50"
           >

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   canClearShortcut,
+  clearButtonState,
   dictationShortcutIds,
   shortcutLabelId,
 } from "./shortcutPresentation";
@@ -17,4 +18,27 @@ for (const id of ["transcribe", "transcribe_with_post_process"]) {
   assert.equal(canClearShortcut(id, false), false);
 }
 assert.equal(canClearShortcut("cancel", true), false);
+for (const id of ["transcribe", "transcribe_with_post_process", "cancel"]) {
+  for (const enabled of [false, true]) {
+    for (const isRecording of [false, true]) {
+      for (const isUpdating of [false, true]) {
+        for (const disabled of [false, true]) {
+          assert.deepEqual(
+            clearButtonState({
+              enabled,
+              id,
+              isRecording,
+              isUpdating,
+              disabled,
+            }),
+            {
+              visible: enabled && id !== "cancel",
+              disabled: disabled || isRecording || isUpdating,
+            },
+          );
+        }
+      }
+    }
+  }
+}
 console.log("shortcutPresentation: all assertions passed");

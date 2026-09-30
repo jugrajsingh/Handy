@@ -13,3 +13,22 @@ export function canClearShortcut(id: string, enabled: boolean): boolean {
     enabled && (id === "transcribe" || id === "transcribe_with_post_process")
   );
 }
+
+export function clearButtonState({
+  enabled,
+  id,
+  isRecording,
+  isUpdating,
+  disabled,
+}: {
+  enabled: boolean;
+  id: string;
+  isRecording: boolean;
+  isUpdating: boolean;
+  disabled: boolean;
+}): { visible: boolean; disabled: boolean } {
+  return {
+    visible: canClearShortcut(id, enabled),
+    disabled: disabled || isRecording || isUpdating,
+  };
+}
