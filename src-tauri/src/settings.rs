@@ -1210,6 +1210,10 @@ pub fn get_settings(app: &AppHandle) -> AppSettings {
             }
         }
 
+        if crate::shortcut::policy::restore_raw_binding(&mut settings) {
+            updated = true;
+        }
+
         if updated {
             store.set("settings", serde_json::to_value(&settings).unwrap());
         }

@@ -12,9 +12,9 @@ use crate::settings::{self, ShortcutBinding};
 use super::handler::handle_shortcut_event;
 
 /// Initialize shortcuts using Tauri's global-shortcut plugin
-pub fn init_shortcuts(app: &AppHandle) {
+pub fn init_shortcuts(app: &impl super::policy::RegistrationContext) {
+    let user_settings = app.load_settings();
     let default_bindings = settings::get_default_settings().bindings;
-    let user_settings = settings::load_or_create_app_settings(app);
 
     // Register all default shortcuts, applying user customizations
     for (id, default_binding) in default_bindings {
@@ -74,7 +74,19 @@ pub fn validate_shortcut(raw: &str) -> Result<(), String> {
 }
 
 /// Register a shortcut using Tauri's global-shortcut plugin
-pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
+pub fn register_shortcut(
+    app: &impl super::policy::RegistrationContext,
+    binding: ShortcutBinding,
+) -> Result<(), String> {
+    super::policy::register_nonempty(binding, |binding| {
+        app.register_native(settings::KeyboardImplementation::Tauri, binding)
+    })
+}
+
+pub(super) fn register_nonempty_shortcut(
+    app: &AppHandle,
+    binding: ShortcutBinding,
+) -> Result<(), String> {
     // Validate for Tauri requirements
     if let Err(e) = validate_shortcut(&binding.current_binding) {
         warn!(

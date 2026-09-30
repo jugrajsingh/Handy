@@ -418,11 +418,11 @@ pub fn validate_shortcut(raw: &str) -> Result<(), String> {
 }
 
 /// Initialize handy-keys shortcuts
-pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
-    let state = HandyKeysState::new(app.clone())?;
-
+pub fn init_shortcuts(app: &impl super::policy::RegistrationContext) -> Result<(), String> {
+    use super::policy::HandyKeysRegistration;
+    let state = app.create_handy_keys()?;
+    let user_settings = app.load_settings();
     let default_bindings = settings::get_default_settings().bindings;
-    let user_settings = settings::load_or_create_app_settings(app);
 
     // Register all bindings except cancel (which is dynamic)
     for (id, default_binding) in default_bindings {
@@ -440,7 +440,9 @@ pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
             .cloned()
             .unwrap_or(default_binding);
 
-        if let Err(e) = state.register(&binding) {
+        if let Err(e) =
+            super::policy::register_nonempty(binding, |binding| state.register(&binding))
+        {
             error!(
                 "Failed to register handy-keys shortcut {} during init: {}",
                 id, e
@@ -448,13 +450,25 @@ pub fn init_shortcuts(app: &AppHandle) -> Result<(), String> {
         }
     }
 
-    app.manage(state);
+    app.manage_handy_keys(state);
     info!("handy-keys shortcuts initialized");
     Ok(())
 }
 
 /// Register a shortcut
-pub fn register_shortcut(app: &AppHandle, binding: ShortcutBinding) -> Result<(), String> {
+pub fn register_shortcut(
+    app: &impl super::policy::RegistrationContext,
+    binding: ShortcutBinding,
+) -> Result<(), String> {
+    super::policy::register_nonempty(binding, |binding| {
+        app.register_native(settings::KeyboardImplementation::HandyKeys, binding)
+    })
+}
+
+pub(super) fn register_nonempty_shortcut(
+    app: &AppHandle,
+    binding: ShortcutBinding,
+) -> Result<(), String> {
     let state = app
         .try_state::<HandyKeysState>()
         .ok_or("HandyKeysState not initialized")?;
