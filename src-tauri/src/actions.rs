@@ -4,7 +4,7 @@ use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, S
 use crate::audio_toolkit::VadPolicy;
 use crate::local_llm::LocalLlmManager;
 use crate::managers::audio::{recording_notice_code, AudioRecordingManager};
-use crate::managers::history::HistoryManager;
+use crate::managers::history::{HistoryManager, PostProcessProvenance};
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::policy::{live_decode, LiveDecode, ModelTraits};
 use crate::managers::transcription::StreamWorkKind;
@@ -447,6 +447,17 @@ pub(crate) struct ProcessedTranscription {
     pub post_process_prompt: Option<String>,
     /// `final_text` is the bare transcript because post-processing failed.
     pub post_process_failed: bool,
+    pub provenance: Option<PostProcessProvenance>,
+}
+
+fn cleanup_provenance(settings: &AppSettings) -> PostProcessProvenance {
+    let provider = settings.post_process_provider_id.clone();
+    let model = if provider == LOCAL_LLM_PROVIDER_ID {
+        settings.local_llm_model_id.clone()
+    } else {
+        settings.post_process_models.get(&provider).cloned()
+    };
+    PostProcessProvenance { provider, model }
 }
 
 pub(crate) async fn process_transcription_output(
@@ -459,6 +470,7 @@ pub(crate) async fn process_transcription_output(
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
     let mut post_process_failed = false;
+    let mut provenance = None;
 
     if post_process {
         // A reply that's blank once cleaned is no better than none.
@@ -471,6 +483,7 @@ pub(crate) async fn process_transcription_output(
             PostProcessOutcome::Skipped => {}
             PostProcessOutcome::Failed => post_process_failed = true,
             PostProcessOutcome::Done(processed_text) => {
+                provenance = Some(cleanup_provenance(&settings));
                 post_processed_text = Some(processed_text.clone());
                 final_text = processed_text;
 
@@ -492,6 +505,7 @@ pub(crate) async fn process_transcription_output(
         post_processed_text,
         post_process_prompt,
         post_process_failed,
+        provenance,
     }
 }
 
@@ -845,6 +859,7 @@ impl ShortcutAction for TranscribeAction {
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
                                     language,
+                                    processed.provenance.clone(),
                                 ) {
                                     error!("Failed to save history entry: {}", err);
                                 }
@@ -1095,6 +1110,7 @@ mod tests {
         complete_unless_cancelled, is_blank_transcription, non_blank_post_processed_text,
         post_process_transcription, should_use_streaming_overlay, strip_invisible_chars,
         strip_think_block, PostProcessOutcome, post_process_route, PostProcessRoute,
+        cleanup_provenance,
     };
     use crate::settings::{get_default_settings, AppSettings, OverlayStyle};
     use std::future;
@@ -1178,6 +1194,27 @@ mod tests {
             run_post_process(&post_process_settings(&url), "hello"),
             PostProcessOutcome::Failed
         );
+    }
+
+    #[test]
+    fn provenance_keeps_the_request_snapshot_when_settings_change() {
+        let mut settings = crate::settings::get_default_settings();
+        settings.post_process_provider_id = "local_llm".into();
+        settings.local_llm_model_id = Some("s1-mini-q4km".into());
+        let request = settings.clone();
+        settings.local_llm_model_id = Some("later-selection".into());
+        let provenance = cleanup_provenance(&request);
+        assert_eq!(provenance.provider, "local_llm");
+        assert_eq!(provenance.model.as_deref(), Some("s1-mini-q4km"));
+        for provider in ["openai", "custom", "apple_intelligence"] {
+            settings.post_process_provider_id = provider.into();
+            settings
+                .post_process_models
+                .insert(provider.into(), "actual-api-model".into());
+            let provenance = cleanup_provenance(&settings);
+            assert_eq!(provenance.provider, provider);
+            assert_eq!(provenance.model.as_deref(), Some("actual-api-model"));
+        }
     }
 
     #[test]

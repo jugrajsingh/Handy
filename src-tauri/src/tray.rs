@@ -1087,6 +1087,8 @@ mod tests {
             source_name: None,
             language: None,
             language_source: None,
+            post_process_provider: None,
+            post_process_model: None,
         }
     }
 

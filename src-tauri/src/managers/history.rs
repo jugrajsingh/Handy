@@ -33,6 +33,8 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN post_processed_text TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_prompt TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_requested BOOLEAN NOT NULL DEFAULT 0;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN post_process_provider TEXT;"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN post_process_model TEXT;"),
 ];
 
 /// Nullable columns added outside [`MIGRATIONS`]; see
@@ -42,7 +44,7 @@ const ADDED_COLUMNS: &[&str] = &["source_name", "language", "language_source"];
 /// Every column a [`HistoryEntry`] is read from.
 const ENTRY_COLUMNS: &str = "id, file_name, timestamp, saved, title, transcription_text, \
     post_processed_text, post_process_prompt, post_process_requested, source_name, language, \
-    language_source";
+    language_source, post_process_provider, post_process_model";
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
 pub struct PaginatedHistory {
@@ -81,6 +83,15 @@ pub struct HistoryEntry {
     pub language: Option<String>,
     /// How that language was chosen; `None` before it was recorded.
     pub language_source: Option<LanguageSource>,
+    pub post_process_provider: Option<String>,
+    pub post_process_model: Option<String>,
+}
+
+/// Provider and model from the settings snapshot used for successful cleanup.
+#[derive(Clone, Debug)]
+pub struct PostProcessProvenance {
+    pub provider: String,
+    pub model: Option<String>,
 }
 
 pub struct HistoryManager {
@@ -272,6 +283,8 @@ impl HistoryManager {
                 .get::<_, Option<String>>("language_source")?
                 .as_deref()
                 .and_then(LanguageSource::parse),
+            post_process_provider: row.get("post_process_provider")?,
+            post_process_model: row.get("post_process_model")?,
         })
     }
 
@@ -289,6 +302,7 @@ impl HistoryManager {
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
         language: Option<LanguageDecision>,
+        provenance: Option<PostProcessProvenance>,
     ) -> Result<HistoryEntry> {
         let (language, language_source) = split_language(language);
         let entry = self.insert_entry(HistoryEntry {
@@ -304,6 +318,8 @@ impl HistoryManager {
             source_name: None,
             language,
             language_source,
+            post_process_provider: provenance.as_ref().map(|value| value.provider.clone()),
+            post_process_model: provenance.and_then(|value| value.model),
         })?;
 
         self.cleanup_old_entries()?;
@@ -325,6 +341,8 @@ impl HistoryManager {
             post_processed_text: None,
             post_process_prompt: None,
             post_process_requested: false,
+            post_process_provider: None,
+            post_process_model: None,
             source_name: Some(source_name),
             language: None,
             language_source: None,
@@ -335,36 +353,9 @@ impl HistoryManager {
     fn insert_entry(&self, mut entry: HistoryEntry) -> Result<HistoryEntry> {
         entry.title = self.format_timestamp_title(entry.timestamp);
 
+
         let conn = self.get_connection()?;
-        conn.execute(
-            "INSERT INTO transcription_history (
-                file_name,
-                timestamp,
-                saved,
-                title,
-                transcription_text,
-                post_processed_text,
-                post_process_prompt,
-                post_process_requested,
-                source_name,
-                language,
-                language_source
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                &entry.file_name,
-                entry.timestamp,
-                entry.saved,
-                &entry.title,
-                &entry.transcription_text,
-                &entry.post_processed_text,
-                &entry.post_process_prompt,
-                entry.post_process_requested,
-                &entry.source_name,
-                &entry.language,
-                entry.language_source.map(LanguageSource::as_str),
-            ],
-        )?;
-        entry.id = conn.last_insert_rowid();
+        entry.id = Self::insert_history_entry_with_conn(&conn, &entry)?;
 
         debug!("Saved history entry with id {}", entry.id);
 
@@ -380,6 +371,31 @@ impl HistoryManager {
         Ok(entry)
     }
 
+    fn insert_history_entry_with_conn(conn: &Connection, entry: &HistoryEntry) -> Result<i64> {
+        conn.execute(
+            "INSERT INTO transcription_history (file_name, timestamp, saved, title,
+             transcription_text, post_processed_text, post_process_prompt,
+             post_process_requested, post_process_provider, post_process_model, source_name, language, language_source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                entry.file_name,
+                entry.timestamp,
+                entry.saved,
+                entry.title,
+                entry.transcription_text,
+                entry.post_processed_text,
+                entry.post_process_prompt,
+                entry.post_process_requested,
+                entry.post_process_provider,
+                entry.post_process_model,
+                entry.source_name,
+                entry.language,
+                entry.language_source.map(LanguageSource::as_str),
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
     /// Update an existing history entry with new transcription results (used by retry).
     pub fn update_transcription(
         &self,
@@ -388,36 +404,14 @@ impl HistoryManager {
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
         language: Option<LanguageDecision>,
+        provenance: Option<PostProcessProvenance>,
     ) -> Result<HistoryEntry> {
         let (language, language_source) = split_language(language);
-        let conn = self.get_connection()?;
-        let updated = conn.execute(
-            "UPDATE transcription_history
-             SET transcription_text = ?1,
-                 post_processed_text = ?2,
-                 post_process_prompt = ?3,
-                 language = ?4,
-                 language_source = ?5
-             WHERE id = ?6",
-            params![
-                transcription_text,
-                post_processed_text,
-                post_process_prompt,
-                language,
-                language_source.map(LanguageSource::as_str),
-                id
-            ],
-        )?;
-
-        if updated == 0 {
-            return Err(anyhow!("History entry {} not found", id));
-        }
-
-        let entry = conn.query_row(
-            &format!("SELECT {ENTRY_COLUMNS} FROM transcription_history WHERE id = ?1"),
-            params![id],
-            Self::map_history_entry,
-        )?;
+        let mut conn = self.get_connection()?;
+        let tx = conn.transaction()?;
+        tx.execute("UPDATE transcription_history SET language = ?1, language_source = ?2 WHERE id = ?3", params![language, language_source.map(LanguageSource::as_str), id])?;
+        let entry = Self::update_transcription_with_conn(&tx, id, transcription_text, post_processed_text, post_process_prompt, provenance)?;
+        tx.commit()?;
 
         debug!("Updated transcription for history entry {}", id);
 
@@ -428,6 +422,47 @@ impl HistoryManager {
         {
             error!("Failed to emit history-updated event: {}", e);
         }
+
+        Ok(entry)
+    }
+
+    /// Write retry text and provenance together using the supplied connection.
+    pub fn update_transcription_with_conn(
+        conn: &Connection,
+        id: i64,
+        transcription_text: String,
+        post_processed_text: Option<String>,
+        post_process_prompt: Option<String>,
+        provenance: Option<PostProcessProvenance>,
+    ) -> Result<HistoryEntry> {
+        let updated = conn.execute(
+            "UPDATE transcription_history
+             SET transcription_text = ?1,
+                 post_processed_text = ?2,
+                 post_process_prompt = ?3,
+                 post_process_provider = ?4,
+                 post_process_model = ?5
+             WHERE id = ?6",
+            params![
+                transcription_text,
+                post_processed_text,
+                post_process_prompt,
+                provenance.as_ref().map(|value| value.provider.as_str()),
+                provenance.as_ref().and_then(|value| value.model.as_deref()),
+                id
+            ],
+        )?;
+
+        if updated == 0 {
+            return Err(anyhow!("History entry {} not found", id));
+        }
+
+        let entry = conn
+            .query_row(
+                &format!("SELECT {ENTRY_COLUMNS} FROM transcription_history WHERE id = ?1"),
+                params![id],
+                Self::map_history_entry,
+            )?;
 
         Ok(entry)
     }
@@ -736,25 +771,89 @@ mod tests {
     use rusqlite::{params, Connection};
 
     fn setup_conn() -> Connection {
-        let conn = Connection::open_in_memory().expect("open in-memory db");
-        conn.execute_batch(
-            "CREATE TABLE transcription_history (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                file_name TEXT NOT NULL,
-                timestamp INTEGER NOT NULL,
-                saved BOOLEAN NOT NULL DEFAULT 0,
-                title TEXT NOT NULL,
-                transcription_text TEXT NOT NULL,
-                post_processed_text TEXT,
-                post_process_prompt TEXT,
-                post_process_requested BOOLEAN NOT NULL DEFAULT 0,
-                source_name TEXT,
-                language TEXT,
-                language_source TEXT
-            );",
-        )
-        .expect("create transcription_history table");
+        let mut conn = Connection::open_in_memory().unwrap();
+        HistoryManager::apply_migrations(&mut conn).unwrap();
         conn
+    }
+
+    #[test]
+    fn pre_provenance_rows_migrate_and_read_with_null_provenance() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        Migrations::new(MIGRATIONS[..4].to_vec())
+            .to_latest(&mut conn)
+            .unwrap();
+        insert_entry(&conn, 100, "before migration", Some("Before migration."));
+        Migrations::new(MIGRATIONS.to_vec())
+            .to_latest(&mut conn)
+            .unwrap();
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.transcription_text, "before migration");
+        assert_eq!(entry.post_process_provider, None);
+        assert_eq!(entry.post_process_model, None);
+    }
+
+    #[test]
+    fn retry_writes_and_clears_provenance_with_the_processed_text() {
+        let conn = setup_conn();
+        insert_entry(&conn, 100, "raw", None);
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .unwrap();
+        let updated = HistoryManager::update_transcription_with_conn(
+            &conn,
+            entry.id,
+            "raw".into(),
+            Some("Clean.".into()),
+            None,
+            Some(PostProcessProvenance {
+                provider: "local_llm".into(),
+                model: Some("s1-mini-q4km".into()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(updated.post_processed_text.as_deref(), Some("Clean."));
+        assert_eq!(updated.post_process_provider.as_deref(), Some("local_llm"));
+        assert_eq!(updated.post_process_model.as_deref(), Some("s1-mini-q4km"));
+        let failed = HistoryManager::update_transcription_with_conn(
+            &conn,
+            entry.id,
+            "retry raw".into(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(failed.post_processed_text, None);
+        assert_eq!(failed.post_process_provider, None);
+        assert_eq!(failed.post_process_model, None);
+    }
+
+    #[test]
+    fn initial_save_roundtrips_processed_text_and_provenance_together() {
+        let conn = setup_conn();
+        let mut entry = HistoryEntry {
+            id: 0,
+            file_name: "handy-100.wav".into(),
+            timestamp: 100,
+            saved: false,
+            title: "Recording".into(),
+            transcription_text: "raw".into(),
+            post_processed_text: Some("Clean.".into()),
+            post_process_prompt: None,
+            post_process_requested: true,
+            post_process_provider: Some("local_llm".into()),
+            post_process_model: Some("s1-mini-q4km".into()),
+        };
+        entry.id = HistoryManager::insert_history_entry_with_conn(&conn, &entry).unwrap();
+        let stored = HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.id, entry.id);
+        assert_eq!(stored.post_processed_text, entry.post_processed_text);
+        assert_eq!(stored.post_process_provider, entry.post_process_provider);
+        assert_eq!(stored.post_process_model, entry.post_process_model);
     }
 
     fn insert_entry(conn: &Connection, timestamp: i64, text: &str, post_processed: Option<&str>) {
