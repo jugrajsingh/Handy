@@ -465,19 +465,60 @@ pub(crate) async fn process_transcription_output(
     transcription: &str,
     post_process: bool,
 ) -> ProcessedTranscription {
-    let settings = get_settings(app);
+    process_transcription_output_with_dependencies(
+        transcription,
+        post_process,
+        || get_settings(app),
+        |_, _| std::future::ready(None),
+        |settings, text| async move {
+            match post_process_with_provider(app, &settings, &text).await {
+                PostProcessOutcome::Done(text) => Some(text),
+                PostProcessOutcome::Skipped | PostProcessOutcome::Failed => None,
+            }
+        },
+    )
+    .await
+}
+
+/// Assemble output using one settings snapshot for conversion, cleanup and provenance.
+pub(crate) async fn process_transcription_output_with_dependencies<
+    Settings,
+    Convert,
+    Conversion,
+    Cleanup,
+    Cleaned,
+>(
+    transcription: &str,
+    post_process: bool,
+    settings_source: Settings,
+    convert: Convert,
+    cleanup: Cleanup,
+) -> ProcessedTranscription
+where
+    Settings: FnOnce() -> AppSettings,
+    Convert: FnOnce(AppSettings, String) -> Conversion,
+    Conversion: Future<Output = Option<String>>,
+    Cleanup: FnOnce(AppSettings, String) -> Cleaned,
+    Cleaned: Future<Output = Option<String>>,
+{
+    let settings = settings_source();
     let mut final_text = transcription.to_string();
     let mut post_processed_text: Option<String> = None;
     let mut post_process_prompt: Option<String> = None;
     let mut post_process_failed = false;
     let mut provenance = None;
 
+    if let Some(converted_text) = convert(settings.clone(), final_text.clone()).await {
+        final_text = converted_text;
+    }
+
     if post_process {
         // A reply that's blank once cleaned is no better than none.
-        let outcome = match post_process_with_provider(app, &settings, &final_text).await {
-            PostProcessOutcome::Done(text) => non_blank_post_processed_text(text)
+        let outcome = match cleanup(settings.clone(), final_text.clone()).await {
+            Some(text) => non_blank_post_processed_text(text)
                 .map_or(PostProcessOutcome::Failed, PostProcessOutcome::Done),
-            outcome => outcome,
+            None if is_blank_transcription(&final_text) => PostProcessOutcome::Skipped,
+            None => PostProcessOutcome::Failed,
         };
         match outcome {
             PostProcessOutcome::Skipped => {}
@@ -1111,6 +1152,7 @@ mod tests {
         post_process_transcription, should_use_streaming_overlay, strip_invisible_chars,
         strip_think_block, PostProcessOutcome, post_process_route, PostProcessRoute,
         cleanup_provenance,
+        process_transcription_output_with_dependencies,
     };
     use crate::settings::{get_default_settings, AppSettings, OverlayStyle};
     use std::future;
@@ -1194,6 +1236,89 @@ mod tests {
             run_post_process(&post_process_settings(&url), "hello"),
             PostProcessOutcome::Failed
         );
+    }
+
+    #[test]
+    fn successful_cleanup_outcome_has_processed_text_and_provenance() {
+        let mut settings = crate::settings::get_default_settings();
+        settings.post_process_provider_id = "local_llm".into();
+        settings.local_llm_model_id = Some("s1-mini-q4km".into());
+        let expected_prompt = settings
+            .post_process_prompts
+            .iter()
+            .find(|prompt| Some(&prompt.id) == settings.post_process_selected_prompt_id.as_ref())
+            .map(|prompt| prompt.prompt.clone());
+        let processed =
+            tauri::async_runtime::block_on(process_transcription_output_with_dependencies(
+                "raw",
+                true,
+                || settings,
+                |_, text| {
+                    assert_eq!(text, "raw");
+                    future::ready(Some("converted".into()))
+                },
+                |request, text| {
+                    assert_eq!(text, "converted");
+                    assert_eq!(request.local_llm_model_id.as_deref(), Some("s1-mini-q4km"));
+                    future::ready(Some("Clean.".into()))
+                },
+            ));
+        assert_eq!(processed.final_text, "Clean.");
+        assert_eq!(processed.post_processed_text.as_deref(), Some("Clean."));
+        assert_eq!(processed.post_process_prompt, expected_prompt);
+        let provenance = processed.provenance.expect("successful cleanup provenance");
+        assert_eq!(provenance.provider, "local_llm");
+        assert_eq!(provenance.model.as_deref(), Some("s1-mini-q4km"));
+    }
+
+    #[test]
+    fn failed_or_skipped_cleanup_outcome_has_null_provenance() {
+        for post_process in [true, false] {
+            let cleanup_called = std::cell::Cell::new(false);
+            let processed =
+                tauri::async_runtime::block_on(process_transcription_output_with_dependencies(
+                    "raw",
+                    post_process,
+                    crate::settings::get_default_settings,
+                    |_, _| future::ready(None),
+                    |_, _| {
+                        cleanup_called.set(true);
+                        future::ready(None)
+                    },
+                ));
+            assert_eq!(cleanup_called.get(), post_process);
+            assert_eq!(processed.final_text, "raw");
+            assert_eq!(processed.post_processed_text, None);
+            assert_eq!(processed.post_process_prompt, None);
+            assert!(processed.provenance.is_none());
+        }
+    }
+
+    #[test]
+    fn conversion_only_outcome_has_null_provenance() {
+        for post_process in [false, true] {
+            let cleanup_called = std::cell::Cell::new(false);
+            let processed =
+                tauri::async_runtime::block_on(process_transcription_output_with_dependencies(
+                    "简体",
+                    post_process,
+                    crate::settings::get_default_settings,
+                    |_, _| future::ready(Some("簡體".into())),
+                    |_, text| {
+                        cleanup_called.set(true);
+                        assert_eq!(text, "簡體");
+                        future::ready(None)
+                    },
+                ));
+            assert_eq!(cleanup_called.get(), post_process);
+            assert_eq!(processed.final_text, "簡體");
+            assert_eq!(
+                processed.post_processed_text.as_deref(),
+                if post_process { None } else { Some("簡體") },
+            );
+            assert_eq!(processed.post_process_prompt, None);
+            assert!(processed.provenance.is_none());
+        }
     }
 
     #[test]
