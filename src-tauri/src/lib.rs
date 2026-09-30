@@ -15,6 +15,7 @@ mod input;
 mod language_detection;
 mod languages;
 mod llm_client;
+mod local_llm;
 mod managers;
 mod memory;
 mod notices;

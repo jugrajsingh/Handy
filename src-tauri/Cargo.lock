@@ -2520,6 +2520,7 @@ dependencies = [
  "tauri-plugin-updater",
  "tauri-specta",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "transcribe-cpp",
  "webkit2gtk-sys",
