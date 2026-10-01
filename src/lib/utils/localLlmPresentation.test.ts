@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import type { LocalLlmModelInfo, LocalLlmStatus, Result } from "@/bindings";
+import type {
+  LocalLlmModelInfo,
+  LocalLlmStatus,
+  ModelInfo,
+  Result,
+} from "@/bindings";
 import {
   cleanupStatus,
   cleanupPickerPresentation,
@@ -420,3 +425,94 @@ assert.ok(
   ),
 );
 console.log("picker wiring and Footer flex allocation: all assertions passed");
+
+const { default: ModelDropdown } = await import(
+  "../../components/model-selector/ModelDropdown"
+);
+const transcriptionModel: ModelInfo = {
+  id: "size-fixture",
+  name: "Distinctive transcription fixture",
+  description: "Distinctive transcription description.",
+  filename: "fixture.bin",
+  source: { Url: { url: "https://example.com/fixture.bin", sha256: null } },
+  size_mb: 1234.6,
+  is_downloaded: true,
+  is_downloading: false,
+  partial_size: 0,
+  is_directory: false,
+  engine_type: "TranscribeCpp",
+  accuracy_score: 0,
+  speed_score: 0,
+  supports_translation: false,
+  is_recommended: false,
+  supported_languages: ["en"],
+  supports_language_selection: false,
+  is_custom: false,
+  supports_streaming: false,
+  supports_language_detection: false,
+};
+const transcriptionRowsMarkup = renderToStaticMarkup(
+  React.createElement(ModelDropdown, {
+    models: [
+      transcriptionModel,
+      {
+        ...transcriptionModel,
+        id: "other-size-fixture",
+        name: "Other transcription fixture",
+        size_mb: 42.1,
+      },
+    ],
+    currentModelId: transcriptionModel.id,
+    onModelSelect: () => undefined,
+  }),
+);
+const transcriptionRows = transcriptionRowsMarkup.match(
+  /<div\b[^>]*role="button"[^>]*>[\s\S]*?(?=<div\b[^>]*role="button"|$)/gu,
+);
+assert.equal(transcriptionRows?.length, 2);
+const transcriptionRow = transcriptionRows?.find((entry) =>
+  entry.includes(transcriptionModel.name),
+);
+assert.ok(transcriptionRow);
+const transcriptionSizeLine = transcriptionRow.match(
+  /<div class="text-xs text-mid-gray">([^<]*)<\/div>/u,
+);
+assert.ok(transcriptionSizeLine, "transcription row has its own size line");
+assert.equal(transcriptionSizeLine[1], "1235 MiB");
+assert.ok(
+  transcriptionRow.includes(
+    `<div class="text-xs text-text/40 italic pe-4">${transcriptionModel.description}</div>${transcriptionSizeLine[0]}`,
+  ),
+  "transcription size immediately follows its description",
+);
+console.log("transcription row rounded MiB size: all assertions passed");
+
+const downloadedRows = [
+  model,
+  { ...model, id: "unselected-model", display_name: "Unselected model" },
+];
+for (const selectedId of [model.id, null]) {
+  const dropdown = renderToStaticMarkup(
+    React.createElement(LocalLlmDropdown, {
+      models: downloadedRows,
+      selectedId,
+      disabled: false,
+      onSelect: () => undefined,
+    }),
+  );
+  const buttons = dropdown.match(/<button\b[\s\S]*?<\/button>/gu);
+  assert.equal(buttons?.length, downloadedRows.length);
+  for (const entry of downloadedRows) {
+    const ownRow: string | undefined = buttons?.find((entryRow) =>
+      entryRow.includes(`title="${entry.display_name}"`),
+    );
+    assert.ok(ownRow, `row for ${entry.id}`);
+    const activeBadges: string[] = ownRow.match(/>Active<\/span>/gu) ?? [];
+    assert.equal(
+      activeBadges.length,
+      entry.id === selectedId ? 1 : 0,
+      `Active badge only on selected row: ${entry.id}, selected=${selectedId}`,
+    );
+  }
+}
+console.log("selected and unselected local row badges: all assertions passed");
