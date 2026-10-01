@@ -58,6 +58,53 @@ struct CleanupMenu {
     model_name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TrayModelChoice {
+    id: String,
+    label: String,
+    checked: bool,
+}
+
+fn model_choices(
+    models: &[(String, String)],
+    selected: Option<&str>,
+    prefix: &str,
+) -> Vec<TrayModelChoice> {
+    models
+        .iter()
+        .map(|(id, label)| TrayModelChoice {
+            id: format!("{prefix}:{id}"),
+            label: label.clone(),
+            checked: selected == Some(id.as_str()),
+        })
+        .collect()
+}
+
+/// Selects a downloaded local model when local post-processing is enabled.
+pub(crate) fn select_cleanup_with(
+    enabled: bool,
+    provider: &str,
+    model_id: &str,
+    downloaded: &[(String, String)],
+    select: impl FnOnce(String) -> Result<(), String>,
+) -> Result<bool, String> {
+    if !enabled
+        || provider != settings::LOCAL_LLM_PROVIDER_ID
+        || !downloaded.iter().any(|(id, _)| id == model_id)
+    {
+        return Ok(false);
+    }
+    select(model_id.to_string())?;
+    Ok(true)
+}
+
+/// Dispatches local model selection on a std worker.
+pub(crate) fn select_cleanup_on_worker(
+    work: impl FnOnce() -> Result<(), String> + Send + 'static,
+) -> std::thread::JoinHandle<Result<(), String>> {
+    std::thread::spawn(work)
+}
+
 fn cleanup_unload_enabled(cleanup: &CleanupMenu) -> bool {
     cleanup.state == LocalLlmStateKind::Ready
 }
@@ -91,25 +138,27 @@ fn cleanup_status_label(
 }
 
 fn cleanup_menu(
+    enabled: bool,
     busy: bool,
     provider: &str,
     selected_model: Option<&str>,
     no_cleanup_model: &str,
     status: impl FnOnce() -> Option<LocalLlmStatus>,
 ) -> Option<CleanupMenu> {
-    if busy || provider != settings::LOCAL_LLM_PROVIDER_ID {
+    if !enabled || busy || provider != settings::LOCAL_LLM_PROVIDER_ID {
         return None;
     }
     status().map(|status| {
-        let id = status.model_id.as_deref().or(selected_model);
-        let model_name = id
+        let model_name = selected_model
             .and_then(registry::find)
             .map(|entry| entry.display_name.to_string())
             .unwrap_or_else(|| no_cleanup_model.to_string());
-        CleanupMenu {
-            state: status.state,
-            model_name,
-        }
+        let state = if selected_model.is_some() && status.model_id.as_deref() == selected_model {
+            status.state
+        } else {
+            LocalLlmStateKind::Unloaded
+        };
+        CleanupMenu { state, model_name }
     })
 }
 
@@ -126,6 +175,8 @@ pub(crate) fn unload_cleanup_on_worker(
 struct MenuInputs {
     busy: bool,
     cleanup: Option<CleanupMenu>,
+    selected_cleanup_model: Option<String>,
+    downloaded_cleanup_models: Vec<(String, String)>,
     warning: bool,
     model_loaded: bool,
     selected_model: String,
@@ -324,9 +375,7 @@ pub fn update_tray_menu(app: &AppHandle) {
 /// thread (or lets an already-pending apply pick it up). Never blocks on the
 /// main thread.
 ///
-/// The snapshot (settings, model list, loaded state) is computed on the
-/// *calling* thread on purpose: the main-thread applier must not take manager
-/// locks that a worker may hold across slow work (see #1716).
+/// Snapshot reads and icon decoding run on a std worker before native application.
 pub fn sync_tray(app: &AppHandle) {
     sync_tray_with(app, |_| {});
 }
@@ -351,6 +400,14 @@ fn sync_tray_with(app: &AppHandle, update: impl FnOnce(&mut TrayInner)) {
         return;
     }
 
+    let app = app.clone();
+    std::thread::spawn(move || compute_and_accept(&app, seq, icon_state));
+}
+
+fn compute_and_accept(app: &AppHandle, seq: u64, icon_state: TrayIconState) {
+    let Some(state) = app.try_state::<TrayState>() else {
+        return;
+    };
     let desired = compute_desired(app, icon_state);
 
     // Decode the icon off the main thread, once per path, outside the lock.
@@ -403,6 +460,7 @@ fn compute_desired(app: &AppHandle, icon_state: TrayIconState) -> TrayDesired {
     let strings = get_tray_translations(Some(settings.app_language.clone()));
     let english = get_tray_translations(Some("en".to_string()));
     let cleanup = cleanup_menu(
+        settings.post_process_enabled,
         icon_state.is_busy(),
         &settings.post_process_provider_id,
         settings.local_llm_model_id.as_deref(),
@@ -413,11 +471,28 @@ fn compute_desired(app: &AppHandle, icon_state: TrayIconState) -> TrayDesired {
         },
     );
 
+    let downloaded_cleanup_models = app
+        .try_state::<Arc<LocalLlmManager>>()
+        .and_then(|manager| {
+            manager.models_root().map(|root| {
+                let mut models = registry::MODELS
+                    .iter()
+                    .filter(|entry| crate::local_llm::download::is_downloaded(root, entry))
+                    .map(|entry| (entry.id.to_string(), entry.display_name.to_string()))
+                    .collect::<Vec<_>>();
+                models.sort_by(|left, right| left.1.cmp(&right.1));
+                models
+            })
+        })
+        .unwrap_or_default();
+
     TrayDesired {
         icon_path: get_icon_path(theme, icon_state, warning),
         menu: MenuInputs {
             busy: icon_state.is_busy(),
             cleanup,
+            selected_cleanup_model: settings.local_llm_model_id.clone(),
+            downloaded_cleanup_models,
             warning,
             model_loaded,
             selected_model: settings.selected_model,
@@ -620,36 +695,66 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
             ],
         )?
     } else {
-        // Build model submenu — label is the active model name
-        let submenu_label = inputs
+        let english = get_tray_translations(Some("en".to_string()));
+        let selected_name = inputs
             .downloaded_models
             .iter()
             .find(|(id, _)| *id == inputs.selected_model)
             .map(|(_, name)| name.clone())
             .unwrap_or_else(|| strings.model.clone());
 
+        let submenu_label = format!(
+            "{}: {}",
+            tray_label(&strings.transcription_model, &english.transcription_model),
+            selected_name
+        );
         let model_submenu = Submenu::with_id(app, "model_submenu", &submenu_label, true)?;
-        for (id, name) in &inputs.downloaded_models {
-            let is_active = *id == inputs.selected_model;
-            let item_id = format!("model_select:{}", id);
-            let item = CheckMenuItem::with_id(app, &item_id, name, true, is_active, None::<&str>)?;
+        for choice in model_choices(
+            &inputs.downloaded_models,
+            Some(&inputs.selected_model),
+            "model_select",
+        ) {
+            let item = CheckMenuItem::with_id(
+                app,
+                choice.id,
+                choice.label,
+                true,
+                choice.checked,
+                None::<&str>,
+            )?;
             model_submenu.append(&item)?;
         }
 
         let unload_model_i = MenuItem::with_id(
             app,
             "unload_model",
-            &strings.unload_model,
+            tray_label(&strings.unload_model, &english.unload_model),
             inputs.model_loaded,
             None::<&str>,
         )?;
 
         let cleanup_items = if let Some(cleanup) = &inputs.cleanup {
-            let english = get_tray_translations(Some("en".to_string()));
             let label =
                 cleanup_status_label(cleanup.state, &cleanup.model_name, &strings, &english);
+            let choices = model_choices(
+                &inputs.downloaded_cleanup_models,
+                inputs.selected_cleanup_model.as_deref(),
+                "cleanup_model_select",
+            );
+            let submenu =
+                Submenu::with_id(app, "cleanup_model_submenu", &label, !choices.is_empty())?;
+            for choice in choices {
+                submenu.append(&CheckMenuItem::with_id(
+                    app,
+                    choice.id,
+                    choice.label,
+                    true,
+                    choice.checked,
+                    None::<&str>,
+                )?)?;
+            }
             Some((
-                MenuItem::with_id(app, "cleanup_status", &label, false, None::<&str>)?,
+                submenu,
                 MenuItem::with_id(
                     app,
                     "unload_post_processing_model",
@@ -669,7 +774,6 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
             app,
             &[
                 &version_i,
-                &separator()?,
                 &copy_last_transcript_i,
                 &separator()?,
                 &model_submenu,
@@ -677,13 +781,13 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
                 &separator()?,
                 &settings_i,
                 &check_updates_i,
-                &separator()?,
                 &quit_i,
             ],
         )?;
-        if let Some((status_item, unload_item)) = cleanup_items {
-            menu.insert(&status_item, 6)?;
+        if let Some((submenu, unload_item)) = cleanup_items {
+            menu.insert(&submenu, 6)?;
             menu.insert(&unload_item, 7)?;
+            menu.insert(&separator()?, 8)?;
         }
         menu
     };
@@ -698,13 +802,13 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
         menu.remove(&check_updates_i)?;
     }
 
-    // Both layouts start with [version, separator, ...]; slot the warning in
-    // right below the version line so it's the first actionable thing seen.
+    // Warning follows the version with a separator after it.
     let mut tooltip = version_label;
     if let Some(warning_item) = secure_input_warning {
-        menu.insert(&warning_item, 2)?;
-        menu.insert(&separator()?, 3)?;
-        tooltip = format!("{} — {}", tooltip, warning_item.text().unwrap_or_default());
+        let warning_index = if inputs.busy { 2 } else { 1 };
+        menu.insert(&warning_item, warning_index)?;
+        menu.insert(&separator()?, warning_index + 1)?;
+        tooltip = format!("{} - {}", tooltip, warning_item.text().unwrap_or_default());
     }
 
     Ok((menu, tooltip))
@@ -788,6 +892,164 @@ mod tests {
     use crate::local_llm::manager::LocalLlmStateKind;
     use crate::managers::history::HistoryEntry;
 
+    #[test]
+    fn model_choices_keep_full_names_and_check_only_selected_downloads() {
+        let long = "Qwen3-4B-Instruct-2507 with an exceptionally long display name";
+        let models = vec![
+            ("s1-mini-q4km".into(), "S1-mini by Superwhisper".into()),
+            ("qwen3-4b-instruct-2507-q4km".into(), long.into()),
+        ];
+        let choices = model_choices(
+            &models,
+            Some("qwen3-4b-instruct-2507-q4km"),
+            "cleanup_model_select",
+        );
+        assert_eq!(choices[0].id, "cleanup_model_select:s1-mini-q4km");
+        assert!(!choices[0].checked);
+        assert!(choices[1].checked);
+        assert_eq!(choices[1].label, long);
+        assert!(
+            model_choices(&models, Some("missing"), "cleanup_model_select")
+                .iter()
+                .all(|choice| !choice.checked)
+        );
+        let english = get_tray_translations(Some("en".into()));
+        assert_eq!(
+            cleanup_status_label(LocalLlmStateKind::Ready, long, &english, &english),
+            format!("Post-processing model: {long} (ready)")
+        );
+    }
+
+    #[test]
+    fn disabled_post_processing_never_reads_status_or_exposes_group() {
+        assert!(cleanup_menu(
+            false,
+            false,
+            settings::LOCAL_LLM_PROVIDER_ID,
+            Some("s1-mini-q4km"),
+            "No post-processing model",
+            || panic!("disabled group must not inspect manager")
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn selected_model_label_does_not_claim_another_loaded_model_is_ready() {
+        let snapshot = cleanup_menu(
+            true,
+            false,
+            settings::LOCAL_LLM_PROVIDER_ID,
+            Some("quill-0.8b-q4km"),
+            "No post-processing model",
+            || {
+                Some(LocalLlmStatus {
+                    state: LocalLlmStateKind::Ready,
+                    model_id: Some("s1-mini-q4km".into()),
+                    error: None,
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(snapshot.model_name, "Quill 0.8B");
+        assert_eq!(snapshot.state, LocalLlmStateKind::Unloaded);
+    }
+
+    #[test]
+    fn tray_selection_worker_never_runs_on_callback_thread() {
+        let caller = std::thread::current().id();
+        let worker = select_cleanup_on_worker(move || {
+            assert_ne!(caller, std::thread::current().id());
+            Ok(())
+        });
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn tray_selection_refuses_disabled_remote_and_missing_models() {
+        let downloaded = vec![("s1-mini-q4km".into(), "S1-mini by Superwhisper".into())];
+        for (enabled, provider, id) in [
+            (false, "local_llm", "s1-mini-q4km"),
+            (true, "openai", "s1-mini-q4km"),
+            (true, "local_llm", "unknown"),
+            (true, "local_llm", "qwen3-4b-instruct-2507-q4km"),
+        ] {
+            assert!(
+                !select_cleanup_with(enabled, provider, id, &downloaded, |_| panic!(
+                    "refused selection must not call persistence"
+                ))
+                .unwrap()
+            );
+        }
+        let mut selected = None;
+        assert!(
+            select_cleanup_with(true, "local_llm", "s1-mini-q4km", &downloaded, |id| {
+                selected = Some(id);
+                Ok(())
+            })
+            .unwrap()
+        );
+        assert_eq!(selected.as_deref(), Some("s1-mini-q4km"));
+        assert!(
+            select_cleanup_with(true, "local_llm", "s1-mini-q4km", &downloaded, |_| Err(
+                "persist failed".into()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn disabled_group_and_action_each_protect_selection() {
+        let downloaded = vec![("s1-mini-q4km".into(), "S1-mini by Superwhisper".into())];
+        let group = cleanup_menu(
+            false,
+            false,
+            "local_llm",
+            Some("s1-mini-q4km"),
+            "No post-processing model",
+            || {
+                Some(LocalLlmStatus {
+                    state: LocalLlmStateKind::Ready,
+                    model_id: Some("s1-mini-q4km".into()),
+                    error: None,
+                })
+            },
+        );
+        let mut called = false;
+        if group.is_some() {
+            select_cleanup_with(false, "local_llm", "s1-mini-q4km", &downloaded, |_| {
+                called = true;
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert!(!called);
+    }
+
+    #[test]
+    fn identical_bursts_rebuild_once_with_either_coalescing_layer() {
+        let state = TrayState::new();
+        let desired = TrayDesired {
+            icon_path: "resources/tray_idle.png",
+            menu: inputs(false),
+        };
+        let mut queued = Vec::new();
+        for seq in 1..=100 {
+            if state.lock().accept_desired(seq, desired.clone()) {
+                queued.push(desired.clone());
+            }
+        }
+        let mut rebuilds = 0;
+        for next in queued {
+            let mut inner = state.lock();
+            inner.pending = false;
+            if inner.menu_needs_rebuild(&next.menu) {
+                rebuilds += 1;
+                inner.applied_menu = Some(next.menu);
+            }
+        }
+        assert_eq!(rebuilds, 1);
+    }
+
     fn build_entry(transcription: &str, post_processed: Option<&str>) -> HistoryEntry {
         HistoryEntry {
             id: 1,
@@ -808,6 +1070,8 @@ mod tests {
         MenuInputs {
             busy,
             cleanup: None,
+            selected_cleanup_model: None,
+            downloaded_cleanup_models: Vec::new(),
             warning: false,
             model_loaded: true,
             selected_model: "small".to_string(),
@@ -841,8 +1105,8 @@ mod tests {
         unloaded.cleanup = Some(cleanup(LocalLlmStateKind::Unloaded));
         assert_ne!(ready, unloaded);
         assert_eq!(
-            tray_label("", "Unload Post-processing Model"),
-            "Unload Post-processing Model"
+            tray_label("", "Unload post-processing model"),
+            "Unload post-processing model"
         );
         assert_eq!(tray_label("Localized", "English"), "Localized");
     }
@@ -899,9 +1163,14 @@ mod tests {
     fn cleanup_snapshot_is_idle_and_local_only_and_uses_registry_or_fallback() {
         for (busy, provider) in [(true, settings::LOCAL_LLM_PROVIDER_ID), (false, "openai")] {
             assert_eq!(
-                cleanup_menu(busy, provider, None, "No cleanup model", || {
-                    panic!("irrelevant cleanup status must not be read")
-                }),
+                cleanup_menu(
+                    true,
+                    busy,
+                    provider,
+                    None,
+                    "No post-processing model",
+                    || { panic!("irrelevant cleanup status must not be read") }
+                ),
                 None
             );
         }
@@ -911,10 +1180,11 @@ mod tests {
             error: None,
         };
         let snapshot = cleanup_menu(
+            true,
             false,
             settings::LOCAL_LLM_PROVIDER_ID,
-            Some("unknown"),
-            "No cleanup model",
+            Some("s1-mini-q4km"),
+            "No post-processing model",
             || Some(status.clone()),
         )
         .unwrap();
@@ -928,10 +1198,11 @@ mod tests {
             error: None,
         };
         let snapshot = cleanup_menu(
+            true,
             false,
             settings::LOCAL_LLM_PROVIDER_ID,
             Some("s1-mini-q4km"),
-            "No cleanup model",
+            "No post-processing model",
             || Some(unloaded.clone()),
         )
         .unwrap();
@@ -940,47 +1211,51 @@ mod tests {
             registry::find("s1-mini-q4km").unwrap().display_name
         );
         let missing = cleanup_menu(
+            true,
             false,
             settings::LOCAL_LLM_PROVIDER_ID,
             None,
-            "No cleanup model",
+            "No post-processing model",
             || Some(unloaded),
         )
         .unwrap();
-        assert_eq!(missing.model_name, "No cleanup model");
+        assert_eq!(missing.model_name, "No post-processing model");
         let failed = LocalLlmStatus {
             state: LocalLlmStateKind::Failed,
             model_id: Some("unknown".into()),
             error: Some("first error".into()),
         };
         let snapshot = cleanup_menu(
+            true,
             false,
             settings::LOCAL_LLM_PROVIDER_ID,
-            None,
-            "No cleanup model",
+            Some("unknown"),
+            "No post-processing model",
             || Some(failed.clone()),
         )
         .unwrap();
         assert_eq!(snapshot.state, LocalLlmStateKind::Failed);
-        assert_eq!(snapshot.model_name, "No cleanup model");
+        assert_eq!(snapshot.model_name, "No post-processing model");
         let mut other_error = failed;
         other_error.error = Some("second error".into());
         assert_eq!(
             Some(snapshot),
             cleanup_menu(
+                true,
                 false,
                 settings::LOCAL_LLM_PROVIDER_ID,
-                None,
-                "No cleanup model",
+                Some("unknown"),
+                "No post-processing model",
                 || Some(other_error)
             )
         );
         assert_eq!(
             cleanup_menu(
+                true,
                 false,
                 settings::LOCAL_LLM_PROVIDER_ID,
                 None,
-                "No cleanup model",
+                "No post-processing model",
                 || None
             ),
             None
@@ -1000,10 +1275,11 @@ mod tests {
 
     fn unloaded_cleanup_snapshot(saved: &settings::AppSettings) -> Option<CleanupMenu> {
         cleanup_menu(
+            saved.post_process_enabled,
             false,
             &saved.post_process_provider_id,
             saved.local_llm_model_id.as_deref(),
-            "No cleanup model",
+            "No post-processing model",
             || {
                 Some(LocalLlmStatus {
                     state: LocalLlmStateKind::Unloaded,
@@ -1017,6 +1293,7 @@ mod tests {
     #[test]
     fn provider_selection_refreshes_saved_snapshot_and_failed_persist_does_not_refresh() {
         let mut initial = settings::get_default_settings();
+        initial.post_process_enabled = true;
         initial.post_process_provider_id = "openai".into();
         initial.local_llm_model_id = Some("s1-mini-q4km".into());
         let store = Mutex::new(initial);
@@ -1074,6 +1351,7 @@ mod tests {
     async fn unloaded_model_selection_and_clear_refresh_saved_snapshot_without_state_events() {
         let h = crate::local_llm::manager::tests::harness();
         let mut initial = h.settings.clone();
+        initial.post_process_enabled = true;
         initial.local_llm_model_id = None;
         let store = Mutex::new(initial);
         let refreshed = Mutex::new(Vec::new());
@@ -1119,7 +1397,7 @@ mod tests {
                 snapshots[1].1,
                 Some(CleanupMenu {
                     state: LocalLlmStateKind::Unloaded,
-                    model_name: "No cleanup model".into()
+                    model_name: "No post-processing model".into()
                 })
             );
         }
@@ -1148,7 +1426,7 @@ mod tests {
             (LocalLlmStateKind::Stopping, "loading"),
             (LocalLlmStateKind::Failed, "error"),
         ] {
-            let expected = format!("Cleanup: S1-mini ({text})");
+            let expected = format!("Post-processing model: S1-mini ({text})");
             assert_eq!(
                 cleanup_status_label(state, "S1-mini", &english, &english),
                 expected

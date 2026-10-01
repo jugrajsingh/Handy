@@ -498,6 +498,7 @@ pub(crate) mod tests {
     #[derive(Default)]
     pub(crate) struct FakeState {
         pub request_block: bool,
+        pub request_succeeds_on_release: bool,
         pub request_ignores_kill: bool,
         pub request_killed: Arc<AtomicBool>,
         pub request_started: Arc<AtomicBool>,
@@ -570,14 +571,20 @@ pub(crate) mod tests {
             if block {
                 started.store(true, Ordering::SeqCst);
                 for _ in 0..500 {
-                    if release.load(Ordering::SeqCst)
-                        || (!ignores_kill && killed.load(Ordering::SeqCst))
-                    {
+                    if release.load(Ordering::SeqCst) {
+                        if lock(&self.0).request_succeeds_on_release {
+                            break;
+                        }
+                        return Err(LocalLlmError::Transport("request interrupted".into()));
+                    }
+                    if !ignores_kill && killed.load(Ordering::SeqCst) {
                         return Err(LocalLlmError::Transport("request interrupted".into()));
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
-                return Err(LocalLlmError::RequestTimeout);
+                if !release.load(Ordering::SeqCst) {
+                    return Err(LocalLlmError::RequestTimeout);
+                }
             }
             let mut s = lock(&self.0);
             s.requests.push(req.clone());
