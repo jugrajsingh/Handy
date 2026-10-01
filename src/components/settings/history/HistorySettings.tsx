@@ -9,17 +9,7 @@ import React, {
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
-import {
-  Check,
-  Copy,
-  FileAudio,
-  FilePlus,
-  FolderOpen,
-  RotateCcw,
-  Star,
-  Trash2,
-  X,
-} from "lucide-react";
+import { FileAudio, FilePlus, FolderOpen } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { notify } from "@/stores/noticeStore";
 import {
@@ -35,7 +25,12 @@ import {
 } from "@/stores/transcriptionJobsStore";
 import { useSettings } from "@/hooks/useSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { cleanedText, historyCopyText } from "@/lib/utils/historyPresentation";
+import {
+  cleanedText,
+  copyHistoryRaw,
+  historyCopyText,
+  historyModelName,
+} from "@/lib/utils/historyPresentation";
 import { formatDateTime } from "@/utils/dateFormat";
 import { AudioPlayer, AudioPlayerGroup } from "../../ui/AudioPlayer";
 import { Button } from "../../ui/Button";
@@ -47,6 +42,8 @@ import {
   type FileRead,
 } from "./transcribeFiles";
 import { HistoryCompare } from "./HistoryCompare";
+import { HistoryActions } from "./HistoryActions";
+import { useLocalLlmModels } from "../post-processing/LocalLlmSettings";
 import {
   PageGeneration,
   createHistoryActions,
@@ -54,29 +51,7 @@ import {
   reloadHistoryOnUpdate,
   createHistoryScrollAnchor,
   createHistoryEntryActions,
-  retryHistoryWithAnchor,
 } from "./pageGeneration";
-
-const IconButton: React.FC<{
-  onClick: () => void;
-  title: string;
-  disabled?: boolean;
-  active?: boolean;
-  children: React.ReactNode;
-}> = ({ onClick, title, disabled, active, children }) => (
-  <button
-    onClick={onClick}
-    disabled={disabled}
-    className={`p-1.5 rounded-md flex items-center justify-center transition-colors cursor-pointer disabled:cursor-not-allowed disabled:text-text/20 ${
-      active
-        ? "text-logo-primary hover:text-logo-primary"
-        : "text-ink-3 hover:text-logo-primary"
-    }`}
-    title={title}
-  >
-    {children}
-  </button>
-);
 
 const PAGE_SIZE = 30;
 
@@ -145,6 +120,7 @@ export const HistorySettings: React.FC = () => {
   const osType = useOsType();
   const jobs = useTranscriptionJobsStore((state) => state.jobs);
   const reads = useFileReadsStore((state) => state.reads);
+  const { models: localModels } = useLocalLlmModels();
   const { getSetting } = useSettings();
   const changeCompareView = useSettingsStore(
     (state) => state.changeHistoryCompareView,
@@ -380,6 +356,7 @@ export const HistorySettings: React.FC = () => {
                 entry={entry}
                 job={jobs[entry.id]}
                 view={view}
+                modelName={historyModelName(entry, localModels)}
                 onToggleSaved={() => void entryActions.toggleSaved(entry.id)}
                 onCopyText={() => copyToClipboard(historyCopyText(entry))}
                 onCopyRaw={() => copyToClipboard(entry.transcription_text)}
@@ -409,18 +386,23 @@ export const HistorySettings: React.FC = () => {
             </h2>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Dropdown
-              options={(
-                ["diff", "side_by_side", "stacked"] as HistoryCompareView[]
-              ).map((value) => ({
-                value,
-                label: t(`settings.history.compare.${value}`),
-              }))}
-              selectedValue={view}
-              onSelect={(next) => void changeView(next)}
-              disabled={changingView}
-              placeholder={t("settings.history.compare.title")}
-            />
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm text-mid-gray">
+                {t("settings.history.compare.title")}
+              </span>
+              <Dropdown
+                options={(
+                  ["diff", "side_by_side", "stacked"] as HistoryCompareView[]
+                ).map((value) => ({
+                  value,
+                  label: t(`settings.history.compare.${value}`),
+                }))}
+                selectedValue={view}
+                onSelect={(next) => void changeView(next)}
+                disabled={changingView}
+                placeholder={t("settings.history.compare.title")}
+              />
+            </div>
             <Button
               variant="secondary"
               size="sm"
@@ -454,6 +436,7 @@ interface HistoryEntryProps {
   entry: HistoryEntry;
   job?: ActiveJobStatus;
   view: HistoryCompareView;
+  modelName: string | null;
   onToggleSaved: () => void;
   onCopyText: () => Promise<boolean>;
   onCopyRaw: () => Promise<boolean>;
@@ -469,6 +452,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   entry,
   job,
   view,
+  modelName,
   onToggleSaved,
   onCopyText,
   onCopyRaw,
@@ -536,6 +520,12 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
     }
   };
 
+  const handleRetranscribe = async () => {
+    captureAnchor();
+    try { await retryTranscription(entry.id); }
+    catch (error) { console.error("Failed to re-transcribe:", error); notify({ title: t("settings.history.retranscribeError") }); }
+  };
+
   const formattedDate = formatDateTime(String(entry.timestamp), i18n.language);
 
   let progressText = t("settings.history.transcribing");
@@ -562,63 +552,29 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
             </span>
           )}
         </div>
-        <div className="flex items-center shrink-0">
-          <IconButton
-            onClick={handleCopyText}
-            disabled={!hasTranscription || retrying}
-            title={t("settings.history.copyToClipboard")}
-          >
-            {showCopied ? (
-              <Check width={16} height={16} />
-            ) : (
-              <Copy width={16} height={16} />
-            )}
-          </IconButton>
-          <IconButton
-            onClick={onToggleSaved}
-            active={entry.saved}
-            title={
-              entry.saved
-                ? t("settings.history.unsave")
-                : t("settings.history.save")
-            }
-          >
-            <Star
-              width={16}
-              height={16}
-              fill={entry.saved ? "currentColor" : "none"}
-            />
-          </IconButton>
-          {retrying ? (
-            <IconButton
-              onClick={() => {
-                setCancelling(true);
-                void cancelTranscription(entry.id);
-              }}
-              disabled={cancelling}
-              title={t("settings.history.cancelTranscription")}
-            >
-              <X width={16} height={16} />
-            </IconButton>
-          ) : (
-            <IconButton
-              onClick={() => retryTranscription(entry.id)}
-              title={t("settings.history.retranscribe")}
-            >
-              <RotateCcw width={16} height={16} />
-            </IconButton>
-          )}
-          <IconButton
-            onClick={handleDeleteEntry}
-            title={t("settings.history.delete")}
-          >
-            <Trash2 width={16} height={16} />
-          </IconButton>
-        </div>
+        <HistoryActions
+          processed={cleanedText(entry) !== null}
+          rawAvailable={entry.transcription_text.trim().length > 0}
+          hasText={hasTranscription}
+          saved={entry.saved}
+          retrying={retrying}
+          copied={showCopied}
+          onCopy={() => void handleCopyText()}
+          onCopyRaw={() =>
+            void copyHistoryRaw(onCopyRaw, () =>
+              notify({ title: t("settings.history.copyError") }),
+            )
+          }
+          onToggleSaved={onToggleSaved}
+          onRetranscribe={() => void handleRetranscribe()}
+          onCancel={() => { setCancelling(true); void cancelTranscription(entry.id); }}
+          cancelling={cancelling}
+          onDelete={() => void handleDeleteEntry()}
+        />
       </div>
 
       {!retrying && cleanedText(entry) !== null ? (
-        <HistoryCompare entry={entry} view={view} onCopyRaw={onCopyRaw} />
+        <HistoryCompare entry={entry} view={view} modelName={modelName} />
       ) : (
       <div className="flex flex-col items-start gap-1 pb-2">
         <p
