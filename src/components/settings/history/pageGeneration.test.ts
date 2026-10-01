@@ -348,6 +348,57 @@ assert.deepEqual(
 assert.equal(visible[1].saved, false);
 console.log("history deletion and saved overlays: all assertions passed");
 
+const retentionFetches: ReturnType<
+  typeof deferred<Result<PaginatedHistory, string>>
+>[] = [];
+let retained: HistoryEntry[] = [];
+const retentionGeneration = new PageGeneration();
+const retentionCursors: (number | null)[] = [];
+const retentionLoader = createHistoryPageLoader({
+  generation: retentionGeneration,
+  getEntries: () => retained,
+  loadingRef: { current: false },
+  fetchPage: (cursor) => {
+    retentionCursors.push(cursor);
+    const request = deferred<Result<PaginatedHistory, string>>();
+    retentionFetches.push(request);
+    return request.promise;
+  },
+  setEntries: (update) => {
+    retained = update(retained);
+  },
+  setLoading: () => undefined,
+  setHasMore: () => undefined,
+  setError: (value) => {
+    assert.equal(value, null);
+  },
+});
+const retentionInitial = retentionLoader.loadPage();
+retentionFetches[0].resolve(page(90, 80));
+await retentionInitial;
+const retentionOlder = retentionLoader.loadPage(80);
+retentionFetches[1].resolve(page(70, 60));
+await retentionOlder;
+const retentionRevision = retentionGeneration.current();
+const pendingRetentionPage = retentionLoader.loadPage(60);
+retentionLoader.applyHistoryUpdate({ action: "deleted", id: 80 });
+retentionLoader.applyHistoryUpdate({ action: "added", entry: row(100) });
+assert.deepEqual(
+  retained.map((entry) => entry.id),
+  [100, 90, 70, 60],
+);
+retentionFetches[2].resolve(page(80, 60, 50));
+await pendingRetentionPage;
+assert.deepEqual(
+  retained.map((entry) => entry.id),
+  [100, 90, 70, 60, 50],
+);
+assert.equal(retentionGeneration.current(), retentionRevision);
+assert.deepEqual(retentionCursors, [null, 80, 60]);
+console.log(
+  "history retention deletion before addition: all assertions passed",
+);
+
 const viewport = {
   top: 0,
   scrollTop: 900,
