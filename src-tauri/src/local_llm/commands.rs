@@ -61,15 +61,29 @@ pub async fn download_local_llm_model(
 ) -> Result<(), String> {
     let entry = entry(&model_id)?;
     let root = models_root(&manager)?;
+    let progress_app = app.clone();
     let emit = move |p: &DownloadProgress| {
-        let _ = app.emit(download::PROGRESS_EVENT, p);
+        let _ = progress_app.emit(download::PROGRESS_EVENT, p);
     };
-    download::download(&root, entry, &emit).await.map(|_| ())
+    download_local_llm_model_with_refresh(download::download(&root, entry, &emit), || {
+        crate::tray::update_tray_menu(&app);
+    })
+    .await
+}
+
+async fn download_local_llm_model_with_refresh(
+    download: impl std::future::Future<Output = Result<std::path::PathBuf, String>>,
+    refresh_tray: impl FnOnce(),
+) -> Result<(), String> {
+    download.await?;
+    refresh_tray();
+    Ok(())
 }
 
 #[tauri::command]
 #[specta::specta]
 pub async fn delete_local_llm_model(
+    app: AppHandle,
     manager: State<'_, Arc<LocalLlmManager>>,
     model_id: String,
 ) -> Result<(), String> {
@@ -78,10 +92,22 @@ pub async fn delete_local_llm_model(
     tauri::async_runtime::spawn_blocking(move || {
         let root = models_root(&manager)?;
         manager.unload();
-        download::delete(&root, entry)
+        delete_local_llm_model_with_refresh(
+            || download::delete(&root, entry),
+            || crate::tray::update_tray_menu(&app),
+        )
     })
     .await
     .map_err(|e| format!("local model deletion worker failed: {e}"))?
+}
+
+fn delete_local_llm_model_with_refresh(
+    delete: impl FnOnce() -> Result<(), String>,
+    refresh_tray: impl FnOnce(),
+) -> Result<(), String> {
+    delete()?;
+    refresh_tray();
+    Ok(())
 }
 
 #[tauri::command]
@@ -105,7 +131,15 @@ pub async fn set_local_llm_model(
         model_id,
         || settings::get_settings(&app),
         |s| settings::write_settings_checked(&app, s),
-        || crate::tray::update_tray_menu(&app),
+        || {
+            crate::tray::update_tray_menu(&app);
+            if let Err(error) = app.emit(
+                "settings-changed",
+                serde_json::json!({ "setting": "local_llm_model_id" }),
+            ) {
+                log::error!("Failed to publish local model selection: {error}");
+            }
+        },
     )
     .await
 }
@@ -178,6 +212,141 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::oneshot;
+
+    fn write_downloaded_fixture(
+        root: &std::path::Path,
+        entry: &registry::ModelEntry,
+    ) -> std::path::PathBuf {
+        let path = registry::model_path(root, entry);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(entry.size_bytes)
+            .unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn download_completion_refreshes_tray_once_and_failures_preserve_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = registry::find("quill-0.8b-q4km").unwrap();
+        let refreshes = std::cell::Cell::new(0);
+        assert!(!download::is_downloaded(dir.path(), entry));
+        for error in ["download failed", "download was cancelled"] {
+            let result =
+                download_local_llm_model_with_refresh(async { Err(error.to_string()) }, || {
+                    refreshes.set(refreshes.get() + 1)
+                })
+                .await;
+            assert_eq!(result, Err(error.to_string()));
+            assert_eq!(refreshes.get(), 0);
+            assert!(!download::is_downloaded(dir.path(), entry));
+        }
+        download_local_llm_model_with_refresh(
+            async { Ok(write_downloaded_fixture(dir.path(), entry)) },
+            || {
+                assert!(download::is_downloaded(dir.path(), entry));
+                refreshes.set(refreshes.get() + 1);
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshes.get(), 1);
+        assert!(download::is_downloaded(dir.path(), entry));
+    }
+
+    #[test]
+    fn deletion_refreshes_tray_once_and_failure_preserves_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = registry::find("quill-0.8b-q4km").unwrap();
+        write_downloaded_fixture(dir.path(), entry);
+        let refreshes = std::cell::Cell::new(0);
+        let result = delete_local_llm_model_with_refresh(
+            || Err("delete failed".into()),
+            || refreshes.set(refreshes.get() + 1),
+        );
+        assert_eq!(result, Err("delete failed".into()));
+        assert_eq!(refreshes.get(), 0);
+        assert!(download::is_downloaded(dir.path(), entry));
+        delete_local_llm_model_with_refresh(
+            || download::delete(dir.path(), entry),
+            || {
+                assert!(!download::is_downloaded(dir.path(), entry));
+                refreshes.set(refreshes.get() + 1);
+            },
+        )
+        .unwrap();
+        assert_eq!(refreshes.get(), 1);
+        assert!(!download::is_downloaded(dir.path(), entry));
+    }
+
+    #[tokio::test]
+    async fn tray_selection_waits_off_thread_for_an_inflight_request() {
+        let h = harness();
+        let alternative = registry::find("quill-0.8b-q4km").unwrap();
+        let alternative_path = registry::model_path(h.manager.models_root().unwrap(), alternative);
+        std::fs::create_dir_all(alternative_path.parent().unwrap()).unwrap();
+        std::fs::File::create(alternative_path)
+            .unwrap()
+            .set_len(alternative.size_bytes)
+            .unwrap();
+        let (started, release) = {
+            let mut fake = h.fake.lock().unwrap();
+            fake.request_block = true;
+            fake.request_succeeds_on_release = true;
+            (fake.request_started.clone(), fake.request_release.clone())
+        };
+        let old = h.settings.clone();
+        let manager = h.manager.clone();
+        let request = std::thread::spawn(move || manager.process("hello there friend", &old));
+        for _ in 0..100 {
+            if started.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.load(Ordering::SeqCst));
+        let store = Arc::new(Mutex::new(h.settings.clone()));
+        let read = store.clone();
+        let write = store.clone();
+        let manager = h.manager.clone();
+        let (refreshed, refresh_done) = oneshot::channel();
+        let selection = tokio::spawn(set_local_llm_model_with_settings(
+            manager,
+            Some("quill-0.8b-q4km".into()),
+            move || read.lock().unwrap().clone(),
+            move |settings| {
+                *write.lock().unwrap() = settings;
+                Ok(())
+            },
+            move || {
+                refreshed.send(()).unwrap();
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(1), refresh_done)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!selection.is_finished());
+        assert_eq!(
+            store.lock().unwrap().local_llm_model_id.as_deref(),
+            Some("quill-0.8b-q4km")
+        );
+        assert!(!request.is_finished());
+        assert_eq!(h.fake.lock().unwrap().loads, 1);
+        release.store(true, Ordering::SeqCst);
+        assert_eq!(request.join().unwrap().unwrap(), "hello there friend");
+        tokio::time::timeout(Duration::from_secs(1), selection)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(h.fake.lock().unwrap().loads, 1);
+        assert_eq!(
+            h.manager.status().state,
+            super::super::manager::LocalLlmStateKind::Unloaded
+        );
+    }
 
     #[tokio::test]
     async fn model_selection_preserves_settings_changed_during_unload() {
