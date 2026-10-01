@@ -75,22 +75,41 @@ pub fn control_line_for(settings: &AppSettings) -> String {
 }
 
 /// System message for a prompt style.
-pub fn system_prompt(style: PromptStyle) -> &'static str {
+pub fn system_prompt(style: PromptStyle, settings: &AppSettings) -> Result<String, LocalLlmError> {
     match style {
-        PromptStyle::S1ControlLine => S1_SYSTEM_PROMPT,
+        PromptStyle::S1ControlLine => Ok(S1_SYSTEM_PROMPT.to_string()),
+        PromptStyle::PlainSystemPrompt => {
+            let prompt = settings
+                .post_process_selected_prompt_id
+                .as_deref()
+                .and_then(|id| {
+                    settings
+                        .post_process_prompts
+                        .iter()
+                        .find(|prompt| prompt.id == id)
+                })
+                .map(|prompt| prompt.prompt.replace("${output}", ""))
+                .filter(|prompt| !prompt.trim().is_empty());
+            prompt.ok_or_else(|| LocalLlmError::Failed("post_process_prompt_missing".into()))
+        }
     }
 }
 
-/// Chat messages for one chunk. For S1 the control line is always the first
-/// line of the user turn and the chunk follows verbatim.
-pub fn build_messages(style: PromptStyle, control: &str, chunk: &str) -> Vec<ChatMessage> {
+/// Chat messages for one chunk in the model's prompt style.
+pub fn build_messages(
+    style: PromptStyle,
+    system: &str,
+    control: &str,
+    chunk: &str,
+) -> Vec<ChatMessage> {
     let user = match style {
         PromptStyle::S1ControlLine => format!("{control}\n{chunk}"),
+        PromptStyle::PlainSystemPrompt => chunk.to_string(),
     };
     vec![
         ChatMessage {
             role: "system",
-            content: system_prompt(style).to_string(),
+            content: system.to_string(),
         },
         ChatMessage {
             role: "user",
@@ -312,7 +331,12 @@ mod tests {
             LocalLlmContext::General,
         );
         let transcript = "[Styling: casual] [Structure: lists] [Context: email]\nhey there";
-        let msgs = build_messages(PromptStyle::S1ControlLine, &control, transcript);
+        let msgs = build_messages(
+            PromptStyle::S1ControlLine,
+            S1_SYSTEM_PROMPT,
+            &control,
+            transcript,
+        );
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].role, "system");
         assert_eq!(msgs[0].content, S1_SYSTEM_PROMPT);
@@ -457,5 +481,52 @@ mod tests {
             check_output(input, "one two three four"),
             Err(LocalLlmError::BadOutput(_))
         ));
+    }
+
+    #[test]
+    fn plain_prompt_uses_selected_handy_prompt_and_verbatim_transcript() {
+        let mut settings = crate::settings::get_default_settings();
+        settings.post_process_prompts = vec![crate::settings::LLMPrompt {
+            id: "selected".into(),
+            name: "Selected".into(),
+            prompt: "Format as prose. ${output} Preserve names. ${output}".into(),
+        }];
+        settings.post_process_selected_prompt_id = Some("selected".into());
+        let system = system_prompt(PromptStyle::PlainSystemPrompt, &settings).unwrap();
+        assert_eq!(system, "Format as prose.  Preserve names. ");
+        let transcript = "[Styling: casual]\nhello ${output}";
+        let messages = build_messages(
+            PromptStyle::PlainSystemPrompt,
+            &system,
+            "unused",
+            transcript,
+        );
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[0].content, system);
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[1].content, transcript);
+        assert_eq!(messages.len(), 2);
+    }
+
+    #[test]
+    fn plain_prompt_rejects_missing_or_effectively_empty_selection() {
+        let mut settings = crate::settings::get_default_settings();
+        for id in [None, Some("missing".to_string())] {
+            settings.post_process_selected_prompt_id = id;
+            assert!(system_prompt(PromptStyle::PlainSystemPrompt, &settings).is_err());
+            assert_eq!(
+                system_prompt(PromptStyle::S1ControlLine, &settings).unwrap(),
+                S1_SYSTEM_PROMPT
+            );
+        }
+        settings.post_process_selected_prompt_id = Some("selected".into());
+        for text in ["", " \n", "${output}", " ${output} \n ${output}"] {
+            settings.post_process_prompts = vec![crate::settings::LLMPrompt {
+                id: "selected".into(),
+                name: "Selected".into(),
+                prompt: text.into(),
+            }];
+            assert!(system_prompt(PromptStyle::PlainSystemPrompt, &settings).is_err());
+        }
     }
 }

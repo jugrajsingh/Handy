@@ -162,3 +162,56 @@ fn real_server_matches_goldens_and_is_gone_after_unload() {
         "shutdown must reap every llama-server child"
     );
 }
+
+#[test]
+#[ignore = "needs an explicitly supplied PlainSystemPrompt GGUF and llama-server"]
+fn plain_system_prompt_real_server() {
+    let Ok(file) = std::env::var("HANDY_LOCAL_LLM_IT_PLAIN_MODEL") else {
+        eprintln!("SKIP: HANDY_LOCAL_LLM_IT_PLAIN_MODEL is absent");
+        return;
+    };
+    let file = PathBuf::from(file);
+    assert!(file.is_file(), "explicit Plain model path must exist");
+    let id =
+        std::env::var("HANDY_LOCAL_LLM_IT_PLAIN_ID").unwrap_or_else(|_| "quill-0.8b-q4km".into());
+    let entry = registry::find(&id).expect("registered Plain model");
+    assert_ne!(entry.prompt_style, registry::PromptStyle::S1ControlLine);
+    let root = tempfile::tempdir().unwrap();
+    let dest = registry::model_path(root.path(), entry);
+    std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(std::fs::canonicalize(file).unwrap(), dest).unwrap();
+    let manager = LocalLlmManager::new(
+        Box::new(LlamaServerBackend::new()),
+        Some(root.path().to_path_buf()),
+        ManagerHooks {
+            idle_inputs: Box::new(|| IdleInputs {
+                timeout: ModelUnloadTimeout::Never,
+                recording: false,
+            }),
+            on_status: Box::new(|_| {}),
+        },
+        ManagerConfig {
+            start_timeout: Duration::from_secs(30),
+            idle_tick: Duration::from_secs(3600),
+        },
+    );
+    let mut settings = get_default_settings();
+    settings.local_llm_model_id = Some(id);
+    settings.post_process_selected_prompt_id = Some("plain-it".into());
+    settings.post_process_prompts = vec![crate::settings::LLMPrompt {
+        id: "plain-it".into(),
+        name: "Plain integration".into(),
+        prompt:
+            "Correct punctuation. Preserve names and meaning. Return only the transcript. ${output}"
+                .into(),
+    }];
+    let input = "hello there friend";
+    let output = manager
+        .process(input, &settings)
+        .expect("Plain server request");
+    assert!(!output.trim().is_empty());
+    super::prompt::check_output(input, &output).unwrap();
+    assert_eq!(llama_children().len(), 1);
+    manager.unload();
+    assert!(llama_children().is_empty());
+}
