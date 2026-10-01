@@ -285,3 +285,138 @@ assert.equal(
   false,
 );
 console.log("promptControls: all assertions passed");
+
+const React = await import("react");
+const { renderToStaticMarkup } = await import("react-dom/server");
+const { default: i18next } = await import("i18next");
+const { initReactI18next } = await import("react-i18next");
+const { default: en } = await import("../../i18n/locales/en/translation.json");
+await i18next.use(initReactI18next).init({
+  lng: "en",
+  resources: { en: { translation: en } },
+  interpolation: { escapeValue: false },
+});
+const { default: ModelStatusButton } = await import(
+  "../../components/model-selector/ModelStatusButton"
+);
+const { LocalLlmDropdown } = await import(
+  "../../components/model-selector/LocalLlmDropdown"
+);
+const longName = "Qwen3-4B-Instruct-2507 with a very long model display name";
+const button = renderToStaticMarkup(
+  React.createElement(ModelStatusButton, {
+    status: "ready",
+    displayText: longName,
+    isDropdownOpen: false,
+    onClick: () => undefined,
+    icon: React.createElement("svg", { "data-picker-icon": "post-processing" }),
+  }),
+);
+assert.ok(button.includes(`title="Model status: ${longName}"`));
+assert.ok(button.includes("data-picker-icon"));
+assert.ok(button.indexOf("data-picker-icon") < button.indexOf("rounded-full"));
+assert.ok(button.includes("flex-1 min-w-0 truncate"));
+assert.ok(!button.includes("max-w-28"));
+const row = renderToStaticMarkup(
+  React.createElement(LocalLlmDropdown, {
+    models: [{ ...model, display_name: longName, size_bytes: 2497281120 }],
+    selectedId: model.id,
+    disabled: false,
+    onSelect: () => undefined,
+  }),
+);
+const onlyRow = row.match(/<button\b[\s\S]*?<\/button>/u)?.[0];
+assert.ok(onlyRow);
+assert.ok(onlyRow.includes(longName));
+assert.ok(onlyRow.includes("Uses styling, structure and context controls."));
+assert.ok(onlyRow.includes("2382 MiB"));
+assert.ok(onlyRow.includes(">Active</span>"));
+const missingRows = renderToStaticMarkup(
+  React.createElement(LocalLlmDropdown, {
+    models: [{ ...model, downloaded: false }],
+    selectedId: model.id,
+    disabled: false,
+    onSelect: () => undefined,
+  }),
+);
+assert.ok(!missingRows.includes("<button"));
+console.log("footer rows and full-name tooltip: all assertions passed");
+
+const plainRow = renderToStaticMarkup(
+  React.createElement(LocalLlmDropdown, {
+    models: [
+      {
+        ...model,
+        display_name: "Quill 0.8B",
+        prompt_style: "plain_system_prompt",
+        size_bytes: 529296832,
+      },
+    ],
+    selectedId: model.id,
+    disabled: true,
+    onSelect: () => undefined,
+  }),
+);
+const plainButton = plainRow.match(/<button\b[\s\S]*?<\/button>/u)?.[0];
+assert.ok(plainButton);
+assert.ok(plainButton.includes("Uses your selected Handy prompt."));
+assert.ok(plainButton.includes("Quill 0.8B"));
+assert.ok(plainButton.includes("505 MiB"));
+assert.ok(plainButton.includes(">Active</span>"));
+assert.ok(plainButton.includes('disabled=""'));
+
+assert.equal(
+  cleanupPickerPresentation(models, "downloaded-b", true, "local_llm", ready)
+    .status,
+  "unloaded",
+);
+for (const state of ["starting", "stopping"] as const) {
+  assert.equal(
+    cleanupPickerPresentation(models, "downloaded-b", true, "local_llm", {
+      ...ready,
+      state,
+    }).status,
+    "unloaded",
+  );
+}
+
+const { readFileSync } = await import("node:fs");
+for (const [file, icon] of [
+  ["ModelSelector.tsx", "Cpu"],
+  ["LocalLlmModelSelector.tsx", "Sparkles"],
+]) {
+  const source = readFileSync(
+    new URL(`../../components/model-selector/${file}`, import.meta.url),
+    "utf8",
+  );
+  const picker = source.match(/<ModelStatusButton\b[\s\S]*?\n\s*\/>/u)?.[0];
+  assert.ok(picker, file);
+  assert.ok(
+    picker.includes(`icon={<${icon} size={16} />}`),
+    `${file} passes its sidebar icon`,
+  );
+  assert.ok(
+    /<div[^>]*className="relative flex-1 min-w-0"/u.test(source),
+    `${file} allocates remaining width`,
+  );
+}
+const footerSource = readFileSync(
+  new URL("../../components/footer/Footer.tsx", import.meta.url),
+  "utf8",
+);
+assert.ok(
+  footerSource.includes(
+    'className="flex justify-between items-center gap-3 min-w-0 text-xs px-4 pb-3 text-text/60"',
+  ),
+);
+assert.ok(
+  /<div className="flex items-center gap-4 min-w-0 flex-1">\s*<ModelSelector \/>\s*<LocalLlmModelSelector/u.test(
+    footerSource,
+  ),
+);
+assert.ok(
+  /<div className="flex items-center gap-1 shrink-0">\s*<UpdateChecker/u.test(
+    footerSource,
+  ),
+);
+console.log("picker wiring and Footer flex allocation: all assertions passed");

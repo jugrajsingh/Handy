@@ -41,4 +41,13 @@ for (const id of ["transcribe", "transcribe_with_post_process", "cancel"]) {
     }
   }
 }
+const { default: en } = await import("../../i18n/locales/en/translation.json");
+assert.equal(
+  en.settings.general.shortcut.bindings.transcribe_raw.name,
+  "Raw Shortcut",
+);
+assert.equal(
+  en.settings.general.shortcut.bindings.transcribe_with_post_process.name,
+  "Post-processing Shortcut",
+);
 console.log("shortcutPresentation: all assertions passed");

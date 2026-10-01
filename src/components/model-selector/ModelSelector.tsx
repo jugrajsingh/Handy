@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { listen } from "@tauri-apps/api/event";
+import { Cpu } from "lucide-react";
 import { commands } from "@/bindings";
 import { getTranslatedModelName } from "../../lib/utils/modelTranslation";
 import { useModelStore } from "../../stores/modelStore";
@@ -245,8 +246,9 @@ const ModelSelector: React.FC<ModelSelectorProps> = ({ onError }) => {
   return (
     <>
       {/* Model Status and Switcher */}
-      <div className="relative" ref={dropdownRef}>
+      <div className="relative flex-1 min-w-0" ref={dropdownRef}>
         <ModelStatusButton
+          icon={<Cpu size={16} />}
           status={getDisplayStatus()}
           displayText={getModelDisplayText()}
           isDropdownOpen={showModelDropdown}

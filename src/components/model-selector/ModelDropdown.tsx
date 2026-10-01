@@ -25,7 +25,7 @@ const ModelDropdown: React.FC<ModelDropdownProps> = ({
   };
 
   return (
-    <div className="absolute bottom-full start-0 mb-2 w-64 max-h-[60vh] overflow-y-auto bg-background border border-mid-gray/20 rounded-lg shadow-lg py-2 z-50">
+    <div className="absolute bottom-full start-0 mb-2 w-80 max-w-[calc(100vw-2rem)] max-h-[60vh] overflow-y-auto bg-background border border-mid-gray/20 rounded-lg shadow-lg py-2 z-50">
       {downloadedModels.length > 0 ? (
         <div>
           {downloadedModels.map((model) => (
@@ -46,9 +46,9 @@ const ModelDropdown: React.FC<ModelDropdownProps> = ({
                   : ""
               }`}
             >
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-sm text-text/80">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-sm text-text/80 break-words">
                     {getTranslatedModelName(model, t)}
                     {model.is_custom && (
                       <span className="ms-1.5 text-[10px] font-medium text-text/40 uppercase">
@@ -64,9 +64,14 @@ const ModelDropdown: React.FC<ModelDropdownProps> = ({
                   <div className="text-xs text-text/40 italic pe-4">
                     {getTranslatedModelDescription(model, t)}
                   </div>
+                  <div className="text-xs text-mid-gray">
+                    {t("modelSelector.size", {
+                      size: model.size_mb.toFixed(0),
+                    })}
+                  </div>
                 </div>
                 {currentModelId === model.id && (
-                  <div className="text-xs text-logo-primary">
+                  <div className="text-xs text-logo-primary shrink-0">
                     {t("modelSelector.active")}
                   </div>
                 )}

@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { Sparkles } from "lucide-react";
 import { commands } from "@/bindings";
 import { useSettings } from "@/hooks/useSettings";
 import { useLocalLlmStatus } from "@/hooks/useLocalLlmStatus";
@@ -9,6 +10,7 @@ import {
   createCleanupModelPickerActions,
 } from "@/lib/utils/localLlmPresentation";
 import ModelStatusButton from "./ModelStatusButton";
+import { LocalLlmDropdown } from "./LocalLlmDropdown";
 
 export function LocalLlmModelSelector({
   onOpenPostProcessing,
@@ -78,8 +80,9 @@ export function LocalLlmModelSelector({
   if (!view.visible) return null;
   const displayedError = error ?? statusError ?? status?.error;
   return (
-    <div ref={container} className="relative">
+    <div ref={container} className="relative flex-1 min-w-0">
       <ModelStatusButton
+        icon={<Sparkles size={16} />}
         status={view.status}
         displayText={
           view.selected?.display_name ??
@@ -89,22 +92,12 @@ export function LocalLlmModelSelector({
         onClick={() => void actions.toggle()}
       />
       {open && (
-        <div className="absolute bottom-full start-0 mb-2 w-64 max-h-64 overflow-y-auto rounded-lg border border-mid-gray/20 bg-background shadow-lg z-50">
-          {view.downloaded.map((model) => (
-            <button
-              type="button"
-              key={model.id}
-              disabled={selecting}
-              onClick={() => void actions.select(model.id)}
-              className="w-full flex justify-between gap-2 px-3 py-2 text-start hover:bg-mid-gray/10 disabled:opacity-50"
-            >
-              <span className="truncate">{model.display_name}</span>
-              {model.id === view.selected?.id && (
-                <span>{t("modelSelector.active")}</span>
-              )}
-            </button>
-          ))}
-        </div>
+        <LocalLlmDropdown
+          models={view.downloaded}
+          selectedId={view.selected?.id ?? null}
+          disabled={selecting}
+          onSelect={(id) => void actions.select(id)}
+        />
       )}
       {displayedError && (
         <p role="alert" className="text-red-500 text-xs">

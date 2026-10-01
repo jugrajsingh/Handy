@@ -26,14 +26,14 @@ const Footer: React.FC<{ onOpenPostProcessing: () => void }> = ({
 
   return (
     <div className="w-full border-t border-mid-gray/20 pt-3">
-      <div className="flex justify-between items-center text-xs px-4 pb-3 text-text/60">
-        <div className="flex items-center gap-4">
+      <div className="flex justify-between items-center gap-3 min-w-0 text-xs px-4 pb-3 text-text/60">
+        <div className="flex items-center gap-4 min-w-0 flex-1">
           <ModelSelector />
           <LocalLlmModelSelector onOpenPostProcessing={onOpenPostProcessing} />
         </div>
 
         {/* Update Status */}
-        <div className="flex items-center gap-1">
+        <div className="flex items-center gap-1 shrink-0">
           <UpdateChecker />
           <span>•</span>
           {/* eslint-disable-next-line i18next/no-literal-string -- The v prefix is a version marker, not translatable copy. */}
