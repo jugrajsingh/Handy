@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 type ModelStatus =
@@ -20,6 +20,13 @@ interface ModelStatusButtonProps {
   icon?: React.ReactNode;
 }
 
+export function modelStatusTitle(
+  name: { scrollWidth: number; clientWidth: number } | null,
+  fullTitle: string,
+): string | undefined {
+  return name && name.scrollWidth > name.clientWidth ? fullTitle : undefined;
+}
+
 const ModelStatusButton: React.FC<ModelStatusButtonProps> = ({
   status,
   displayText,
@@ -29,6 +36,18 @@ const ModelStatusButton: React.FC<ModelStatusButtonProps> = ({
   icon,
 }) => {
   const { t } = useTranslation();
+  const nameRef = useRef<HTMLSpanElement>(null);
+  const [title, setTitle] = useState<string | undefined>();
+  const fullTitle = t("modelSelector.status", { modelName: displayText });
+  useEffect(() => {
+    const name = nameRef.current;
+    if (!name) return;
+    const measure = () => setTitle(modelStatusTitle(name, fullTitle));
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(name);
+    return () => observer.disconnect();
+  }, [displayText, fullTitle]);
   const getStatusColor = (status: ModelStatus): string => {
     switch (status) {
       case "ready":
@@ -56,7 +75,7 @@ const ModelStatusButton: React.FC<ModelStatusButtonProps> = ({
     <button
       onClick={onClick}
       className={`flex w-full min-w-0 items-center gap-2 hover:text-text/80 transition-colors ${className}`}
-      title={t("modelSelector.status", { modelName: displayText })}
+      title={title}
     >
       {icon && (
         <span aria-hidden className="shrink-0">
@@ -66,7 +85,9 @@ const ModelStatusButton: React.FC<ModelStatusButtonProps> = ({
       <div
         className={`w-2 h-2 shrink-0 rounded-full ${getStatusColor(status)}`}
       />
-      <span className="flex-1 min-w-0 truncate text-start">{displayText}</span>
+      <span ref={nameRef} className="flex-1 min-w-0 truncate text-start">
+        {displayText}
+      </span>
       <svg
         className={`w-3 h-3 shrink-0 transition-transform ${isDropdownOpen ? "rotate-180" : ""}`}
         fill="none"

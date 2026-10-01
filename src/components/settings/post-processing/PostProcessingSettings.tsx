@@ -456,7 +456,7 @@ export const PostProcessingSettings: React.FC = () => {
   );
   const { hidePrompts } = promptControls(
     getSetting("post_process_provider_id"),
-    localModel ?? null,
+    models.length === 0 ? undefined : (localModel ?? null),
     getSetting("post_process_prompts") ?? [],
     getSetting("post_process_selected_prompt_id") ?? null,
   );

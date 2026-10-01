@@ -61,6 +61,7 @@ export function createHistoryScrollAnchor({
   const capture = (): void => {
     if (anchor) return;
     const viewport = getViewport();
+    if (!viewport || viewport.scrollTop <= 0) return;
     const row = viewport?.rows.find((row) => row.bottom > viewport.top);
     if (viewport && row)
       anchor = { id: row.id, contentTop: row.top + viewport.scrollTop };
