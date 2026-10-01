@@ -251,7 +251,7 @@ impl HistoryManager {
         let timestamp = Utc::now().timestamp();
         let title = self.format_timestamp_title(timestamp);
 
-        let mut entry = HistoryEntry {
+        let entry = HistoryEntry {
             id: 0,
             file_name,
             timestamp,
@@ -265,23 +265,49 @@ impl HistoryManager {
             post_process_model: provenance.and_then(|value| value.model),
         };
 
-        let conn = self.get_connection()?;
-        entry.id = Self::insert_history_entry_with_conn(&conn, &entry)?;
+        let mut conn = self.get_connection()?;
+        let retention_period = crate::settings::get_recording_retention_period(&self.app_handle);
+        let history_limit = crate::settings::get_history_limit(&self.app_handle);
+        Self::save_entry_and_notify_with_connection(
+            &mut conn,
+            &self.recordings_dir,
+            entry,
+            retention_period,
+            history_limit,
+            Utc::now().timestamp(),
+            |event| self.emit_history_update(event),
+        )
+    }
 
+    fn save_entry_and_notify_with_connection(
+        conn: &mut Connection,
+        recordings_dir: &Path,
+        mut entry: HistoryEntry,
+        retention_period: crate::settings::RecordingRetentionPeriod,
+        history_limit: usize,
+        now: i64,
+        mut notify: impl FnMut(HistoryUpdatePayload),
+    ) -> Result<HistoryEntry> {
+        entry.id = Self::insert_history_entry_with_conn(conn, &entry)?;
         debug!("Saved history entry with id {}", entry.id);
-
-        self.cleanup_old_entries()?;
-
-        // Emit typed event for real-time frontend updates
-        if let Err(e) = (HistoryUpdatePayload::Added {
+        Self::cleanup_and_notify_with_connection(
+            conn,
+            recordings_dir,
+            retention_period,
+            history_limit,
+            now,
+            &mut notify,
+        )?;
+        notify(HistoryUpdatePayload::Added {
             entry: entry.clone(),
-        })
-        .emit(&self.app_handle)
-        {
-            error!("Failed to emit history-updated event: {}", e);
-        }
-
+        });
         Ok(entry)
+    }
+
+    fn emit_history_update(&self, event: HistoryUpdatePayload) {
+        if let Err(error) = event.emit(&self.app_handle) {
+            error!("Failed to emit history-updated event: {}", error);
+        }
     }
 
     fn insert_history_entry_with_conn(conn: &Connection, entry: &HistoryEntry) -> Result<i64> {
@@ -382,29 +408,20 @@ impl HistoryManager {
 
     pub fn cleanup_old_entries(&self) -> Result<()> {
         let retention_period = crate::settings::get_recording_retention_period(&self.app_handle);
-
-        match retention_period {
-            crate::settings::RecordingRetentionPeriod::Never => {
-                // Don't delete anything
-                Ok(())
-            }
-            crate::settings::RecordingRetentionPeriod::PreserveLimit => {
-                // Use the old count-based logic with history_limit
-                let limit = crate::settings::get_history_limit(&self.app_handle);
-                self.cleanup_by_count(limit)
-            }
-            _ => {
-                // Use time-based logic
-                self.cleanup_by_time(retention_period)
-            }
+        if retention_period == crate::settings::RecordingRetentionPeriod::Never {
+            return Ok(());
         }
-    }
-
-    fn delete_entries_and_files(&self, entries: &[(i64, String)]) -> Result<usize> {
-        let conn = self.get_connection()?;
-        let removed =
-            Self::delete_entries_and_files_with_conn(&conn, &self.recordings_dir, entries)?;
-        Ok(removed.recordings)
+        let history_limit = crate::settings::get_history_limit(&self.app_handle);
+        let mut conn = self.get_connection()?;
+        Self::cleanup_and_notify_with_connection(
+            &mut conn,
+            &self.recordings_dir,
+            retention_period,
+            history_limit,
+            Utc::now().timestamp(),
+            |event| self.emit_history_update(event),
+        )?;
+        Ok(())
     }
 
     fn clear_candidates(conn: &Connection, keep_saved: bool) -> Result<Vec<(i64, String)>> {
@@ -506,74 +523,69 @@ impl HistoryManager {
         Ok(removed)
     }
 
-    fn cleanup_by_count(&self, limit: usize) -> Result<()> {
-        let conn = self.get_connection()?;
-
-        // Get all entries that are not saved, ordered by timestamp desc
-        let mut stmt = conn.prepare(
-            "SELECT id, file_name FROM transcription_history WHERE saved = 0 ORDER BY timestamp DESC"
-        )?;
-
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>("id")?, row.get::<_, String>("file_name")?))
-        })?;
-
-        let mut entries: Vec<(i64, String)> = Vec::new();
-        for row in rows {
-            entries.push(row?);
-        }
-
-        if entries.len() > limit {
-            let entries_to_delete = &entries[limit..];
-            let deleted_count = self.delete_entries_and_files(entries_to_delete)?;
-
-            if deleted_count > 0 {
-                debug!("Cleaned up {} old history entries by count", deleted_count);
-            }
-        }
-
-        Ok(())
-    }
-
-    fn cleanup_by_time(
-        &self,
+    fn cleanup_and_notify_with_connection(
+        conn: &mut Connection,
+        recordings_dir: &Path,
         retention_period: crate::settings::RecordingRetentionPeriod,
-    ) -> Result<()> {
-        let conn = self.get_connection()?;
-
-        // Calculate cutoff timestamp (current time minus retention period)
-        let now = Utc::now().timestamp();
-        let cutoff_timestamp = match retention_period {
-            crate::settings::RecordingRetentionPeriod::Days3 => now - (3 * 24 * 60 * 60), // 3 days in seconds
-            crate::settings::RecordingRetentionPeriod::Weeks2 => now - (2 * 7 * 24 * 60 * 60), // 2 weeks in seconds
-            crate::settings::RecordingRetentionPeriod::Months3 => now - (3 * 30 * 24 * 60 * 60), // 3 months in seconds (approximate)
-            _ => unreachable!("Should not reach here"),
-        };
-
-        // Get all unsaved entries older than the cutoff timestamp
-        let mut stmt = conn.prepare(
-            "SELECT id, file_name FROM transcription_history WHERE saved = 0 AND timestamp < ?1",
-        )?;
-
-        let rows = stmt.query_map(params![cutoff_timestamp], |row| {
-            Ok((row.get::<_, i64>("id")?, row.get::<_, String>("file_name")?))
-        })?;
-
-        let mut entries_to_delete: Vec<(i64, String)> = Vec::new();
-        for row in rows {
-            entries_to_delete.push(row?);
+        history_limit: usize,
+        now: i64,
+        mut notify: impl FnMut(HistoryUpdatePayload),
+    ) -> Result<HistoryClearSummary> {
+        use crate::settings::RecordingRetentionPeriod;
+        if retention_period == RecordingRetentionPeriod::Never {
+            return Ok(HistoryClearSummary::default());
         }
-
-        let deleted_count = self.delete_entries_and_files(&entries_to_delete)?;
-
-        if deleted_count > 0 {
+        let (removed, entries) = Self::with_clear_transaction(conn, |transaction| {
+            let entries =
+                Self::retention_candidates(transaction, retention_period, history_limit, now)?;
+            let removed =
+                Self::delete_entries_and_files_with_conn(transaction, recordings_dir, &entries)?;
+            Ok((removed, entries))
+        })?;
+        for (id, _) in entries {
+            notify(HistoryUpdatePayload::Deleted { id });
+        }
+        if removed.recordings > 0 {
             debug!(
-                "Cleaned up {} old history entries based on retention period",
-                deleted_count
+                "Removed {} old history recordings by retention",
+                removed.recordings
             );
         }
+        Ok(removed)
+    }
 
-        Ok(())
+    fn retention_candidates(
+        conn: &Connection,
+        retention_period: crate::settings::RecordingRetentionPeriod,
+        history_limit: usize,
+        now: i64,
+    ) -> Result<Vec<(i64, String)>> {
+        use crate::settings::RecordingRetentionPeriod;
+        let cutoff = match retention_period {
+            RecordingRetentionPeriod::Never => return Ok(Vec::new()),
+            RecordingRetentionPeriod::PreserveLimit => None,
+            RecordingRetentionPeriod::Days3 => Some(now - 3 * 24 * 60 * 60),
+            RecordingRetentionPeriod::Weeks2 => Some(now - 2 * 7 * 24 * 60 * 60),
+            RecordingRetentionPeriod::Months3 => Some(now - 3 * 30 * 24 * 60 * 60),
+        };
+        let entries = if let Some(cutoff) = cutoff {
+            let mut statement = conn.prepare(
+                "SELECT id, file_name FROM transcription_history WHERE saved = 0 AND timestamp < ?1 ORDER BY id",
+            )?;
+            let rows =
+                statement.query_map(params![cutoff], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut statement = conn.prepare(
+                "SELECT id, file_name FROM transcription_history WHERE saved = 0 ORDER BY timestamp DESC",
+            )?;
+            let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .skip(history_limit)
+                .collect()
+        };
+        Ok(entries)
     }
 
     pub async fn get_history_entries(
@@ -781,10 +793,7 @@ impl HistoryManager {
 
         debug!("Deleted history entry with id: {}", id);
 
-        // Emit history updated event
-        if let Err(e) = (HistoryUpdatePayload::Deleted { id }).emit(&self.app_handle) {
-            error!("Failed to emit history-updated event: {}", e);
-        }
+        self.emit_history_update(HistoryUpdatePayload::Deleted { id });
 
         Ok(())
     }
@@ -813,6 +822,225 @@ mod tests {
             .to_latest(&mut conn)
             .unwrap();
         conn
+    }
+
+    #[test]
+    fn count_retention_notifies_deleted_ids_after_commit_before_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let mut conn = Connection::open(&path).unwrap();
+        Migrations::new(MIGRATIONS.to_vec())
+            .to_latest(&mut conn)
+            .unwrap();
+        let observer = Connection::open(&path).unwrap();
+        observer.busy_timeout(Duration::ZERO).unwrap();
+        for timestamp in [100, 200, 300, 400, 500] {
+            insert_entry(&conn, timestamp, "raw", None);
+            if timestamp != 300 {
+                fs::write(dir.path().join(format!("handy-{timestamp}.wav")), b"audio").unwrap();
+            }
+        }
+        conn.execute(
+            "UPDATE transcription_history SET saved = 1 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let mut pending = HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .unwrap();
+        pending.timestamp = 600;
+        pending.file_name = "handy-600.wav".into();
+        fs::write(dir.path().join(&pending.file_name), b"new audio").unwrap();
+        let mut events = Vec::new();
+        let added = HistoryManager::save_entry_and_notify_with_connection(
+            &mut conn,
+            dir.path(),
+            pending,
+            crate::settings::RecordingRetentionPeriod::PreserveLimit,
+            2,
+            600,
+            |event| {
+                let mut statement = observer
+                    .prepare("SELECT id FROM transcription_history ORDER BY id")
+                    .unwrap();
+                let surviving = statement
+                    .query_map([], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(
+                    surviving,
+                    [1, 5, 6],
+                    "Count retention must commit before notifying"
+                );
+                assert!(!dir.path().join("handy-200.wav").exists());
+                assert!(!dir.path().join("handy-400.wav").exists());
+                events.push(serde_json::to_value(event).unwrap());
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                serde_json::json!({"action": "deleted", "id": 4}),
+                serde_json::json!({"action": "deleted", "id": 3}),
+                serde_json::json!({"action": "deleted", "id": 2}),
+                serde_json::to_value(HistoryUpdatePayload::Added { entry: added }).unwrap(),
+            ],
+            "Count retention must notify every removed id before Added"
+        );
+        for timestamp in [100, 500, 600] {
+            assert!(dir.path().join(format!("handy-{timestamp}.wav")).exists());
+        }
+        HistoryManager::cleanup_and_notify_with_connection(
+            &mut conn,
+            dir.path(),
+            crate::settings::RecordingRetentionPeriod::PreserveLimit,
+            2,
+            600,
+            |_| panic!("No retention deletion means no event"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn time_retention_notifies_deleted_ids_after_commit_before_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let mut conn = Connection::open(&path).unwrap();
+        Migrations::new(MIGRATIONS.to_vec())
+            .to_latest(&mut conn)
+            .unwrap();
+        let observer = Connection::open(&path).unwrap();
+        observer.busy_timeout(Duration::ZERO).unwrap();
+        let now = 2_000_000;
+        let day = 24 * 60 * 60;
+        for timestamp in [
+            now - 4 * day,
+            now - 3 * day - 1,
+            now - 3 * day,
+            now,
+            now - 5 * day,
+        ] {
+            insert_entry(&conn, timestamp, "raw", None);
+            fs::write(dir.path().join(format!("handy-{timestamp}.wav")), b"audio").unwrap();
+        }
+        conn.execute(
+            "UPDATE transcription_history SET saved = 1 WHERE id = 5",
+            [],
+        )
+        .unwrap();
+        let mut pending = HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .unwrap();
+        pending.timestamp = now + 1;
+        pending.file_name = format!("handy-{}.wav", pending.timestamp);
+        fs::write(dir.path().join(&pending.file_name), b"new audio").unwrap();
+        let mut events = Vec::new();
+        let added = HistoryManager::save_entry_and_notify_with_connection(
+            &mut conn,
+            dir.path(),
+            pending,
+            crate::settings::RecordingRetentionPeriod::Days3,
+            0,
+            now,
+            |event| {
+                let mut statement = observer
+                    .prepare("SELECT id FROM transcription_history ORDER BY id")
+                    .unwrap();
+                let surviving = statement
+                    .query_map([], |row| row.get::<_, i64>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap();
+                assert_eq!(
+                    surviving,
+                    [3, 4, 5, 6],
+                    "Time retention must commit before notifying"
+                );
+                for timestamp in [now - 4 * day, now - 3 * day - 1] {
+                    assert!(!dir.path().join(format!("handy-{timestamp}.wav")).exists());
+                }
+                events.push(serde_json::to_value(event).unwrap());
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            events,
+            vec![
+                serde_json::json!({"action": "deleted", "id": 1}),
+                serde_json::json!({"action": "deleted", "id": 2}),
+                serde_json::to_value(HistoryUpdatePayload::Added { entry: added }).unwrap(),
+            ],
+            "Time retention must notify every removed id before Added"
+        );
+        for timestamp in [now - 3 * day, now, now - 5 * day, now + 1] {
+            assert!(dir.path().join(format!("handy-{timestamp}.wav")).exists());
+        }
+        HistoryManager::cleanup_and_notify_with_connection(
+            &mut conn,
+            dir.path(),
+            crate::settings::RecordingRetentionPeriod::Never,
+            0,
+            now,
+            |_| panic!("Never retention must not notify"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn retention_does_not_notify_on_delete_or_commit_failure() {
+        use crate::settings::RecordingRetentionPeriod;
+        for period in [
+            RecordingRetentionPeriod::PreserveLimit,
+            RecordingRetentionPeriod::Days3,
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("history.db");
+            let mut conn = Connection::open(&path).unwrap();
+            Migrations::new(MIGRATIONS.to_vec())
+                .to_latest(&mut conn)
+                .unwrap();
+            let observer = Connection::open(&path).unwrap();
+            insert_entry(&conn, 100, "raw", None);
+            let mut events = Vec::new();
+            conn.execute_batch("CREATE TRIGGER stop_delete BEFORE DELETE ON transcription_history BEGIN SELECT RAISE(ABORT, 'blocked'); END;").unwrap();
+            let failed = HistoryManager::cleanup_and_notify_with_connection(
+                &mut conn,
+                dir.path(),
+                period,
+                0,
+                2_000_000,
+                |event| events.push(event),
+            );
+            assert_eq!(failed.unwrap_err().to_string(), "blocked");
+            assert!(
+                events.is_empty(),
+                "Failed retention deletion must not notify"
+            );
+            conn.execute_batch("DROP TRIGGER stop_delete;").unwrap();
+            conn.pragma_update(None, "foreign_keys", true).unwrap();
+            conn.execute_batch("CREATE TABLE history_reference (history_id INTEGER REFERENCES transcription_history(id) DEFERRABLE INITIALLY DEFERRED); INSERT INTO history_reference SELECT id FROM transcription_history;").unwrap();
+            let failed = HistoryManager::cleanup_and_notify_with_connection(
+                &mut conn,
+                dir.path(),
+                period,
+                0,
+                2_000_000,
+                |event| events.push(event),
+            );
+            assert_eq!(
+                failed.unwrap_err().to_string(),
+                "FOREIGN KEY constraint failed"
+            );
+            assert!(events.is_empty(), "Failed retention commit must not notify");
+            let remaining: usize = observer
+                .query_row("SELECT COUNT(*) FROM transcription_history", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(remaining, 1);
+        }
     }
 
     #[test]
