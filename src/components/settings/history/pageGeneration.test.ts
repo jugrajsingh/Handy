@@ -399,6 +399,26 @@ console.log(
   "history retention deletion before addition: all assertions passed",
 );
 
+const topViewport = {
+  top: 0,
+  scrollTop: 0,
+  rows: [{ id: "80", top: 80, bottom: 220 }],
+};
+const topAnchor = createHistoryScrollAnchor({
+  getViewport: () => topViewport,
+  setScrollTop: (value) => {
+    topViewport.scrollTop = value;
+  },
+});
+topAnchor.capture();
+topViewport.rows = [
+  { id: "81", top: 80, bottom: 220 },
+  { id: "80", top: 220, bottom: 360 },
+];
+topAnchor.restore();
+assert.equal(topViewport.scrollTop, 0);
+console.log("history additions at the top: all assertions passed");
+
 const viewport = {
   top: 0,
   scrollTop: 900,

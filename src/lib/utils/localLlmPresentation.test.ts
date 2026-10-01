@@ -261,6 +261,16 @@ const prompts = [
   { id: "p", name: "Prompt", prompt: "Return prose. ${output}" },
 ];
 const plain = { ...model, prompt_style: "plain_system_prompt" as const };
+assert.deepEqual(promptControls("local_llm", undefined, prompts, null), {
+  hidePrompts: true,
+  showS1Controls: false,
+  missingPrompt: false,
+});
+assert.deepEqual(promptControls("openai", undefined, prompts, null), {
+  hidePrompts: false,
+  showS1Controls: false,
+  missingPrompt: false,
+});
 assert.deepEqual(promptControls("local_llm", model, prompts, "p"), {
   hidePrompts: true,
   showS1Controls: true,
@@ -301,7 +311,7 @@ await i18next.use(initReactI18next).init({
   resources: { en: { translation: en } },
   interpolation: { escapeValue: false },
 });
-const { default: ModelStatusButton } = await import(
+const { default: ModelStatusButton, modelStatusTitle } = await import(
   "../../components/model-selector/ModelStatusButton"
 );
 const { LocalLlmDropdown } = await import(
@@ -317,7 +327,21 @@ const button = renderToStaticMarkup(
     icon: React.createElement("svg", { "data-picker-icon": "post-processing" }),
   }),
 );
-assert.ok(button.includes(`title="Model status: ${longName}"`));
+const fullTitle = `Model status: ${longName}`;
+assert.equal(
+  modelStatusTitle({ scrollWidth: 300, clientWidth: 100 }, fullTitle),
+  fullTitle,
+);
+assert.equal(
+  modelStatusTitle({ scrollWidth: 100, clientWidth: 100 }, fullTitle),
+  undefined,
+);
+assert.equal(
+  modelStatusTitle({ scrollWidth: 80, clientWidth: 100 }, fullTitle),
+  undefined,
+);
+assert.equal(modelStatusTitle(null, fullTitle), undefined);
+assert.ok(!button.includes("title="));
 assert.ok(button.includes("data-picker-icon"));
 assert.ok(button.indexOf("data-picker-icon") < button.indexOf("rounded-full"));
 assert.ok(button.includes("flex-1 min-w-0 truncate"));

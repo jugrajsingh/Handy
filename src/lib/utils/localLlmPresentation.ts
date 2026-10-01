@@ -113,7 +113,7 @@ export function createCleanupModelPickerActions(
 
 export function promptControls(
   providerId: string | undefined,
-  model: Pick<LocalLlmModelInfo, "prompt_style"> | null,
+  model: Pick<LocalLlmModelInfo, "prompt_style"> | null | undefined,
   prompts: LLMPrompt[],
   selectedPromptId: string | null,
 ): { hidePrompts: boolean; showS1Controls: boolean; missingPrompt: boolean } {
@@ -121,7 +121,7 @@ export function promptControls(
   const s1 = local && model?.prompt_style === "s1_control_line";
   const selected = prompts.find((prompt) => prompt.id === selectedPromptId);
   return {
-    hidePrompts: s1,
+    hidePrompts: local && (model === undefined || s1),
     showS1Controls: s1,
     missingPrompt:
       local &&

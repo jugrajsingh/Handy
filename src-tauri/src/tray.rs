@@ -154,6 +154,7 @@ fn cleanup_menu(
     provider: &str,
     selected_model: Option<&str>,
     no_cleanup_model: &str,
+    downloaded_models: &[(String, String)],
     status: impl FnOnce() -> Option<LocalLlmStatus>,
 ) -> Option<CleanupMenu> {
     if !enabled || busy || provider != settings::LOCAL_LLM_PROVIDER_ID {
@@ -162,6 +163,7 @@ fn cleanup_menu(
     status().map(|status| {
         let model_name = selected_model
             .and_then(registry::find)
+            .filter(|entry| downloaded_models.iter().any(|(id, _)| id == entry.id))
             .map(|entry| entry.display_name.to_string())
             .unwrap_or_else(|| no_cleanup_model.to_string());
         let state = if selected_model.is_some() && status.model_id.as_deref() == selected_model {
@@ -545,19 +547,7 @@ fn compute_desired(app: &AppHandle, icon_state: TrayIconState) -> TrayDesired {
 
     let strings = get_tray_translations(Some(settings.app_language.clone()));
     let english = get_tray_translations(Some("en".to_string()));
-    let cleanup = cleanup_menu(
-        settings.post_process_enabled,
-        icon_state.is_busy(),
-        &settings.post_process_provider_id,
-        settings.local_llm_model_id.as_deref(),
-        tray_label(&strings.no_cleanup_model, &english.no_cleanup_model),
-        || {
-            app.try_state::<Arc<LocalLlmManager>>()
-                .map(|manager| manager.status())
-        },
-    );
-
-    let downloaded_cleanup_models = app
+    let downloaded_cleanup_models: Vec<(String, String)> = app
         .try_state::<Arc<LocalLlmManager>>()
         .and_then(|manager| {
             manager.models_root().map(|root| {
@@ -571,6 +561,19 @@ fn compute_desired(app: &AppHandle, icon_state: TrayIconState) -> TrayDesired {
             })
         })
         .unwrap_or_default();
+
+    let cleanup = cleanup_menu(
+        settings.post_process_enabled,
+        icon_state.is_busy(),
+        &settings.post_process_provider_id,
+        settings.local_llm_model_id.as_deref(),
+        tray_label(&strings.no_cleanup_model, &english.no_cleanup_model),
+        &downloaded_cleanup_models,
+        || {
+            app.try_state::<Arc<LocalLlmManager>>()
+                .map(|manager| manager.status())
+        },
+    );
 
     TrayDesired {
         icon_path: get_icon_path(theme, icon_state, badge),
@@ -1211,6 +1214,46 @@ mod tests {
         );
     }
 
+    fn downloaded_registry_models() -> Vec<(String, String)> {
+        registry::MODELS
+            .iter()
+            .map(|entry| (entry.id.to_string(), entry.display_name.to_string()))
+            .collect()
+    }
+
+    mod missing_cleanup_download {
+        use super::*;
+
+        #[test]
+        fn registry_selection_without_file_has_no_model_label_or_checked_row() {
+            let downloaded = vec![("s1-mini-q4km".into(), "S1-mini by Superwhisper".into())];
+            for selected in ["quill-0.8b-q4km", "unknown"] {
+                let snapshot = cleanup_menu(
+                    true,
+                    false,
+                    settings::LOCAL_LLM_PROVIDER_ID,
+                    Some(selected),
+                    "No post-processing model",
+                    &downloaded,
+                    || {
+                        Some(LocalLlmStatus {
+                            state: LocalLlmStateKind::Unloaded,
+                            model_id: None,
+                            error: None,
+                        })
+                    },
+                )
+                .unwrap();
+                assert_eq!(snapshot.model_name, "No post-processing model");
+                assert!(
+                    model_choices(&downloaded, Some(selected), "cleanup_model_select")
+                        .iter()
+                        .all(|row| !row.checked)
+                );
+            }
+        }
+    }
+
     fn assert_toggle_refreshes_unloaded_group(initially_enabled: bool) {
         let h = crate::local_llm::manager::tests::harness();
         let mut saved = h.settings.clone();
@@ -1230,6 +1273,7 @@ mod tests {
                     &saved.post_process_provider_id,
                     saved.local_llm_model_id.as_deref(),
                     "No post-processing model",
+                    &downloaded_registry_models(),
                     || Some(h.manager.status()),
                 )
                 .is_some(),
@@ -1471,6 +1515,7 @@ mod tests {
             settings::LOCAL_LLM_PROVIDER_ID,
             Some("s1-mini-q4km"),
             "No post-processing model",
+            &downloaded_registry_models(),
             || panic!("disabled group must not inspect manager")
         )
         .is_none());
@@ -1484,6 +1529,7 @@ mod tests {
             settings::LOCAL_LLM_PROVIDER_ID,
             Some("quill-0.8b-q4km"),
             "No post-processing model",
+            &downloaded_registry_models(),
             || {
                 Some(LocalLlmStatus {
                     state: LocalLlmStateKind::Ready,
@@ -1549,6 +1595,7 @@ mod tests {
             "local_llm",
             Some("s1-mini-q4km"),
             "No post-processing model",
+            &downloaded_registry_models(),
             || {
                 Some(LocalLlmStatus {
                     state: LocalLlmStateKind::Ready,
@@ -1718,6 +1765,7 @@ mod tests {
                     provider,
                     None,
                     "No post-processing model",
+                    &downloaded_registry_models(),
                     || { panic!("irrelevant cleanup status must not be read") }
                 ),
                 None
@@ -1734,6 +1782,7 @@ mod tests {
             settings::LOCAL_LLM_PROVIDER_ID,
             Some("s1-mini-q4km"),
             "No post-processing model",
+            &downloaded_registry_models(),
             || Some(status.clone()),
         )
         .unwrap();
@@ -1752,6 +1801,7 @@ mod tests {
             settings::LOCAL_LLM_PROVIDER_ID,
             Some("s1-mini-q4km"),
             "No post-processing model",
+            &downloaded_registry_models(),
             || Some(unloaded.clone()),
         )
         .unwrap();
@@ -1765,6 +1815,7 @@ mod tests {
             settings::LOCAL_LLM_PROVIDER_ID,
             None,
             "No post-processing model",
+            &downloaded_registry_models(),
             || Some(unloaded),
         )
         .unwrap();
@@ -1780,6 +1831,7 @@ mod tests {
             settings::LOCAL_LLM_PROVIDER_ID,
             Some("unknown"),
             "No post-processing model",
+            &downloaded_registry_models(),
             || Some(failed.clone()),
         )
         .unwrap();
@@ -1795,6 +1847,7 @@ mod tests {
                 settings::LOCAL_LLM_PROVIDER_ID,
                 Some("unknown"),
                 "No post-processing model",
+                &downloaded_registry_models(),
                 || Some(other_error)
             )
         );
@@ -1805,6 +1858,7 @@ mod tests {
                 settings::LOCAL_LLM_PROVIDER_ID,
                 None,
                 "No post-processing model",
+                &downloaded_registry_models(),
                 || None
             ),
             None
@@ -1829,6 +1883,7 @@ mod tests {
             &saved.post_process_provider_id,
             saved.local_llm_model_id.as_deref(),
             "No post-processing model",
+            &downloaded_registry_models(),
             || {
                 Some(LocalLlmStatus {
                     state: LocalLlmStateKind::Unloaded,
