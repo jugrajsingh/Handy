@@ -1,4 +1,14 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
+const {
+  mock,
+}: {
+  mock: {
+    module: (name: string, factory: () => unknown) => void;
+    restore: () => void;
+  };
+} = createRequire(import.meta.url)("bun:test");
+import type { AppSettings, HistoryCompareView } from "@/bindings";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import i18next from "i18next";
@@ -14,17 +24,22 @@ await i18next.use(initReactI18next).init({
 const entry = {
   transcription_text: "raw words",
   post_processed_text: "Clean words",
-  post_process_model: "historical-model",
+  post_process_model: "s1-mini-q4km",
 };
 const render = (view: "diff" | "side_by_side" | "stacked", value = entry) =>
   renderToStaticMarkup(
-    <HistoryCompare entry={value} view={view} modelName="historical-model" />,
+    <HistoryCompare
+      entry={value}
+      view={view}
+      modelName="S1-mini by Superwhisper"
+    />,
   );
 const diff = render("diff");
 assert.match(
   diff,
-  /<span class="text-xs text-logo-primary">Post-processed with historical-model<\/span>/,
+  /<span class="text-xs text-logo-primary">Post-processed with S1-mini by Superwhisper<\/span>/,
 );
+assert.ok(!diff.includes(entry.post_process_model));
 assert.ok(!diff.includes("<button"));
 assert.match(diff, /<del[^>]*>raw<\/del>/);
 assert.match(diff, /<mark[^>]*>Clean<\/mark>/);
@@ -37,24 +52,27 @@ assert.match(
   /<h3[^>]*>Post-processed<\/h3><p[^>]*>Clean words<\/p>/,
 );
 assert.match(render("stacked"), /<div class="flex flex-col gap-3">/);
-const old = renderToStaticMarkup(
-  <HistoryCompare
-    entry={{ ...entry, post_process_model: null }}
-    view="stacked"
-    modelName={null}
-  />,
-);
-assert.match(
-  old,
-  /<span class="text-xs text-logo-primary">Post-processed<\/span>/,
-);
-assert.ok(!old.includes("historical-model"));
+for (const post_process_model of [entry.post_process_model, null]) {
+  const old = renderToStaticMarkup(
+    <HistoryCompare
+      entry={{ ...entry, post_process_model }}
+      view="stacked"
+      modelName={null}
+    />,
+  );
+  assert.match(
+    old,
+    /<span class="text-xs text-logo-primary">Post-processed<\/span>/,
+  );
+  assert.ok(!old.includes(entry.post_process_model));
+  assert.ok(!old.includes("S1-mini by Superwhisper"));
+}
 for (const post_processed_text of [null, "", " \n"]) {
   const raw = renderToStaticMarkup(
     <HistoryCompare
       entry={{ ...entry, post_processed_text }}
       view="diff"
-      modelName="historical-model"
+      modelName="S1-mini by Superwhisper"
     />,
   );
   assert.match(raw, /^<p[^>]*>raw words<\/p>$/);
@@ -75,7 +93,7 @@ for (const view of ["diff", "side_by_side", "stacked"] as const) {
   });
   assert.match(
     equal,
-    /<span class="text-xs text-logo-primary">Post-processed with historical-model<\/span>/,
+    /<span class="text-xs text-logo-primary">Post-processed with S1-mini by Superwhisper<\/span>/,
   );
   assert.equal((equal.match(/<p\b/gu) ?? []).length, 1);
   assert.match(equal, /<p[^>]*>raw words<\/p>/);
@@ -115,6 +133,12 @@ assert.deepEqual(titles, [
 ]);
 assert.match(actions, /^<div class="flex items-center"/u);
 assert.equal((actions.match(/<button\b/gu) ?? []).length, 5);
+const idleButtons = Array.from(
+  actions.matchAll(/<button\b([^>]*)>/gu),
+  (match) => match[1],
+);
+assert.ok(!idleButtons[0].includes('disabled=""'));
+assert.ok(!idleButtons[1].includes('disabled=""'));
 const rawActions = renderToStaticMarkup(
   <HistoryActions
     processed={false}
@@ -132,6 +156,9 @@ assert.match(
   rawActions,
   /<button[^>]*title="Copy transcription to clipboard"/u,
 );
+const rawMainButton = rawActions.match(/<button\b([^>]*)>/u)?.[1];
+assert.ok(rawMainButton);
+assert.ok(!rawMainButton.includes('disabled=""'));
 const busy = renderToStaticMarkup(
   <HistoryActions
     processed
@@ -171,4 +198,28 @@ assert.ok(
     .slice(2)
     .every((button) => !button.includes('disabled=""')),
 );
+mock.module("@/hooks/useOsType", () => ({ useOsType: () => "linux" }));
+mock.module("@/hooks/useSettings", () => ({
+  useSettings: () => ({
+    getSetting: (key: keyof AppSettings) =>
+      key === "history_compare_view" ? "side_by_side" : undefined,
+  }),
+}));
+mock.module("@/stores/settingsStore", () => ({
+  useSettingsStore: (
+    select: (state: {
+      changeHistoryCompareView: (view: HistoryCompareView) => Promise<void>;
+    }) => unknown,
+  ) => select({ changeHistoryCompareView: async () => undefined }),
+}));
+mock.module("../post-processing/LocalLlmSettings", () => ({
+  useLocalLlmModels: () => ({ models: [] }),
+}));
+const { HistorySettings } = await import("./HistorySettings");
+const history = renderToStaticMarkup(<HistorySettings />);
+assert.match(
+  history,
+  /<div class="flex flex-wrap items-center gap-2"><span class="text-sm text-mid-gray">Compare view<\/span><div class="relative "><button[^>]*><span class="truncate">Side by side<\/span>/u,
+);
+mock.restore();
 console.log("HistoryCompare: all assertions passed");
