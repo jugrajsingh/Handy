@@ -338,60 +338,77 @@ fn initialize_core_logic(app_handle: &AppHandle) {
                 let model_id = model_id.to_string();
                 let app = app.clone();
                 tray::select_cleanup_on_worker(move || {
-                    let saved = settings::get_settings(&app);
-                    let Some(manager) = app.try_state::<Arc<local_llm::LocalLlmManager>>() else {
-                        return Ok(());
-                    };
-                    let downloaded = manager
-                        .models_root()
-                        .map(|root| {
-                            local_llm::registry::MODELS
-                                .iter()
-                                .filter(|entry| local_llm::download::is_downloaded(root, entry))
-                                .map(|entry| (entry.id.to_string(), entry.display_name.to_string()))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    let result = tray::select_cleanup_with(
-                        saved.post_process_enabled,
-                        &saved.post_process_provider_id,
-                        &model_id,
-                        &downloaded,
-                        |id| {
-                            tauri::async_runtime::block_on(
-                                local_llm::commands::set_local_llm_model(
-                                    app.clone(),
-                                    manager,
-                                    Some(id),
-                                ),
+                    tray::activate_model_check_with(
+                        || {
+                            let saved = settings::get_settings(&app);
+                            let Some(manager) = app.try_state::<Arc<local_llm::LocalLlmManager>>()
+                            else {
+                                return Ok(());
+                            };
+                            let downloaded = manager
+                                .models_root()
+                                .map(|root| {
+                                    local_llm::registry::MODELS
+                                        .iter()
+                                        .filter(|entry| {
+                                            local_llm::download::is_downloaded(root, entry)
+                                        })
+                                        .map(|entry| {
+                                            (entry.id.to_string(), entry.display_name.to_string())
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default();
+                            let result = tray::select_cleanup_with(
+                                saved.post_process_enabled,
+                                &saved.post_process_provider_id,
+                                &model_id,
+                                &downloaded,
+                                |id| {
+                                    tauri::async_runtime::block_on(
+                                        local_llm::commands::set_local_llm_model(
+                                            app.clone(),
+                                            manager,
+                                            Some(id),
+                                        ),
+                                    )
+                                },
                             )
+                            .map(|_| ());
+                            if let Err(error) = &result {
+                                log::error!("Post-processing tray selection failed: {error}");
+                            }
+                            result
                         },
+                        || tray::reconcile_model_checkmarks(&app),
                     )
-                    .map(|_| ());
-                    if let Err(error) = &result {
-                        log::error!("Post-processing tray selection failed: {error}");
-                    }
-                    result
                 });
             }
 
             id if id.starts_with("model_select:") => {
-                let model_id = id.strip_prefix("model_select:").unwrap().to_string();
-                let current_model = settings::get_settings(app).selected_model;
-                if model_id == current_model {
+                let Some(model_id) = id.strip_prefix("model_select:") else {
                     return;
-                }
-                let app_clone = app.clone();
+                };
+                let model_id = model_id.to_string();
+                let app = app.clone();
                 std::thread::spawn(move || {
-                    match commands::models::switch_active_model(&app_clone, &model_id) {
-                        Ok(()) => {
-                            log::info!("Model switched to {} via tray.", model_id);
-                        }
-                        Err(e) => {
-                            log::error!("Failed to switch model via tray: {}", e);
-                        }
-                    }
-                    tray::update_tray_menu(&app_clone);
+                    tray::activate_model_check_with(
+                        || {
+                            let current_model = settings::get_settings(&app).selected_model;
+                            if model_id == current_model {
+                                return Ok(());
+                            }
+                            let result = commands::models::switch_active_model(&app, &model_id);
+                            match &result {
+                                Ok(()) => log::info!("Model switched to {} via tray.", model_id),
+                                Err(error) => {
+                                    log::error!("Failed to switch model via tray: {error}")
+                                }
+                            }
+                            result
+                        },
+                        || tray::reconcile_model_checkmarks(&app),
+                    )
                 });
             }
             _ => {}

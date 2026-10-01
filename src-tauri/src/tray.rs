@@ -105,6 +105,16 @@ pub(crate) fn select_cleanup_on_worker(
     std::thread::spawn(work)
 }
 
+/// Reconciles native model checkmarks after every selection outcome.
+pub(crate) fn activate_model_check_with<T>(
+    activate: impl FnOnce() -> T,
+    reconcile: impl FnOnce(),
+) -> T {
+    let result = activate();
+    reconcile();
+    result
+}
+
 fn cleanup_unload_enabled(cleanup: &CleanupMenu) -> bool {
     cleanup.state == LocalLlmStateKind::Ready
 }
@@ -205,6 +215,10 @@ struct TrayInner {
     /// is derived from the same inputs and set best-effort alongside the menu;
     /// it is not tracked separately.
     applied_menu: Option<MenuInputs>,
+    /// Revision of native check-item invalidations.
+    menu_revision: u64,
+    /// Revision captured by the last successful native menu application.
+    applied_menu_revision: u64,
     /// An apply is scheduled on the main thread.
     pending: bool,
     /// Decoded icons by resource path so the main thread never touches disk.
@@ -230,8 +244,18 @@ impl TrayInner {
         !std::mem::replace(&mut self.pending, true)
     }
 
+    fn invalidate_menu(&mut self) {
+        self.menu_revision += 1;
+    }
+
     fn menu_needs_rebuild(&self, desired: &MenuInputs) -> bool {
-        self.applied_menu.as_ref() != Some(desired)
+        self.menu_revision != self.applied_menu_revision
+            || self.applied_menu.as_ref() != Some(desired)
+    }
+
+    fn mark_menu_applied(&mut self, menu: MenuInputs, revision: u64) {
+        self.applied_menu = Some(menu);
+        self.applied_menu_revision = revision;
     }
 }
 
@@ -245,6 +269,8 @@ impl TrayState {
             desired: None,
             applied_icon: None,
             applied_menu: None,
+            menu_revision: 0,
+            applied_menu_revision: 0,
             pending: false,
             icons: HashMap::new(),
             next_seq: 0,
@@ -369,6 +395,11 @@ pub fn refresh_tray_icon(app: &AppHandle) {
 /// list/selection/loaded state, language, settings).
 pub fn update_tray_menu(app: &AppHandle) {
     sync_tray(app);
+}
+
+/// Rebuilds native check states from persisted settings on the existing applier.
+pub(crate) fn reconcile_model_checkmarks(app: &AppHandle) {
+    sync_tray_with(app, TrayInner::invalidate_menu);
 }
 
 /// Records the current desired tray state and schedules one apply on the main
@@ -525,7 +556,7 @@ fn apply_on_main(app: &AppHandle) {
     };
 
     let started = Instant::now();
-    let (desired, icon, icon_changed, menu_changed) = {
+    let (desired, icon, icon_changed, menu_changed, menu_revision) = {
         let mut inner = state.lock();
         inner.pending = false;
         let Some(desired) = inner.desired.clone() else {
@@ -538,7 +569,13 @@ fn apply_on_main(app: &AppHandle) {
             return;
         }
         let icon = inner.icons.get(desired.icon_path).cloned();
-        (desired, icon, icon_changed, menu_changed)
+        (
+            desired,
+            icon,
+            icon_changed,
+            menu_changed,
+            inner.menu_revision,
+        )
     };
 
     // Each part is recorded as applied only if its native call succeeded, so a
@@ -582,7 +619,7 @@ fn apply_on_main(app: &AppHandle) {
             inner.applied_icon = Some(desired.icon_path);
         }
         if menu_ok {
-            inner.applied_menu = Some(desired.menu.clone());
+            inner.mark_menu_applied(desired.menu.clone(), menu_revision);
         }
     }
 
@@ -891,6 +928,230 @@ mod tests {
     use super::*;
     use crate::local_llm::manager::LocalLlmStateKind;
     use crate::managers::history::HistoryEntry;
+
+    fn assert_toggle_refreshes_unloaded_group(initially_enabled: bool) {
+        let h = crate::local_llm::manager::tests::harness();
+        let mut saved = h.settings.clone();
+        saved.post_process_enabled = initially_enabled;
+        let context = crate::shortcut::policy::command_path_tests::CommandTestContext::new(saved);
+        if initially_enabled {
+            context.seed_dictation();
+        }
+        let visible = std::cell::Cell::new(initially_enabled);
+        let refreshes = std::cell::Cell::new(0);
+        crate::shortcut::change_post_process_enabled_with(&context, !initially_enabled, || {
+            let saved = context.persisted();
+            visible.set(
+                cleanup_menu(
+                    saved.post_process_enabled,
+                    false,
+                    &saved.post_process_provider_id,
+                    saved.local_llm_model_id.as_deref(),
+                    "No post-processing model",
+                    || Some(h.manager.status()),
+                )
+                .is_some(),
+            );
+            refreshes.set(refreshes.get() + 1);
+        })
+        .unwrap();
+        assert_eq!(refreshes.get(), 1);
+        assert_eq!(visible.get(), !initially_enabled);
+        assert_eq!(h.manager.status().state, LocalLlmStateKind::Unloaded);
+        assert!(h.events.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn disabling_refreshes_unloaded_post_processing_group() {
+        assert_toggle_refreshes_unloaded_group(true);
+    }
+
+    #[test]
+    fn enabling_refreshes_unloaded_post_processing_group() {
+        assert_toggle_refreshes_unloaded_group(false);
+    }
+
+    #[derive(Clone, Copy)]
+    enum CheckOutcome {
+        Same,
+        Changed,
+        Refused,
+        Failed,
+    }
+
+    fn assert_check_activation_reconciles(transcription: bool, outcome: CheckOutcome) {
+        let state = TrayState::new();
+        let mut original = inputs(false);
+        original.cleanup = Some(cleanup(LocalLlmStateKind::Unloaded));
+        original.selected_cleanup_model = Some("s1-mini-q4km".into());
+        original.downloaded_cleanup_models = vec![
+            ("s1-mini-q4km".into(), "S1-mini".into()),
+            ("quill-0.8b-q4km".into(), "Quill 0.8B".into()),
+        ];
+        original
+            .downloaded_models
+            .push(("medium".into(), "Medium".into()));
+        let rows = |menu: &MenuInputs| {
+            let mut rows = model_choices(
+                &menu.downloaded_models,
+                Some(&menu.selected_model),
+                "model_select",
+            );
+            rows.extend(model_choices(
+                &menu.downloaded_cleanup_models,
+                menu.selected_cleanup_model.as_deref(),
+                "cleanup_model_select",
+            ));
+            rows
+        };
+        let mut native = rows(&original);
+        {
+            let mut inner = state.lock();
+            inner.applied_menu = Some(original.clone());
+            inner.desired = Some(TrayDesired {
+                icon_path: "resources/tray_idle.png",
+                menu: original.clone(),
+            });
+        }
+        let same = matches!(outcome, CheckOutcome::Same);
+        let clicked = match (transcription, same) {
+            (true, true) => "model_select:small",
+            (true, false) => "model_select:medium",
+            (false, true) => "cleanup_model_select:s1-mini-q4km",
+            (false, false) => "cleanup_model_select:quill-0.8b-q4km",
+        };
+        let row = native.iter_mut().find(|row| row.id == clicked).unwrap();
+        row.checked = !row.checked;
+        let saved = std::cell::RefCell::new(original);
+        let published = std::cell::Cell::new(0);
+        let result = activate_model_check_with(
+            || -> Result<bool, String> {
+                match outcome {
+                    CheckOutcome::Refused => Ok(false),
+                    CheckOutcome::Failed => Err("persist failed".into()),
+                    CheckOutcome::Same => {
+                        published.set(published.get() + 1);
+                        Ok(true)
+                    }
+                    CheckOutcome::Changed => {
+                        if transcription {
+                            saved.borrow_mut().selected_model = "medium".into();
+                        } else {
+                            saved.borrow_mut().selected_cleanup_model =
+                                Some("quill-0.8b-q4km".into());
+                        }
+                        published.set(published.get() + 1);
+                        Ok(true)
+                    }
+                }
+            },
+            || {
+                let mut inner = state.lock();
+                inner.invalidate_menu();
+                inner.accept_desired(
+                    1,
+                    TrayDesired {
+                        icon_path: "resources/tray_idle.png",
+                        menu: saved.borrow().clone(),
+                    },
+                );
+            },
+        );
+        assert_eq!(result.is_err(), matches!(outcome, CheckOutcome::Failed));
+        let mut inner = state.lock();
+        inner.pending = false;
+        let desired = inner.desired.clone().unwrap();
+        if inner.menu_needs_rebuild(&desired.menu) {
+            native = rows(&desired.menu);
+            let revision = inner.menu_revision;
+            inner.mark_menu_applied(desired.menu, revision);
+        }
+        let checked = native
+            .iter()
+            .filter(|row| row.checked)
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+        let expected_transcription = if transcription && matches!(outcome, CheckOutcome::Changed) {
+            "model_select:medium"
+        } else {
+            "model_select:small"
+        };
+        let expected_cleanup = if !transcription && matches!(outcome, CheckOutcome::Changed) {
+            "cleanup_model_select:quill-0.8b-q4km"
+        } else {
+            "cleanup_model_select:s1-mini-q4km"
+        };
+        assert_eq!(checked, vec![expected_transcription, expected_cleanup]);
+        assert_eq!(
+            published.get(),
+            usize::from(matches!(
+                outcome,
+                CheckOutcome::Same | CheckOutcome::Changed
+            ))
+        );
+        assert!(!inner.menu_needs_rebuild(&saved.borrow()));
+    }
+
+    #[test]
+    fn local_check_same_selection_reconciles_native_toggle() {
+        assert_check_activation_reconciles(false, CheckOutcome::Same);
+    }
+    #[test]
+    fn local_check_changed_selection_reconciles_native_toggle() {
+        assert_check_activation_reconciles(false, CheckOutcome::Changed);
+    }
+    #[test]
+    fn local_check_refusal_reconciles_native_toggle() {
+        assert_check_activation_reconciles(false, CheckOutcome::Refused);
+    }
+    #[test]
+    fn local_check_persistence_failure_reconciles_native_toggle() {
+        assert_check_activation_reconciles(false, CheckOutcome::Failed);
+    }
+    #[test]
+    fn transcription_check_same_selection_reconciles_native_toggle() {
+        assert_check_activation_reconciles(true, CheckOutcome::Same);
+    }
+    #[test]
+    fn transcription_check_changed_selection_reconciles_native_toggle() {
+        assert_check_activation_reconciles(true, CheckOutcome::Changed);
+    }
+    #[test]
+    fn transcription_check_refusal_reconciles_native_toggle() {
+        assert_check_activation_reconciles(true, CheckOutcome::Refused);
+    }
+    #[test]
+    fn transcription_check_failure_reconciles_native_toggle() {
+        assert_check_activation_reconciles(true, CheckOutcome::Failed);
+    }
+
+    #[test]
+    fn native_menu_invalidation_survives_apply_and_coalesces_bursts() {
+        let state = TrayState::new();
+        let menu = inputs(false);
+        let desired = TrayDesired {
+            icon_path: "resources/tray_idle.png",
+            menu: menu.clone(),
+        };
+        let mut inner = state.lock();
+        inner.applied_menu = Some(menu.clone());
+        let mut scheduled = 0;
+        for seq in 1..=100 {
+            inner.invalidate_menu();
+            scheduled += usize::from(inner.accept_desired(seq, desired.clone()));
+        }
+        assert_eq!(scheduled, 1);
+        assert!(inner.menu_needs_rebuild(&menu));
+        let applying_revision = inner.menu_revision;
+        inner.pending = false;
+        inner.invalidate_menu();
+        assert!(inner.accept_desired(101, desired));
+        inner.mark_menu_applied(menu.clone(), applying_revision);
+        assert!(inner.menu_needs_rebuild(&menu));
+        let revision = inner.menu_revision;
+        inner.mark_menu_applied(menu.clone(), revision);
+        assert!(!inner.menu_needs_rebuild(&menu));
+    }
 
     #[test]
     fn model_choices_keep_full_names_and_check_only_selected_downloads() {

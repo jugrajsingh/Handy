@@ -1020,12 +1020,14 @@ pub fn change_auto_submit_key_setting(app: AppHandle, key: String) -> Result<(),
 #[tauri::command]
 #[specta::specta]
 pub fn change_post_process_enabled_setting(app: AppHandle, enabled: bool) -> Result<(), String> {
-    change_post_process_enabled_with(&app, enabled)
+    change_post_process_enabled_with(&app, enabled, || tray::update_tray_menu(&app))
 }
 
-fn change_post_process_enabled_with(
+/// Persists a successful toggle before requesting the tray refresh.
+pub(crate) fn change_post_process_enabled_with(
     app: &impl policy::CommandContext,
     enabled: bool,
+    refresh_tray: impl FnOnce(),
 ) -> Result<(), String> {
     let _guard = BINDING_MUTATION_LOCK
         .lock()
@@ -1067,6 +1069,9 @@ fn change_post_process_enabled_with(
         Ok(())
     })();
     app.reconcile_fallback();
+    if result.is_ok() {
+        refresh_tray();
+    }
     result
 }
 
