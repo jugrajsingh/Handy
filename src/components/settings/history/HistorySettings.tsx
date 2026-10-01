@@ -9,7 +9,7 @@ import React, {
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { readFile } from "@tauri-apps/plugin-fs";
-import { Check, Copy, FolderOpen, RotateCcw, Star, Trash2 } from "lucide-react";
+import { FolderOpen } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 import {
@@ -21,13 +21,20 @@ import {
 import { useOsType } from "@/hooks/useOsType";
 import { useSettings } from "@/hooks/useSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
-import { cleanedText, historyCopyText } from "@/lib/utils/historyPresentation";
+import {
+  cleanedText,
+  copyHistoryRaw,
+  historyCopyText,
+  historyModelName,
+} from "@/lib/utils/historyPresentation";
 import { formatDateTime } from "@/utils/dateFormat";
 import { AudioPlayer, AudioPlayerGroup } from "../../ui/AudioPlayer";
 import { Button } from "../../ui/Button";
 import { Dropdown } from "../../ui/Dropdown";
 import { copyToClipboard } from "./clipboard";
 import { HistoryCompare } from "./HistoryCompare";
+import { HistoryActions } from "./HistoryActions";
+import { useLocalLlmModels } from "../post-processing/LocalLlmSettings";
 import {
   PageGeneration,
   createHistoryActions,
@@ -37,27 +44,6 @@ import {
   createHistoryEntryActions,
   retryHistoryWithAnchor,
 } from "./pageGeneration";
-
-const IconButton: React.FC<{
-  onClick: () => void;
-  title: string;
-  disabled?: boolean;
-  active?: boolean;
-  children: React.ReactNode;
-}> = ({ onClick, title, disabled, active, children }) => (
-  <button
-    onClick={onClick}
-    disabled={disabled}
-    className={`p-1.5 rounded-md flex items-center justify-center transition-colors cursor-pointer disabled:cursor-not-allowed disabled:text-text/20 ${
-      active
-        ? "text-logo-primary hover:text-logo-primary/80"
-        : "text-text/50 hover:text-logo-primary"
-    }`}
-    title={title}
-  >
-    {children}
-  </button>
-);
 
 interface OpenRecordingsButtonProps {
   onClick: () => void;
@@ -83,6 +69,7 @@ const OpenRecordingsButton: React.FC<OpenRecordingsButtonProps> = ({
 export const HistorySettings: React.FC = () => {
   const { t } = useTranslation();
   const osType = useOsType();
+  const { models: localModels } = useLocalLlmModels();
   const { getSetting } = useSettings();
   const changeCompareView = useSettingsStore(
     (state) => state.changeHistoryCompareView,
@@ -312,6 +299,7 @@ export const HistorySettings: React.FC = () => {
                 key={entry.id}
                 entry={entry}
                 view={view}
+                modelName={historyModelName(entry, localModels)}
                 onToggleSaved={() => void entryActions.toggleSaved(entry.id)}
                 onCopyText={() => copyToClipboard(historyCopyText(entry))}
                 onCopyRaw={() => copyToClipboard(entry.transcription_text)}
@@ -340,18 +328,23 @@ export const HistorySettings: React.FC = () => {
             </h2>
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <Dropdown
-              options={(
-                ["diff", "side_by_side", "stacked"] as HistoryCompareView[]
-              ).map((value) => ({
-                value,
-                label: t(`settings.history.compare.${value}`),
-              }))}
-              selectedValue={view}
-              onSelect={(next) => void changeView(next)}
-              disabled={changingView}
-              placeholder={t("settings.history.compare.title")}
-            />
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-sm text-mid-gray">
+                {t("settings.history.compare.title")}
+              </span>
+              <Dropdown
+                options={(
+                  ["diff", "side_by_side", "stacked"] as HistoryCompareView[]
+                ).map((value) => ({
+                  value,
+                  label: t(`settings.history.compare.${value}`),
+                }))}
+                selectedValue={view}
+                onSelect={(next) => void changeView(next)}
+                disabled={changingView}
+                placeholder={t("settings.history.compare.title")}
+              />
+            </div>
             <Button
               variant="secondary"
               size="sm"
@@ -382,6 +375,7 @@ export const HistorySettings: React.FC = () => {
 interface HistoryEntryProps {
   entry: HistoryEntry;
   view: HistoryCompareView;
+  modelName: string | null;
   onToggleSaved: () => void;
   onCopyText: () => Promise<boolean>;
   onCopyRaw: () => Promise<boolean>;
@@ -395,6 +389,7 @@ interface HistoryEntryProps {
 const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   entry,
   view,
+  modelName,
   onToggleSaved,
   onCopyText,
   onCopyRaw,
@@ -464,61 +459,27 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
     >
       <div className="flex justify-between items-center">
         <p className="text-sm font-medium">{formattedDate}</p>
-        <div className="flex items-center">
-          <IconButton
-            onClick={handleCopyText}
-            disabled={!hasTranscription || retrying}
-            title={t("settings.history.copyToClipboard")}
-          >
-            {showCopied ? (
-              <Check width={16} height={16} />
-            ) : (
-              <Copy width={16} height={16} />
-            )}
-          </IconButton>
-          <IconButton
-            onClick={onToggleSaved}
-            disabled={retrying}
-            active={entry.saved}
-            title={
-              entry.saved
-                ? t("settings.history.unsave")
-                : t("settings.history.save")
-            }
-          >
-            <Star
-              width={16}
-              height={16}
-              fill={entry.saved ? "currentColor" : "none"}
-            />
-          </IconButton>
-          <IconButton
-            onClick={handleRetranscribe}
-            disabled={retrying}
-            title={t("settings.history.retranscribe")}
-          >
-            <RotateCcw
-              width={16}
-              height={16}
-              style={
-                retrying
-                  ? { animation: "spin 1s linear infinite reverse" }
-                  : undefined
-              }
-            />
-          </IconButton>
-          <IconButton
-            onClick={handleDeleteEntry}
-            disabled={retrying}
-            title={t("settings.history.delete")}
-          >
-            <Trash2 width={16} height={16} />
-          </IconButton>
-        </div>
+        <HistoryActions
+          processed={cleanedText(entry) !== null}
+          rawAvailable={entry.transcription_text.trim().length > 0}
+          hasText={hasTranscription}
+          saved={entry.saved}
+          retrying={retrying}
+          copied={showCopied}
+          onCopy={() => void handleCopyText()}
+          onCopyRaw={() =>
+            void copyHistoryRaw(onCopyRaw, () =>
+              toast.error(t("settings.history.copyError")),
+            )
+          }
+          onToggleSaved={onToggleSaved}
+          onRetranscribe={() => void handleRetranscribe()}
+          onDelete={() => void handleDeleteEntry()}
+        />
       </div>
 
       {!retrying && cleanedText(entry) !== null ? (
-        <HistoryCompare entry={entry} view={view} onCopyRaw={onCopyRaw} />
+        <HistoryCompare entry={entry} view={view} modelName={modelName} />
       ) : (
         <p
           className={`italic text-sm pb-2 ${

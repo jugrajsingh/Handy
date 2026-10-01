@@ -1,10 +1,8 @@
 import React, { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { toast } from "sonner";
 import type { HistoryCompareView, HistoryEntry } from "@/bindings";
 import { wordDiff } from "@/lib/utils/wordDiff";
-import { cleanedText, copyHistoryRaw } from "@/lib/utils/historyPresentation";
-import { Button } from "../../ui/Button";
+import { cleanedText } from "@/lib/utils/historyPresentation";
 
 type CompareEntry = Pick<
   HistoryEntry,
@@ -14,17 +12,19 @@ type CompareEntry = Pick<
 export function HistoryCompare({
   entry,
   view,
-  onCopyRaw,
+  modelName,
 }: {
   entry: CompareEntry;
   view: HistoryCompareView;
-  onCopyRaw: () => Promise<boolean>;
+  modelName: string | null;
 }): React.JSX.Element {
   const { t } = useTranslation();
   const cleaned = cleanedText(entry);
   const diff = useMemo(
     () =>
-      view === "diff" && cleaned !== null
+      view === "diff" &&
+      cleaned !== null &&
+      cleaned !== entry.transcription_text
         ? wordDiff(entry.transcription_text, cleaned)
         : null,
     [entry.transcription_text, cleaned, view],
@@ -39,27 +39,18 @@ export function HistoryCompare({
   const textClass = "text-sm whitespace-pre-wrap break-words select-text";
   return (
     <div className="space-y-2">
-      <div className="flex items-center justify-between gap-2">
+      <div>
         <span className="text-xs text-logo-primary">
-          {entry.post_process_model
+          {modelName
             ? t("settings.history.cleanedWith", {
-                model: entry.post_process_model,
+                model: modelName,
               })
             : t("settings.history.cleaned")}
         </span>
-        <Button
-          variant="secondary"
-          size="sm"
-          onClick={() =>
-            void copyHistoryRaw(onCopyRaw, () =>
-              toast.error(t("settings.history.copyError")),
-            )
-          }
-        >
-          {t("settings.history.copyRaw")}
-        </Button>
       </div>
-      {effectiveView === "diff" && diff?.kind === "diff" ? (
+      {cleaned === entry.transcription_text ? (
+        <p className={textClass}>{cleaned}</p>
+      ) : effectiveView === "diff" && diff?.kind === "diff" ? (
         <p className={textClass}>
           {diff.tokens.map((token, index) => (
             <React.Fragment key={index}>

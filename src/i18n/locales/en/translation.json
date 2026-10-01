@@ -521,10 +521,11 @@
     },
     "history": {
       "title": "History",
-      "cleaned": "Cleaned",
-      "cleanedWith": "Cleaned with {{model}}",
+      "cleaned": "Post-processed",
+      "cleanedWith": "Post-processed with {{model}}",
       "raw": "Raw",
-      "copyRaw": "Copy raw",
+      "copyRaw": "Copy raw text",
+      "copyPostProcessed": "Copy post-processed text",
       "compare": {
         "title": "Compare view",
         "diff": "Diff",
