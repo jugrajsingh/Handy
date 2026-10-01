@@ -468,7 +468,7 @@ mod registration_path_tests {
 }
 
 #[cfg(test)]
-mod command_path_tests {
+pub(crate) mod command_path_tests {
     use super::*;
     use crate::settings::get_default_settings;
     use crate::shortcut::{
@@ -477,7 +477,7 @@ mod command_path_tests {
     use std::cell::{Cell, RefCell};
     use std::collections::HashMap;
 
-    struct CommandTestContext {
+    pub(crate) struct CommandTestContext {
         directory: tempfile::TempDir,
         registered: RefCell<HashMap<String, String>>,
         operations: RefCell<Vec<String>>,
@@ -485,7 +485,7 @@ mod command_path_tests {
         unregister_error: Cell<bool>,
     }
 
-    struct NoHandyKeys;
+    pub(crate) struct NoHandyKeys;
 
     impl HandyKeysRegistration for NoHandyKeys {
         fn register(&self, _binding: &ShortcutBinding) -> Result<(), String> {
@@ -494,7 +494,7 @@ mod command_path_tests {
     }
 
     impl CommandTestContext {
-        fn new(settings: AppSettings) -> Self {
+        pub(crate) fn new(settings: AppSettings) -> Self {
             let context = Self {
                 directory: tempfile::tempdir().unwrap(),
                 registered: RefCell::new(HashMap::new()),
@@ -514,11 +514,11 @@ mod command_path_tests {
             std::fs::read_to_string(self.path()).unwrap()
         }
 
-        fn persisted(&self) -> AppSettings {
+        pub(crate) fn persisted(&self) -> AppSettings {
             serde_json::from_str(&self.stored()).unwrap()
         }
 
-        fn seed_dictation(&self) {
+        pub(crate) fn seed_dictation(&self) {
             let settings = self.persisted();
             for id in ["transcribe", "transcribe_with_post_process"] {
                 let binding = &settings.bindings[id];
@@ -610,6 +610,28 @@ mod command_path_tests {
     }
 
     #[test]
+    fn refused_toggle_never_refreshes_tray() {
+        for enabled in [false, true] {
+            let mut saved = enabled_settings(KeyboardImplementation::Tauri);
+            saved.post_process_enabled = !enabled;
+            let context = CommandTestContext::new(saved);
+            if enabled {
+                context.register_error.set(true);
+            } else {
+                context.seed_dictation();
+                context.unregister_error.set(true);
+            }
+            let refreshes = Cell::new(0);
+            assert!(change_post_process_enabled_with(&context, enabled, || {
+                refreshes.set(refreshes.get() + 1);
+            })
+            .is_err());
+            assert_eq!(refreshes.get(), 0);
+            assert_eq!(context.persisted().post_process_enabled, !enabled);
+        }
+    }
+
+    #[test]
     fn disable_retains_active_raw_and_removes_clean() {
         for implementation in [
             KeyboardImplementation::Tauri,
@@ -618,7 +640,7 @@ mod command_path_tests {
             let context = CommandTestContext::new(enabled_settings(implementation));
             context.seed_dictation();
             let raw = context.registered.borrow()["transcribe"].clone();
-            assert!(change_post_process_enabled_with(&context, false).is_ok());
+            assert!(change_post_process_enabled_with(&context, false, || {}).is_ok());
             assert!(!context.persisted().post_process_enabled);
             assert_eq!(context.registered.borrow().get("transcribe"), Some(&raw));
             assert!(!context
@@ -647,7 +669,7 @@ mod command_path_tests {
                 .clear();
             let context = CommandTestContext::new(settings);
             context.seed_dictation();
-            assert!(change_post_process_enabled_with(&context, false).is_ok());
+            assert!(change_post_process_enabled_with(&context, false, || {}).is_ok());
             let persisted = context.persisted();
             assert!(!persisted.post_process_enabled);
             assert_eq!(
@@ -692,7 +714,7 @@ mod command_path_tests {
                     context.register_error.set(true);
                 }
                 let before = context.stored();
-                let error = change_post_process_enabled_with(&context, false).unwrap_err();
+                let error = change_post_process_enabled_with(&context, false, || {}).unwrap_err();
                 assert!(error.contains(if foreign_owner {
                     "already in use"
                 } else {
@@ -731,7 +753,7 @@ mod command_path_tests {
             let context = CommandTestContext::new(settings);
             let before = context.stored();
             context.register_error.set(true);
-            assert!(change_post_process_enabled_with(&context, true)
+            assert!(change_post_process_enabled_with(&context, true, || {})
                 .unwrap_err()
                 .contains("native registration failed"));
             assert!(!context.persisted().post_process_enabled);
@@ -790,7 +812,7 @@ mod command_path_tests {
                 .current_binding = settings.bindings["transcribe"].current_binding.clone();
             let context = CommandTestContext::new(settings);
             let before = context.stored();
-            assert!(change_post_process_enabled_with(&context, true)
+            assert!(change_post_process_enabled_with(&context, true, || {})
                 .unwrap_err()
                 .contains("transcribe"));
             assert!(!context.persisted().post_process_enabled);
