@@ -52,6 +52,9 @@ import {
   createHistoryActions,
   createHistoryPageLoader,
   reloadHistoryOnUpdate,
+  createHistoryScrollAnchor,
+  createHistoryEntryActions,
+  retryHistoryWithAnchor,
 } from "./pageGeneration";
 
 const IconButton: React.FC<{
@@ -158,23 +161,70 @@ export const HistorySettings: React.FC = () => {
   const entriesRef = useRef<HistoryEntry[]>([]);
   const loadingRef = useRef(false);
 
+  const rootRef = useRef<HTMLDivElement>(null);
+  const scrollAnchor = useMemo(
+    () =>
+      createHistoryScrollAnchor({
+        getViewport: () => {
+          const scroller = rootRef.current?.closest<HTMLElement>(
+            "[data-settings-scroll]",
+          );
+          if (!scroller) return null;
+          return {
+            top: scroller.getBoundingClientRect().top,
+            scrollTop: scroller.scrollTop,
+            rows: Array.from(
+              rootRef.current?.querySelectorAll<HTMLElement>(
+                "[data-history-entry-id]",
+              ) ?? [],
+            ).map((element) => {
+              const rect = element.getBoundingClientRect();
+              return {
+                id: element.dataset.historyEntryId ?? "",
+                top: rect.top,
+                bottom: rect.bottom,
+              };
+            }),
+          };
+        },
+        setScrollTop: (scrollTop) => {
+          const scroller = rootRef.current?.closest<HTMLElement>(
+            "[data-settings-scroll]",
+          );
+          if (scroller) scroller.scrollTop = scrollTop;
+        },
+      }),
+    [],
+  );
+  useLayoutEffect(() => {
+    scrollAnchor.restore();
+  }, [entries, scrollAnchor]);
+
   // Keep ref in sync for use in IntersectionObserver callback
-  useEffect(() => {
+  useLayoutEffect(() => {
     entriesRef.current = entries;
   }, [entries]);
 
-  const { loadPage, loadPageChecked } = useMemo(
+  const {
+    loadPage,
+    loadPageChecked,
+    applyHistoryUpdate,
+    setSaved,
+    removeEntry,
+  } = useMemo(
     () =>
       createHistoryPageLoader({
         generation: generation.current,
         loadingRef,
+        getEntries: () => entriesRef.current,
         fetchPage: commands.getHistoryEntries,
         setEntries,
         setLoading,
         setHasMore,
         setError: setActionError,
+        beforeCommit: scrollAnchor.capture,
       }),
-    [],
+    [scrollAnchor],
   );
 
   const { clearHistory, changeView } = useMemo(
@@ -236,37 +286,30 @@ export const HistorySettings: React.FC = () => {
   // Listen for new entries added from the transcription pipeline
   useEffect(() => {
     const unlisten = events.historyUpdatePayload.listen((event) => {
-      reloadHistoryOnUpdate(event.payload, loadPage);
-      // "deleted" and "toggled" are handled by optimistic updates only,
-      // so we intentionally ignore them here to avoid double-mutation.
+      const payload = event.payload;
+      if (payload.action === "cleared") scrollAnchor.clear();
+      if (payload.action === "deleted") applyHistoryUpdate(payload);
+      reloadHistoryOnUpdate(payload, loadPage, applyHistoryUpdate);
     });
 
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [loadPage]);
+  }, [loadPage, applyHistoryUpdate, scrollAnchor]);
 
-  const toggleSaved = async (id: number) => {
-    // Optimistic update
-    setEntries((prev) =>
-      prev.map((e) => (e.id === id ? { ...e, saved: !e.saved } : e)),
-    );
-    try {
-      const result = await commands.toggleHistoryEntrySaved(id);
-      if (result.status !== "ok") {
-        // Revert on failure
-        setEntries((prev) =>
-          prev.map((e) => (e.id === id ? { ...e, saved: !e.saved } : e)),
-        );
-      }
-    } catch (error) {
-      console.error("Failed to toggle saved status:", error);
-      // Revert on failure
-      setEntries((prev) =>
-        prev.map((e) => (e.id === id ? { ...e, saved: !e.saved } : e)),
-      );
-    }
-  };
+  const entryActions = useMemo(
+    () =>
+      createHistoryEntryActions({
+        getEntry: (id) => entriesRef.current.find((entry) => entry.id === id),
+        setSaved,
+        removeEntry,
+        toggleSaved: commands.toggleHistoryEntrySaved,
+        deleteEntry: commands.deleteHistoryEntry,
+        reload: loadPage,
+        setError: setActionError,
+      }),
+    [setSaved, removeEntry, loadPage],
+  );
 
   const getAudioUrl = useCallback(
     async (fileName: string) => {
@@ -288,21 +331,6 @@ export const HistorySettings: React.FC = () => {
     },
     [osType],
   );
-
-  const deleteAudioEntry = async (id: number) => {
-    // Optimistically remove
-    setEntries((prev) => prev.filter((e) => e.id !== id));
-    try {
-      const result = await commands.deleteHistoryEntry(id);
-      if (result.status !== "ok") {
-        throw new Error(String(result.error));
-      }
-    } catch (error) {
-      console.error("Failed to delete entry:", error);
-      loadPage();
-      throw error;
-    }
-  };
 
   const transcribeFile = async () => {
     try {
@@ -352,13 +380,15 @@ export const HistorySettings: React.FC = () => {
                 entry={entry}
                 job={jobs[entry.id]}
                 view={view}
-                onToggleSaved={() => toggleSaved(entry.id)}
+                onToggleSaved={() => void entryActions.toggleSaved(entry.id)}
                 onCopyText={() => copyToClipboard(historyCopyText(entry))}
                 onCopyRaw={() => copyToClipboard(entry.transcription_text)}
                 getAudioUrl={getAudioUrl}
-                deleteAudio={deleteAudioEntry}
+                deleteAudio={entryActions.deleteEntry}
                 retryTranscription={commands.retryHistoryEntryTranscription}
                 cancelTranscription={commands.cancelHistoryEntryTranscription}
+                captureAnchor={scrollAnchor.capture}
+                restoreAnchor={scrollAnchor.restore}
               />
             ))}
           </div>
@@ -370,7 +400,7 @@ export const HistorySettings: React.FC = () => {
   }
 
   return (
-    <div className="max-w-3xl w-full mx-auto space-y-6">
+    <div ref={rootRef} className="max-w-3xl w-full mx-auto space-y-6">
       <div className="space-y-2">
         <div className="px-4 flex flex-wrap items-center justify-between gap-2">
           <div>
@@ -431,6 +461,8 @@ interface HistoryEntryProps {
   deleteAudio: (id: number) => Promise<void>;
   retryTranscription: (id: number) => Promise<void>;
   cancelTranscription: (id: number) => Promise<void>;
+  captureAnchor: () => void;
+  restoreAnchor: () => void;
 }
 
 const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
@@ -444,6 +476,8 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   deleteAudio,
   retryTranscription,
   cancelTranscription,
+  captureAnchor,
+  restoreAnchor,
 }) => {
   const { t, i18n } = useTranslation();
   const [showCopied, setShowCopied] = useState(false);
@@ -455,6 +489,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
 
   // Queued or being transcribed in the background.
   const retrying = job !== undefined;
+  useLayoutEffect(() => { restoreAnchor(); }, [retrying, restoreAnchor]);
   useEffect(() => {
     if (!retrying) setCancelling(false);
   }, [retrying]);
@@ -513,7 +548,7 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   }
 
   return (
-    <div className="px-4 py-2 pb-5 flex flex-col gap-3">
+    <div data-history-entry-id={entry.id} className="px-4 py-2 pb-5 flex flex-col gap-3">
       <div className="flex justify-between items-center gap-3">
         <div className="flex items-center gap-2 min-w-0">
           <p className="text-sm font-medium shrink-0">{formattedDate}</p>
