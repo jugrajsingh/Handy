@@ -1,6 +1,7 @@
 import React, {
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -32,6 +33,9 @@ import {
   createHistoryActions,
   createHistoryPageLoader,
   reloadHistoryOnUpdate,
+  createHistoryScrollAnchor,
+  createHistoryEntryActions,
+  retryHistoryWithAnchor,
 } from "./pageGeneration";
 
 const IconButton: React.FC<{
@@ -95,23 +99,70 @@ export const HistorySettings: React.FC = () => {
   const entriesRef = useRef<HistoryEntry[]>([]);
   const loadingRef = useRef(false);
 
+  const rootRef = useRef<HTMLDivElement>(null);
+  const scrollAnchor = useMemo(
+    () =>
+      createHistoryScrollAnchor({
+        getViewport: () => {
+          const scroller = rootRef.current?.closest<HTMLElement>(
+            "[data-settings-scroll]",
+          );
+          if (!scroller) return null;
+          return {
+            top: scroller.getBoundingClientRect().top,
+            scrollTop: scroller.scrollTop,
+            rows: Array.from(
+              rootRef.current?.querySelectorAll<HTMLElement>(
+                "[data-history-entry-id]",
+              ) ?? [],
+            ).map((element) => {
+              const rect = element.getBoundingClientRect();
+              return {
+                id: element.dataset.historyEntryId ?? "",
+                top: rect.top,
+                bottom: rect.bottom,
+              };
+            }),
+          };
+        },
+        setScrollTop: (scrollTop) => {
+          const scroller = rootRef.current?.closest<HTMLElement>(
+            "[data-settings-scroll]",
+          );
+          if (scroller) scroller.scrollTop = scrollTop;
+        },
+      }),
+    [],
+  );
+  useLayoutEffect(() => {
+    scrollAnchor.restore();
+  }, [entries, scrollAnchor]);
+
   // Keep ref in sync for use in IntersectionObserver callback
-  useEffect(() => {
+  useLayoutEffect(() => {
     entriesRef.current = entries;
   }, [entries]);
 
-  const { loadPage, loadPageChecked } = useMemo(
+  const {
+    loadPage,
+    loadPageChecked,
+    applyHistoryUpdate,
+    setSaved,
+    removeEntry,
+  } = useMemo(
     () =>
       createHistoryPageLoader({
         generation: generation.current,
         loadingRef,
+        getEntries: () => entriesRef.current,
         fetchPage: commands.getHistoryEntries,
         setEntries,
         setLoading,
         setHasMore,
         setError: setActionError,
+        beforeCommit: scrollAnchor.capture,
       }),
-    [],
+    [scrollAnchor],
   );
 
   const { clearHistory, changeView } = useMemo(
@@ -173,37 +224,30 @@ export const HistorySettings: React.FC = () => {
   // Listen for new entries added from the transcription pipeline
   useEffect(() => {
     const unlisten = events.historyUpdatePayload.listen((event) => {
-      reloadHistoryOnUpdate(event.payload, loadPage);
-      // "deleted" and "toggled" are handled by optimistic updates only,
-      // so we intentionally ignore them here to avoid double-mutation.
+      const payload = event.payload;
+      if (payload.action === "cleared") scrollAnchor.clear();
+      if (payload.action === "deleted") applyHistoryUpdate(payload);
+      reloadHistoryOnUpdate(payload, loadPage, applyHistoryUpdate);
     });
 
     return () => {
       unlisten.then((fn) => fn());
     };
-  }, [loadPage]);
+  }, [loadPage, applyHistoryUpdate, scrollAnchor]);
 
-  const toggleSaved = async (id: number) => {
-    // Optimistic update
-    setEntries((prev) =>
-      prev.map((e) => (e.id === id ? { ...e, saved: !e.saved } : e)),
-    );
-    try {
-      const result = await commands.toggleHistoryEntrySaved(id);
-      if (result.status !== "ok") {
-        // Revert on failure
-        setEntries((prev) =>
-          prev.map((e) => (e.id === id ? { ...e, saved: !e.saved } : e)),
-        );
-      }
-    } catch (error) {
-      console.error("Failed to toggle saved status:", error);
-      // Revert on failure
-      setEntries((prev) =>
-        prev.map((e) => (e.id === id ? { ...e, saved: !e.saved } : e)),
-      );
-    }
-  };
+  const entryActions = useMemo(
+    () =>
+      createHistoryEntryActions({
+        getEntry: (id) => entriesRef.current.find((entry) => entry.id === id),
+        setSaved,
+        removeEntry,
+        toggleSaved: commands.toggleHistoryEntrySaved,
+        deleteEntry: commands.deleteHistoryEntry,
+        reload: loadPage,
+        setError: setActionError,
+      }),
+    [setSaved, removeEntry, loadPage],
+  );
 
   const getAudioUrl = useCallback(
     async (fileName: string) => {
@@ -225,21 +269,6 @@ export const HistorySettings: React.FC = () => {
     },
     [osType],
   );
-
-  const deleteAudioEntry = async (id: number) => {
-    // Optimistically remove
-    setEntries((prev) => prev.filter((e) => e.id !== id));
-    try {
-      const result = await commands.deleteHistoryEntry(id);
-      if (result.status !== "ok") {
-        // Reload on failure
-        loadPage();
-      }
-    } catch (error) {
-      console.error("Failed to delete entry:", error);
-      loadPage();
-    }
-  };
 
   const retryHistoryEntry = async (id: number) => {
     const result = await commands.retryHistoryEntryTranscription(id);
@@ -283,12 +312,14 @@ export const HistorySettings: React.FC = () => {
                 key={entry.id}
                 entry={entry}
                 view={view}
-                onToggleSaved={() => toggleSaved(entry.id)}
+                onToggleSaved={() => void entryActions.toggleSaved(entry.id)}
                 onCopyText={() => copyToClipboard(historyCopyText(entry))}
                 onCopyRaw={() => copyToClipboard(entry.transcription_text)}
                 getAudioUrl={getAudioUrl}
-                deleteAudio={deleteAudioEntry}
+                deleteAudio={entryActions.deleteEntry}
                 retryTranscription={retryHistoryEntry}
+                captureAnchor={scrollAnchor.capture}
+                restoreAnchor={scrollAnchor.restore}
               />
             ))}
           </div>
@@ -300,7 +331,7 @@ export const HistorySettings: React.FC = () => {
   }
 
   return (
-    <div className="max-w-3xl w-full mx-auto space-y-6">
+    <div ref={rootRef} className="max-w-3xl w-full mx-auto space-y-6">
       <div className="space-y-2">
         <div className="px-4 flex flex-wrap items-center justify-between gap-2">
           <div>
@@ -357,6 +388,8 @@ interface HistoryEntryProps {
   getAudioUrl: (fileName: string) => Promise<string | null>;
   deleteAudio: (id: number) => Promise<void>;
   retryTranscription: (id: number) => Promise<void>;
+  captureAnchor: () => void;
+  restoreAnchor: () => void;
 }
 
 const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
@@ -368,10 +401,15 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   getAudioUrl,
   deleteAudio,
   retryTranscription,
+  captureAnchor,
+  restoreAnchor,
 }) => {
   const { t, i18n } = useTranslation();
   const [showCopied, setShowCopied] = useState(false);
   const [retrying, setRetrying] = useState(false);
+  useLayoutEffect(() => {
+    restoreAnchor();
+  }, [retrying, restoreAnchor]);
 
   const hasTranscription = historyCopyText(entry).trim().length > 0;
 
@@ -406,20 +444,24 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
 
   const handleRetranscribe = async () => {
     try {
-      setRetrying(true);
-      await retryTranscription(entry.id);
+      await retryHistoryWithAnchor(entry.id, {
+        captureAnchor,
+        setRetrying,
+        retry: retryTranscription,
+      });
     } catch (error) {
       console.error("Failed to re-transcribe:", error);
       toast.error(t("settings.history.retranscribeError"));
-    } finally {
-      setRetrying(false);
     }
   };
 
   const formattedDate = formatDateTime(String(entry.timestamp), i18n.language);
 
   return (
-    <div className="px-4 py-2 pb-5 flex flex-col gap-3">
+    <div
+      data-history-entry-id={entry.id}
+      className="px-4 py-2 pb-5 flex flex-col gap-3"
+    >
       <div className="flex justify-between items-center">
         <p className="text-sm font-medium">{formattedDate}</p>
         <div className="flex items-center">
