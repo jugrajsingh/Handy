@@ -2,7 +2,10 @@ import React, { useEffect, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import { RefreshCcw } from "lucide-react";
 import { commands } from "@/bindings";
-import { providerGroupKey } from "@/lib/utils/localLlmPresentation";
+import {
+  promptControls,
+  providerGroupKey,
+} from "@/lib/utils/localLlmPresentation";
 
 import { Alert } from "../../ui/Alert";
 import {
@@ -451,9 +454,12 @@ export const PostProcessingSettings: React.FC = () => {
   const localModel = models.find(
     (m) => m.id === getSetting("local_llm_model_id"),
   );
-  const hidePrompts =
-    getSetting("post_process_provider_id") === LOCAL_LLM_PROVIDER_ID &&
-    (localModel?.prompt_style ?? "s1_control_line") === "s1_control_line";
+  const { hidePrompts } = promptControls(
+    getSetting("post_process_provider_id"),
+    localModel ?? null,
+    getSetting("post_process_prompts") ?? [],
+    getSetting("post_process_selected_prompt_id") ?? null,
+  );
 
   return (
     <div className="max-w-3xl w-full mx-auto space-y-6">

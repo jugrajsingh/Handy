@@ -15,6 +15,7 @@ import { useLocalLlmStatus } from "../../../hooks/useLocalLlmStatus";
 import { LocalLlmModelList } from "./LocalLlmModelList";
 import { createLocalLlmActions } from "./localLlmActions";
 import { isLocalLlmBusy } from "./localLlmRowActions";
+import { promptControls } from "@/lib/utils/localLlmPresentation";
 import {
   initializeLocalLlmDownloadProgress,
   useLocalLlmDownloadStore,
@@ -70,6 +71,12 @@ export const LocalLlmSettings: React.FC = () => {
   const selectedId = getSetting("local_llm_model_id") ?? null;
   const selected = models.find((m) => m.id === selectedId) ?? null;
   const error = downloadError ?? actionError ?? statusError;
+  const controls = promptControls(
+    getSetting("post_process_provider_id"),
+    selected,
+    getSetting("post_process_prompts") ?? [],
+    getSetting("post_process_selected_prompt_id") ?? null,
+  );
 
   const actions = createLocalLlmActions({
     isBusy: () =>
@@ -131,7 +138,13 @@ export const LocalLlmSettings: React.FC = () => {
         </Alert>
       )}
 
-      {selected?.prompt_style === "s1_control_line" && (
+      {controls.missingPrompt && (
+        <Alert variant="error" contained>
+          {t("settings.postProcessing.localLlm.promptRequired")}
+        </Alert>
+      )}
+
+      {controls.showS1Controls && (
         <>
           <SettingContainer
             title={t("settings.postProcessing.localLlm.styling.title")}

@@ -515,6 +515,7 @@
             "email": "Email"
           }
         },
+        "promptRequired": "Select a non-empty Handy prompt in the Prompts group. Until then, post-processing is skipped and the raw transcript is used.",
         "promptHidden": "This model uses its own fixed prompt and the Styling, Structure and Context settings above, so the prompt editor is hidden."
       }
     },
