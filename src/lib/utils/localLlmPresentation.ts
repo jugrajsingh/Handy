@@ -1,4 +1,9 @@
-import type { LocalLlmModelInfo, LocalLlmStatus, Result } from "@/bindings";
+import type {
+  LLMPrompt,
+  LocalLlmModelInfo,
+  LocalLlmStatus,
+  Result,
+} from "@/bindings";
 
 export function selectedDownloadedModel(
   models: LocalLlmModelInfo[],
@@ -101,5 +106,24 @@ export function createCleanupModelPickerActions(
         deps.setSelecting(false);
       }
     },
+  };
+}
+
+export function promptControls(
+  providerId: string | undefined,
+  model: Pick<LocalLlmModelInfo, "prompt_style"> | null,
+  prompts: LLMPrompt[],
+  selectedPromptId: string | null,
+): { hidePrompts: boolean; showS1Controls: boolean; missingPrompt: boolean } {
+  const local = providerId === "local_llm";
+  const s1 = local && model?.prompt_style === "s1_control_line";
+  const selected = prompts.find((prompt) => prompt.id === selectedPromptId);
+  return {
+    hidePrompts: s1,
+    showS1Controls: s1,
+    missingPrompt:
+      local &&
+      model?.prompt_style === "plain_system_prompt" &&
+      !selected?.prompt.replace(/\$\{output\}/gu, "").trim(),
   };
 }

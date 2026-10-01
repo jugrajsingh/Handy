@@ -250,3 +250,38 @@ assert.equal(
   "busy guard releases after completion",
 );
 console.log("localLlmPresentation: all assertions passed");
+
+const { promptControls } = await import("./localLlmPresentation");
+const prompts = [
+  { id: "p", name: "Prompt", prompt: "Return prose. ${output}" },
+];
+const plain = { ...model, prompt_style: "plain_system_prompt" as const };
+assert.deepEqual(promptControls("local_llm", model, prompts, "p"), {
+  hidePrompts: true,
+  showS1Controls: true,
+  missingPrompt: false,
+});
+assert.deepEqual(promptControls("local_llm", plain, prompts, "p"), {
+  hidePrompts: false,
+  showS1Controls: false,
+  missingPrompt: false,
+});
+for (const selected of [null, "missing"]) {
+  assert.equal(
+    promptControls("local_llm", plain, prompts, selected).missingPrompt,
+    true,
+  );
+}
+for (const text of ["", " \n\t ", " ${output} "]) {
+  assert.equal(
+    promptControls("local_llm", plain, [{ ...prompts[0], prompt: text }], "p")
+      .missingPrompt,
+    true,
+  );
+}
+assert.equal(promptControls("openai", model, prompts, "p").hidePrompts, false);
+assert.equal(
+  promptControls("local_llm", null, prompts, null).hidePrompts,
+  false,
+);
+console.log("promptControls: all assertions passed");
