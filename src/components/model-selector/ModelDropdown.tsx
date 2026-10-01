@@ -29,7 +29,7 @@ const ModelDropdown: React.FC<ModelDropdownProps> = ({
   };
 
   return (
-    <div className="absolute bottom-full start-0 mb-2 w-64 max-h-[60vh] overflow-y-auto bg-background border border-line rounded-lg shadow-lg py-2 z-50">
+    <div className="absolute bottom-full start-0 mb-2 w-80 max-w-[calc(100vw-2rem)] max-h-[60vh] overflow-y-auto bg-background border border-line rounded-lg shadow-lg py-2 z-50">
       {locked && (
         <div className="px-3 pb-2 mb-1 text-xs text-ink-2 border-b border-line">
           {t("modelSelector.lockedWhileTranscribing")}
@@ -60,9 +60,9 @@ const ModelDropdown: React.FC<ModelDropdownProps> = ({
                   : ""
               }`}
             >
-              <div className="flex items-center justify-between">
-                <div>
-                  <div className="text-sm text-text">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <div className="text-sm text-text break-words">
                     {getTranslatedModelName(model, t)}
                     {model.is_custom && (
                       <span className="ms-1.5 text-[10px] font-medium text-ink-3 uppercase">
@@ -78,9 +78,14 @@ const ModelDropdown: React.FC<ModelDropdownProps> = ({
                   <div className="text-xs text-ink-3 italic pe-4">
                     {getTranslatedModelDescription(model, t)}
                   </div>
+                  <div className="text-xs text-mid-gray">
+                    {t("modelSelector.size", {
+                      size: model.size_mb.toFixed(0),
+                    })}
+                  </div>
                 </div>
                 {currentModelId === model.id && (
-                  <div className="text-xs text-logo-primary">
+                  <div className="text-xs text-logo-primary shrink-0">
                     {t("modelSelector.active")}
                   </div>
                 )}

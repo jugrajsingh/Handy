@@ -48,7 +48,9 @@ export function cleanupPickerPresentation(
     visible: !!enabled && providerId === "local_llm",
     downloaded: models.filter((model) => model.downloaded),
     selected,
-    status: selected ? cleanupStatus(status) : ("none" as const),
+    status: selected
+      ? cleanupStatus(status?.model_id === selected.id ? status : null)
+      : ("none" as const),
   };
 }
 

@@ -1,4 +1,5 @@
 import React from "react";
+import { useTranslation } from "react-i18next";
 
 type ModelStatus =
   | "ready"
@@ -17,6 +18,7 @@ interface ModelStatusButtonProps {
   busy?: boolean;
   onClick: () => void;
   className?: string;
+  icon?: React.ReactNode;
 }
 
 const ModelStatusButton: React.FC<ModelStatusButtonProps> = ({
@@ -26,7 +28,9 @@ const ModelStatusButton: React.FC<ModelStatusButtonProps> = ({
   busy = false,
   onClick,
   className = "",
+  icon,
 }) => {
+  const { t } = useTranslation();
   const getStatusColor = (status: ModelStatus): string => {
     switch (status) {
       case "ready":
@@ -53,13 +57,20 @@ const ModelStatusButton: React.FC<ModelStatusButtonProps> = ({
   return (
     <button
       onClick={onClick}
-      className={`flex items-center gap-2 hover:text-text transition-colors ${className}`}
-      title={`Model status: ${displayText}`}
+      className={`flex w-full min-w-0 items-center gap-2 hover:text-text transition-colors ${className}`}
+      title={t("modelSelector.status", { modelName: displayText })}
     >
-      <div className={`w-2 h-2 rounded-full ${getStatusColor(status)}`} />
-      <span className="max-w-28 truncate">{displayText}</span>
+      {icon && (
+        <span aria-hidden className="shrink-0">
+          {icon}
+        </span>
+      )}
+      <div
+        className={`w-2 h-2 shrink-0 rounded-full ${getStatusColor(status)}`}
+      />
+      <span className="flex-1 min-w-0 truncate text-start">{displayText}</span>
       <svg
-        className={`w-3 h-3 transition-transform ${isDropdownOpen ? "rotate-180" : ""}`}
+        className={`w-3 h-3 shrink-0 transition-transform ${isDropdownOpen ? "rotate-180" : ""}`}
         fill="none"
         stroke="currentColor"
         viewBox="0 0 24 24"

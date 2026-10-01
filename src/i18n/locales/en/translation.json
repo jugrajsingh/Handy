@@ -314,6 +314,8 @@
     "alreadyAdded_other": "{{languages}} are already added."
   },
   "modelSelector": {
+    "status": "Model status: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Custom",
     "streaming": "Streaming",
     "active": "Active",
@@ -351,14 +353,14 @@
             "description": "The keyboard shortcut to record and transcribe your voice."
           },
           "transcribe_raw": {
-            "name": "Raw Transcript Shortcut"
+            "name": "Raw Shortcut"
           },
           "cancel": {
             "name": "Cancel Shortcut",
             "description": "The keyboard shortcut to cancel the current recording."
           },
           "transcribe_with_post_process": {
-            "name": "Clean Transcript Shortcut",
+            "name": "Post-processing Shortcut",
             "description": "Optional: A dedicated hotkey that always applies AI post-processing to your transcription."
           }
         },
@@ -705,7 +707,9 @@
         "createFirst": "Click 'Create New Prompt' above to create your first post-processing prompt."
       },
       "localLlm": {
-        "noCleanupModel": "No cleanup model",
+        "noCleanupModel": "No post-processing model",
+        "s1Description": "Uses styling, structure and context controls.",
+        "plainDescription": "Uses your selected Handy prompt.",
         "groupTitle": "Local model",
         "size": "{{size}} MiB",
         "downloaded": "Downloaded",
@@ -728,7 +732,7 @@
         },
         "styling": {
           "title": "Styling",
-          "description": "How formal the cleaned text reads.",
+          "description": "How formal the post-processed text reads.",
           "options": {
             "casual": "Casual",
             "semi_casual": "Semi-casual",
