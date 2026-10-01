@@ -1,4 +1,4 @@
-//! Built-in list of local text models. v1 ships one entry (S1-mini Q4_K_M).
+//! Built-in list of local text models pinned by revision, size and SHA-256.
 
 use std::path::{Path, PathBuf};
 
@@ -14,6 +14,7 @@ pub enum BackendKind {
 pub enum PromptStyle {
     /// S1-mini: fixed card system prompt, control line + transcript as the user turn.
     S1ControlLine,
+    PlainSystemPrompt,
 }
 
 /// One downloadable model file, pinned by revision, size and SHA-256.
@@ -45,7 +46,31 @@ pub const MODELS: &[ModelEntry] = &[ModelEntry {
     size_bytes: 484_219_808,
     prompt_style: PromptStyle::S1ControlLine,
     default_ctx: 4096,
-}];
+},
+ModelEntry {
+    id: "quill-0.8b-q4km", display_name: "Quill 0.8B",
+    attribution: "Quill by Quobi", card_url: "https://huggingface.co/Quobi/Quill",
+    backend: BackendKind::LlamaServer, file_name: "quill-0.8b-Q4_K_M.gguf",
+    url: "https://huggingface.co/Quobi/Quill/resolve/4cc2cc3c8e7ea9ee69126becd55be23a3a949899/quill-0.8b-Q4_K_M.gguf",
+    sha256: "aa54d6f6108d66e4b60a57bdc04ecca6e84e073504918a64b41ac4a0f816f16d", size_bytes: 529296832,
+    prompt_style: PromptStyle::PlainSystemPrompt, default_ctx: 4096,
+},
+ModelEntry {
+    id: "quill-2b-q4km", display_name: "Quill 2B",
+    attribution: "Quill by Quobi", card_url: "https://huggingface.co/Quobi/Quill",
+    backend: BackendKind::LlamaServer, file_name: "quill-2b-Q4_K_M.gguf",
+    url: "https://huggingface.co/Quobi/Quill/resolve/4cc2cc3c8e7ea9ee69126becd55be23a3a949899/quill-2b-Q4_K_M.gguf",
+    sha256: "b877a22b773d2aac40b3c642c24f1cbbb0b3f1d42cbd3c6eb936533719317196", size_bytes: 1274396096,
+    prompt_style: PromptStyle::PlainSystemPrompt, default_ctx: 4096,
+},
+ModelEntry {
+    id: "qwen3-4b-instruct-2507-q4km", display_name: "Qwen3-4B-Instruct-2507",
+    attribution: "Qwen by Alibaba, GGUF by Unsloth", card_url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF",
+    backend: BackendKind::LlamaServer, file_name: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+    sha256: "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597", size_bytes: 2497281120,
+    prompt_style: PromptStyle::PlainSystemPrompt, default_ctx: 4096,
+},];
 
 /// Looks up a registry entry by id.
 pub fn find(id: &str) -> Option<&'static ModelEntry> {
@@ -113,5 +138,50 @@ mod tests {
     #[test]
     fn unknown_id_is_not_found() {
         assert!(find("nope").is_none());
+    }
+
+    #[test]
+    fn ui_v21_entries_match_verified_metadata() {
+        let expected = [
+            (
+                "quill-0.8b-q4km",
+                "quill-0.8b-Q4_K_M.gguf",
+                529_296_832_u64,
+                "aa54d6f6108d66e4b60a57bdc04ecca6e84e073504918a64b41ac4a0f816f16d",
+            ),
+            (
+                "quill-2b-q4km",
+                "quill-2b-Q4_K_M.gguf",
+                1_274_396_096,
+                "b877a22b773d2aac40b3c642c24f1cbbb0b3f1d42cbd3c6eb936533719317196",
+            ),
+            (
+                "qwen3-4b-instruct-2507-q4km",
+                "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
+                2_497_281_120,
+                "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
+            ),
+        ];
+        assert_eq!(MODELS.len(), 4);
+        for (id, file, size, hash) in expected {
+            let entry = find(id).unwrap();
+            assert_eq!(entry.file_name, file);
+            assert_eq!(entry.size_bytes, size);
+            assert_eq!(entry.sha256, hash);
+            let (repo, revision) = if id == "qwen3-4b-instruct-2507-q4km" {
+                (
+                    "unsloth/Qwen3-4B-Instruct-2507-GGUF",
+                    "a06e946bb6b655725eafa393f4a9745d460374c9",
+                )
+            } else {
+                ("Quobi/Quill", "4cc2cc3c8e7ea9ee69126becd55be23a3a949899")
+            };
+            assert_eq!(
+                entry.url,
+                format!("https://huggingface.co/{repo}/resolve/{revision}/{file}")
+            );
+            assert_eq!(entry.prompt_style, PromptStyle::PlainSystemPrompt);
+            assert_eq!(entry.default_ctx, 4096);
+        }
     }
 }

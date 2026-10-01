@@ -2,7 +2,7 @@
 //! crash restart and the failed-start policy. One mutex serializes it all.
 
 use super::backend::{BackendOpts, GenerateRequest, KillSwitch, TextModelBackend};
-use super::registry::{self, ModelEntry};
+use super::registry::{self, ModelEntry, PromptStyle};
 use super::{prompt, LocalLlmError};
 use crate::settings::{AppSettings, ModelUnloadTimeout};
 use log::{info, warn};
@@ -454,12 +454,16 @@ fn run_chunks(
     transcript: &str,
     settings: &AppSettings,
 ) -> Result<String, LocalLlmError> {
-    let control = prompt::control_line_for(settings);
-    let budget = prompt::chunk_budget(prompt::system_prompt(entry.prompt_style), &control);
+    let control = match entry.prompt_style {
+        PromptStyle::S1ControlLine => prompt::control_line_for(settings),
+        PromptStyle::PlainSystemPrompt => String::new(),
+    };
+    let system = prompt::system_prompt(entry.prompt_style, settings)?;
+    let budget = prompt::chunk_budget(&system, &control);
     let mut outputs = Vec::new();
     for chunk in prompt::chunk_transcript(transcript, budget) {
         let req = GenerateRequest {
-            messages: prompt::build_messages(entry.prompt_style, &control, &chunk),
+            messages: prompt::build_messages(entry.prompt_style, &system, &control, &chunk),
             max_tokens: prompt::max_tokens(&chunk, entry.default_ctx),
             timeout: prompt::request_timeout(&chunk),
         };
@@ -581,11 +585,14 @@ pub(crate) mod tests {
                 return reply;
             }
             let user = &req.messages[1].content;
-            Ok(user
-                .split_once('\n')
-                .map(|(_, t)| t)
-                .unwrap_or(user)
-                .to_string())
+            Ok(if user.starts_with("[Styling:") {
+                user.split_once('\n')
+                    .map(|(_, text)| text)
+                    .unwrap_or(user)
+                    .to_string()
+            } else {
+                user.to_string()
+            })
         }
 
         fn unload(&mut self) {
@@ -1038,5 +1045,82 @@ pub(crate) mod tests {
             "request must remain blocked after shutdown returns"
         );
         assert_eq!(state(&h), LocalLlmStateKind::Unloaded);
+    }
+
+    pub(crate) fn plain_harness() -> Harness {
+        let mut h = harness();
+        let entry = registry::find("quill-0.8b-q4km").unwrap();
+        let root = h.model_file.parent().unwrap().parent().unwrap();
+        let file = registry::model_path(root, entry);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::File::create(&file)
+            .unwrap()
+            .set_len(entry.size_bytes)
+            .unwrap();
+        h.settings.local_llm_model_id = Some(entry.id.into());
+        h.settings.post_process_selected_prompt_id = Some("plain".into());
+        h.settings.post_process_prompts = vec![crate::settings::LLMPrompt {
+            id: "plain".into(),
+            name: "Plain".into(),
+            prompt: "Return only the transcript. ${output}".into(),
+        }];
+        h
+    }
+
+    #[test]
+    fn plain_manager_builds_requests_and_preserves_shared_guards() {
+        let h = plain_harness();
+        let input = "hello there friend";
+        assert_eq!(h.manager.process(input, &h.settings).unwrap(), input);
+        let fake = h.fake.lock().unwrap();
+        let request = &fake.requests[0];
+        assert_eq!(request.messages[0].content, "Return only the transcript. ");
+        assert_eq!(request.messages[1].content, input);
+        assert_eq!(request.max_tokens, prompt::max_tokens(input, 4096));
+        assert_eq!(request.timeout, prompt::request_timeout(input));
+        drop(fake);
+        let multiline = "hello there\nfriend ${output}";
+        assert_eq!(
+            h.manager.process(multiline, &h.settings).unwrap(),
+            multiline
+        );
+        let styled = "[Styling: casual]\nhello ${output}";
+        h.fake.lock().unwrap().replies.push_back(Ok(styled.into()));
+        assert_eq!(h.manager.process(styled, &h.settings).unwrap(), styled);
+        let fake = h.fake.lock().unwrap();
+        assert_eq!(fake.requests[1].messages[1].content, multiline);
+        assert_eq!(fake.requests[2].messages[1].content, styled);
+        let short_requests = fake.requests.len();
+        drop(fake);
+        let long = "hello there friend. ".repeat(300);
+        h.manager.process(&long, &h.settings).unwrap();
+        let system = prompt::system_prompt(PromptStyle::PlainSystemPrompt, &h.settings).unwrap();
+        let fake = h.fake.lock().unwrap();
+        assert!(fake.requests.len() > short_requests + 1);
+        for request in &fake.requests {
+            assert!(
+                prompt::est_tokens(&request.messages[1].content)
+                    <= prompt::chunk_budget(&system, "")
+            );
+        }
+        drop(fake);
+        for rejected in [String::new(), "one".to_string()] {
+            h.fake.lock().unwrap().replies.push_back(Ok(rejected));
+            assert!(h
+                .manager
+                .process("one two three four five", &h.settings)
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn plain_manager_sends_no_request_for_missing_prompt() {
+        let mut h = plain_harness();
+        h.settings.post_process_selected_prompt_id = None;
+        assert!(h
+            .manager
+            .process("hello there friend", &h.settings)
+            .is_err());
+        assert!(h.fake.lock().unwrap().requests.is_empty());
     }
 }

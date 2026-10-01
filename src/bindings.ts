@@ -1211,7 +1211,7 @@ export type PromptStyle =
 /**
  * S1-mini: fixed card system prompt, control line + transcript as the user turn.
  */
-"s1_control_line"
+"s1_control_line" | "plain_system_prompt"
 export type RecordingRetentionPeriod = "never" | "preserve_limit" | "days_3" | "weeks_2" | "months_3"
 export type SecretMap = Partial<{ [key in string]: string }>
 export type SecureInputStatus = { 
