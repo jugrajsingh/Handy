@@ -5,7 +5,7 @@
     "openvino": "2026.4.1-22982-e213a147257-releases/2026/4",
     "gpu_driver": "intel-compute-runtime-26.22.38646.6-4.fc44.x86_64; intel-level-zero-26.22.38646.6-4.fc44.x86_64",
     "npu_driver": "Intel user-space NPU 1.38.0; oneapi-level-zero-1.28.6-1.fc44.x86_64",
-    "date": "2026-10-02T00:43:58.633341+00:00"
+    "date": "2026-10-06T20:31:08.744215+00:00"
   },
   "models": {
     "pocket-en": {
@@ -20,12 +20,12 @@
             "text_conditioner": "cpu"
           },
           "recommended": true,
-          "first_audio_p95_s": 1.344951961,
-          "rtf_1x": 0.24016999303571432,
-          "rtf_2x": 0.6050285814102564,
-          "load_s_cold": 0.566832067,
-          "load_s_cached": 0.433833059,
-          "speed_score": 4.449620358972433
+          "first_audio_p95_s": 2.2180399829999997,
+          "rtf_1x": 0.23046968977941176,
+          "rtf_2x": 0.5289569901397515,
+          "load_s_cold": 0.641498907,
+          "load_s_cached": 0.424317428,
+          "speed_score": 3.7231650210699607
         },
         "npu": {
           "supported": false,
@@ -47,12 +47,12 @@
             "text_conditioner": "gpu"
           },
           "recommended": false,
-          "first_audio_p95_s": 2.025758211,
-          "rtf_1x": 0.32464073894230766,
-          "rtf_2x": 0.7188243266666666,
-          "load_s_cold": 1.138665897,
-          "load_s_cached": 0.565087251,
-          "speed_score": 3.3621848685057625
+          "first_audio_p95_s": 1.97383417,
+          "rtf_1x": 0.2640407231104651,
+          "rtf_2x": 0.6041499943113773,
+          "load_s_cold": 1.066387172,
+          "load_s_cached": 0.518169893,
+          "speed_score": 3.7067769175419727
         }
       }
     },
@@ -68,12 +68,12 @@
             "vocoder": "cpu"
           },
           "recommended": false,
-          "first_audio_p95_s": 1.237605602,
-          "rtf_1x": 0.18285324063571454,
-          "rtf_2x": 0.2195773040286664,
-          "load_s_cold": 0.487908204,
-          "load_s_cached": 0.450072963,
-          "speed_score": 4.981320217007145
+          "first_audio_p95_s": 1.486701772,
+          "rtf_1x": 0.15883518713595843,
+          "rtf_2x": 0.16805138384053103,
+          "load_s_cold": 0.533943826,
+          "load_s_cached": 0.343987589,
+          "speed_score": 4.899818455790874
         },
         "npu": {
           "supported": true,
@@ -84,12 +84,12 @@
             "vocoder": "npu"
           },
           "recommended": true,
-          "first_audio_p95_s": 0.649209776,
-          "rtf_1x": 0.12986701089260577,
-          "rtf_2x": 0.25490083205266206,
-          "load_s_cold": 19.439732913,
-          "load_s_cached": 0.99015986,
-          "speed_score": 6.499390484222456
+          "first_audio_p95_s": 1.108219434,
+          "rtf_1x": 0.03634635917781191,
+          "rtf_2x": 0.06702037713992413,
+          "load_s_cold": 19.321401448,
+          "load_s_cached": 0.961517946,
+          "speed_score": 7.530080053373441
         },
         "gpu": {
           "supported": true,
@@ -100,12 +100,12 @@
             "vocoder": "gpu"
           },
           "recommended": false,
-          "first_audio_p95_s": 1.444336378,
-          "rtf_1x": 0.18768726243385306,
-          "rtf_2x": 0.10829180608964313,
-          "load_s_cold": 2.311364632,
-          "load_s_cached": 0.566786237,
-          "speed_score": 4.699933036456997
+          "first_audio_p95_s": 4.113096053,
+          "rtf_1x": 0.05175658181987995,
+          "rtf_2x": 0.06784799647727717,
+          "load_s_cold": 2.215045915,
+          "load_s_cached": 0.49970528,
+          "speed_score": 4.947226408483456
         }
       }
     },
@@ -118,12 +118,12 @@
             "model_quantized": "cpu"
           },
           "recommended": true,
-          "first_audio_p95_s": 5.593187254,
-          "rtf_1x": 0.5656138973076923,
-          "rtf_2x": 0.5616113555932204,
-          "load_s_cold": 2.898639221,
-          "load_s_cached": 2.682138262,
-          "speed_score": 0.9481712252637695
+          "first_audio_p95_s": 7.084963763,
+          "rtf_1x": 0.6594128406021506,
+          "rtf_2x": 0.5678828482213438,
+          "load_s_cold": 2.81667762,
+          "load_s_cached": 2.598315797,
+          "speed_score": 0.6121454132866768
         },
         "npu": {
           "supported": false,

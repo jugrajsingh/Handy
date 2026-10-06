@@ -28,8 +28,8 @@ fn main() -> Result<()> {
     }
     if args.first().is_some_and(|a| a == "--measure-matrix") {
         anyhow::ensure!(
-            args.len() == 6,
-            "matrix measurement needs model, root, device, cache and corpus"
+            args.len() == 8 && args[6] == "--first-audio-inputs",
+            "matrix measurement needs model, root, device, cache, corpus and --first-audio-inputs directory"
         );
         handy_tts::initialize_run_options()?;
         let device = match args[3].as_str() {
@@ -44,6 +44,7 @@ fn main() -> Result<()> {
             device,
             std::path::Path::new(&args[4]),
             std::path::Path::new(&args[5]),
+            std::path::Path::new(&args[7]),
         );
     }
     if args.first().is_some_and(|a| a == "--measure-once") {

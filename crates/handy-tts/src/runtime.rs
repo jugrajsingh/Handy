@@ -87,7 +87,7 @@ pub fn memory_available() -> Result<u64> {
 }
 
 /// Retries over-cap NPU inputs as ordered word-boundary parts with bounded PCM.
-fn synthesize_bounded(
+pub(crate) fn synthesize_bounded(
     engine: &mut dyn SynthEngine,
     text: &str,
     speed: Option<f32>,
