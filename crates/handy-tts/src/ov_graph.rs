@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+use handy_tts_core::device::Device;
 use openvino::{Core, DeviceType, InferRequest, PartialShape, RwPropertyKey, Tensor};
 use std::{collections::BTreeMap, path::Path, time::Instant};
 #[derive(Debug)]
@@ -22,6 +23,7 @@ pub struct Graph {
     pub info: GraphInfo,
     request: InferRequest,
     compiled: openvino::CompiledModel,
+    device: Device,
     _core: Core,
 }
 impl Graph {
@@ -129,6 +131,11 @@ impl Graph {
             },
             request,
             compiled,
+            device: match device {
+                "GPU" => Device::Gpu,
+                "NPU" => Device::Npu,
+                _ => Device::Cpu,
+            },
             _core: core,
         })
     }
@@ -140,9 +147,11 @@ impl Graph {
                 .set_tensor(name, tensor)
                 .context("set graph input tensor")?;
         }
-        if let Err(error) =
-            crate::cancellation::drive(&mut self.request, &crate::cancellation::CANCELLED)
-        {
+        if let Err(error) = crate::cancellation::drive(
+            &mut self.request,
+            &crate::cancellation::CANCELLED,
+            self.device,
+        ) {
             self.request = self
                 .compiled
                 .create_infer_request()

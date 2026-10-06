@@ -1,4 +1,5 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
+use handy_tts_core::device::Device;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 pub static CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -11,21 +12,50 @@ pub trait AsyncRequest {
     fn wait(&mut self) -> Result<Wait>;
     fn cancel(&mut self) -> Result<()>;
 }
-pub fn drive(request: &mut impl AsyncRequest, cancelled: &AtomicBool) -> Result<()> {
+
+#[derive(Debug, PartialEq, Eq)]
+enum Strategy {
+    Cancel,
+    Drain,
+}
+
+fn strategy(device: Device) -> Strategy {
+    match device {
+        Device::Cpu | Device::Gpu => Strategy::Cancel,
+        Device::Npu => Strategy::Drain,
+    }
+}
+
+fn infer_cancelled() -> anyhow::Error {
+    openvino::InferenceError {
+        kind: openvino::InferenceErrorKind::InferCancelled,
+        message: None,
+    }
+    .into()
+}
+
+/// Drives one request, draining cancelled NPU inference before discarding its output.
+pub fn drive(
+    request: &mut impl AsyncRequest,
+    cancelled: &AtomicBool,
+    device: Device,
+) -> Result<()> {
     if cancelled.load(Ordering::Acquire) {
-        bail!("cancelled");
+        return Err(infer_cancelled());
     }
     request.start()?;
     loop {
         if cancelled.load(Ordering::Acquire) {
-            request.cancel()?;
+            if strategy(device) == Strategy::Cancel {
+                request.cancel()?;
+            }
             while matches!(request.wait(), Ok(Wait::Pending)) {}
-            bail!("cancelled");
+            return Err(infer_cancelled());
         }
         match request.wait()? {
             Wait::Ready => {
                 if cancelled.load(Ordering::Acquire) {
-                    bail!("cancelled");
+                    return Err(infer_cancelled());
                 }
                 return Ok(());
             }
@@ -87,9 +117,37 @@ mod tests {
             waits: 0,
             cancels: 0,
         };
-        assert!(drive(&mut fake, &flag).is_err());
+        assert!(drive(&mut fake, &flag, Device::Gpu).is_err());
         assert_eq!((fake.starts, fake.waits, fake.cancels), (1, 2, 1));
-        assert!(drive(&mut fake, &flag).is_err());
+        assert!(drive(&mut fake, &flag, Device::Gpu).is_err());
         assert_eq!(fake.starts, 1);
+    }
+
+    #[test]
+    fn npu_cancellation_drains_and_discards_without_backend_cancel() {
+        let flag = AtomicBool::new(false);
+        let mut fake = Fake {
+            flag: &flag,
+            starts: 0,
+            waits: 0,
+            cancels: 0,
+        };
+        let result = drive(&mut fake, &flag, Device::Npu);
+        assert_eq!((fake.starts, fake.waits, fake.cancels), (1, 2, 0));
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<openvino::InferenceError>()
+                .unwrap()
+                .kind,
+            openvino::InferenceErrorKind::InferCancelled
+        );
+    }
+
+    #[test]
+    fn device_selects_cancellation_strategy_without_matching_errors() {
+        assert_eq!(strategy(Device::Cpu), Strategy::Cancel);
+        assert_eq!(strategy(Device::Gpu), Strategy::Cancel);
+        assert_eq!(strategy(Device::Npu), Strategy::Drain);
     }
 }
