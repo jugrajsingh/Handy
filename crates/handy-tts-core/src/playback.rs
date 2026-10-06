@@ -39,6 +39,8 @@ pub struct Playback<B: Output> {
     pub fallback_reported: bool,
     current: Option<(usize, Pcm, u32)>,
     pending_fallback: bool,
+    paused: bool,
+    replay_pending: bool,
 }
 impl<B: Output> Playback<B> {
     pub fn new(
@@ -46,7 +48,10 @@ impl<B: Output> Playback<B> {
         tts: Option<&str>,
         handy: Option<&str>,
     ) -> Result<Self, PlaybackError> {
-        let (selected, fallback) = resolve_output(tts, handy, &output.names()?);
+        let (selected, fallback) = match output.names() {
+            Ok(names) => resolve_output(tts, handy, &names),
+            Err(_) => (None, true),
+        };
         let fell_back = if output.open(selected.as_deref()).is_ok() {
             fallback
         } else {
@@ -58,15 +63,24 @@ impl<B: Output> Playback<B> {
             fallback_reported: false,
             current: None,
             pending_fallback: fell_back,
+            paused: false,
+            replay_pending: false,
         })
     }
     pub fn reopen(&mut self, tts: Option<&str>, handy: Option<&str>) -> Result<(), PlaybackError> {
-        self.stop();
-        let (selected, fallback) = resolve_output(tts, handy, &self.output.names()?);
-        self.pending_fallback = fallback;
+        self.output.stop();
+        self.replay_pending = self.current.is_some();
+        let (selected, fallback) = match self.output.names() {
+            Ok(names) => resolve_output(tts, handy, &names),
+            Err(_) => (None, true),
+        };
+        self.pending_fallback |= fallback;
         if self.output.open(selected.as_deref()).is_err() {
             self.output.open(None)?;
             self.pending_fallback = true;
+        }
+        if self.paused {
+            self.output.pause();
         }
         Ok(())
     }
@@ -77,9 +91,22 @@ impl<B: Output> Playback<B> {
             self.pending_fallback = true;
         }
         self.current = Some((index, pcm, pause_ms));
+        self.replay_pending = false;
+        if self.paused {
+            self.output.pause();
+        }
         Ok(())
     }
     pub fn poll(&mut self) -> Result<Poll, PlaybackError> {
+        if self.replay_pending {
+            if self.paused {
+                return Ok(Poll::Playing);
+            }
+            if let Some((_, pcm, pause)) = &self.current {
+                self.output.play(pcm.clone(), *pause)?;
+            }
+            self.replay_pending = false;
+        }
         match self.output.poll() {
             Poll::Finished => {
                 self.current = None;
@@ -87,11 +114,17 @@ impl<B: Output> Playback<B> {
             }
             Poll::Playing => Ok(Poll::Playing),
             Poll::DeviceLost => {
+                self.replay_pending = self.current.is_some();
                 self.output.stop();
                 self.output.open(None)?;
                 self.pending_fallback = true;
-                if let Some((_, pcm, pause)) = &self.current {
+                if self.paused {
+                    self.output.pause();
+                } else if let Some((_, pcm, pause)) = &self.current {
                     self.output.play(pcm.clone(), *pause)?;
+                }
+                if !self.paused {
+                    self.replay_pending = false;
                 }
                 Ok(Poll::Playing)
             }
@@ -110,14 +143,18 @@ impl<B: Output> Playback<B> {
         self.current.as_ref().map(|(index, _, _)| *index)
     }
     pub fn pause(&mut self) {
+        self.paused = true;
         self.output.pause();
     }
     pub fn resume(&mut self) {
+        self.paused = false;
         self.output.resume();
     }
     pub fn stop(&mut self) {
         self.output.stop();
         self.current = None;
+        self.replay_pending = false;
+        self.paused = false;
     }
 }
 
@@ -132,15 +169,21 @@ mod tests {
         lost: bool,
         default_missing: bool,
         stops: usize,
+        paused: bool,
+        names_failed: bool,
     }
     impl Output for Fake {
         fn names(&self) -> Result<Vec<String>, PlaybackError> {
+            if self.names_failed {
+                return Err(PlaybackError::Unavailable);
+            }
             Ok(self.names.clone())
         }
         fn open(&mut self, name: Option<&str>) -> Result<(), PlaybackError> {
             if name.is_none() && self.default_missing {
                 return Err(PlaybackError::Unavailable);
             }
+            self.paused = false;
             self.opened.push(name.map(String::from));
             Ok(())
         }
@@ -156,8 +199,12 @@ mod tests {
                 Poll::Playing
             }
         }
-        fn pause(&mut self) {}
-        fn resume(&mut self) {}
+        fn pause(&mut self) {
+            self.paused = true;
+        }
+        fn resume(&mut self) {
+            self.paused = false;
+        }
         fn stop(&mut self) {
             self.stops += 1;
         }
@@ -224,5 +271,65 @@ mod tests {
         playback.output.lost = true;
         assert_eq!(playback.poll(), Err(PlaybackError::Unavailable));
         assert_eq!(playback.current_index(), Some(9));
+    }
+    fn chunk() -> Pcm {
+        Pcm {
+            id: 7,
+            sample_rate: 24000,
+            samples: vec![0.0; 24],
+        }
+    }
+
+    #[test]
+    fn device_loss_while_paused_defers_replay_until_resume() {
+        let mut p = Playback::new(Fake::default(), None, None).unwrap();
+        p.play(7, chunk(), 100).unwrap();
+        p.pause();
+        p.output.lost = true;
+        assert_eq!(p.poll(), Ok(Poll::Playing));
+        assert_eq!(p.output.played, [7]);
+        assert!(p.output.paused);
+        assert_eq!(p.current_index(), Some(7));
+        p.poll().unwrap();
+        assert_eq!(p.output.played, [7]);
+        p.resume();
+        p.poll().unwrap();
+        assert_eq!(p.output.played, [7, 7]);
+        assert!(!p.output.paused);
+    }
+
+    #[test]
+    fn enumeration_failure_uses_default_and_reports_once() {
+        let fake = Fake {
+            names_failed: true,
+            ..Fake::default()
+        };
+        let mut p = Playback::new(fake, Some("Bluetooth"), None).unwrap();
+        assert_eq!(p.output.opened, [None]);
+        assert!(p.take_fallback());
+        assert!(!p.take_fallback());
+        p.reopen(Some("Bluetooth"), None).unwrap();
+        assert_eq!(p.output.opened, [None, None]);
+        assert!(!p.take_fallback());
+        let mut p = Playback::new(Fake::default(), None, None).unwrap();
+        p.output.names_failed = true;
+        p.reopen(Some("Bluetooth"), None).unwrap();
+        assert!(p.take_fallback());
+        assert!(!p.take_fallback());
+    }
+
+    #[test]
+    fn reopen_preserves_current_chunk_and_unreported_fallback() {
+        let mut p = Playback::new(Fake::default(), Some("Gone"), None).unwrap();
+        p.play(7, chunk(), 100).unwrap();
+        p.reopen(Some("Default"), None).unwrap();
+        assert_eq!(p.current_index(), Some(7));
+        assert!(p.take_fallback());
+        assert!(!p.take_fallback());
+        p.poll().unwrap();
+        assert_eq!(p.output.played, [7, 7]);
+        p.output.default_missing = true;
+        assert_eq!(p.reopen(None, None), Err(PlaybackError::Unavailable));
+        assert_eq!(p.current_index(), Some(7));
     }
 }
