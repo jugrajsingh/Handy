@@ -10,22 +10,49 @@ export interface SelectionDependencies {
   select: (selection: TtsSelection) => Promise<void>;
   refresh: () => Promise<void>;
   error: (key: string) => void;
+  display?: (selection: TtsSelection) => void;
 }
 export function selectionEntries(dependencies: SelectionDependencies) {
-  let pending = false;
-  const choose = async (selection: TtsSelection) => {
-    if (pending) return;
-    pending = true;
+  let pending: Promise<void> | null = null;
+  let queued: TtsSelection | null = null;
+  let desired: TtsSelection | null = null;
+  let failed = false;
+  const drain = async () => {
     try {
-      await dependencies.select(selection);
-      await dependencies.refresh();
-    } catch {
-      dependencies.error("tts.errors.selection");
+      while (queued !== null) {
+        const selection = queued;
+        queued = null;
+        try {
+          await dependencies.select(selection);
+          await dependencies.refresh();
+          failed = false;
+        } catch {
+          failed = true;
+          dependencies.error("tts.errors.selection");
+        }
+      }
     } finally {
-      pending = false;
+      pending = null;
     }
   };
-  return { settings: choose, tray: choose };
+  const choose = (selection: TtsSelection) => {
+    desired = { ...selection };
+    queued = desired;
+    dependencies.display?.(desired);
+    pending ??= drain();
+    return pending;
+  };
+  return {
+    settings: choose,
+    tray: choose,
+    edit: (patch: Partial<TtsSelection>, fallback: TtsSelection) =>
+      choose({ ...(desired ?? fallback), ...patch }),
+    sync: (selection: TtsSelection) => {
+      if (pending || failed) return;
+      desired = { ...selection };
+      dependencies.display?.(desired);
+    },
+  };
 }
 export interface TtsRowModel {
   id: string;
@@ -64,6 +91,118 @@ export function rowActions(
     },
     delete: () => {
       if (canDelete) callbacks.delete(model.id);
+    },
+  };
+}
+
+export interface TtsDownloadProgress {
+  model_id: string;
+  downloaded_bytes: number;
+  total_bytes: number;
+}
+export interface DownloadSnapshot {
+  active: readonly string[];
+  progress: Record<string, TtsDownloadProgress>;
+  error: string | null;
+}
+export interface DownloadDependencies {
+  query: () => Promise<readonly string[]>;
+  watch: (listener: (progress: TtsDownloadProgress) => void) => Promise<void>;
+  download: (id: string) => Promise<void>;
+  cancel: (id: string) => Promise<void>;
+}
+export function downloadController(dependencies: DownloadDependencies) {
+  let state: DownloadSnapshot = { active: [], progress: {}, error: null };
+  const subscribers = new Set<() => void>();
+  const jobs = new Set<string>();
+  const finished = new Set<string>();
+  let watching = false;
+  let revision = 0;
+  const publish = (next: DownloadSnapshot) => {
+    state = next;
+    revision++;
+    subscribers.forEach((listener) => listener());
+  };
+  const error = (reason: unknown) => {
+    publish({
+      ...state,
+      error:
+        reason instanceof Error && reason.message.startsWith("tts.errors.")
+          ? reason.message
+          : "tts.errors.generic",
+    });
+  };
+  const refresh = async () => {
+    const before = revision;
+    try {
+      const backend = await dependencies.query();
+      if (before !== revision) return;
+      backend.forEach((id) => finished.delete(id));
+      const active = [...new Set([...backend, ...jobs])];
+      state.active.forEach((id) => {
+        if (!active.includes(id)) finished.add(id);
+      });
+      publish({
+        ...state,
+        active,
+        progress: Object.fromEntries(
+          Object.entries(state.progress).filter(([id]) => active.includes(id)),
+        ),
+      });
+    } catch (reason) {
+      error(reason);
+    }
+  };
+  return {
+    snapshot: () => state,
+    refresh,
+    subscribe: (listener: () => void) => {
+      subscribers.add(listener);
+      if (!watching) {
+        watching = true;
+        void dependencies
+          .watch((progress) => {
+            if (finished.has(progress.model_id)) return;
+            publish({
+              ...state,
+              active: [...new Set([...state.active, progress.model_id])],
+              progress: { ...state.progress, [progress.model_id]: progress },
+            });
+          })
+          .catch(error);
+      }
+      void refresh();
+      return () => {
+        subscribers.delete(listener);
+      };
+    },
+    download: async (id: string) => {
+      if (state.active.length > 0) return;
+      jobs.add(id);
+      finished.delete(id);
+      publish({ ...state, active: [id], progress: {}, error: null });
+      try {
+        await dependencies.download(id);
+      } catch (reason) {
+        error(reason);
+      } finally {
+        jobs.delete(id);
+        finished.add(id);
+        const progress = { ...state.progress };
+        delete progress[id];
+        publish({
+          ...state,
+          active: state.active.filter((model) => model !== id),
+          progress,
+        });
+      }
+    },
+    cancel: async (id: string) => {
+      try {
+        await dependencies.cancel(id);
+      } catch (reason) {
+        error(reason);
+      }
     },
   };
 }

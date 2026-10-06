@@ -28,7 +28,9 @@ const model: TtsModelInfo = {
   card_url: "https://huggingface.co/kyutai/pocket-tts",
   size_bytes: 295738958,
   voices: ["alba"],
+  default_voice: "alba",
   downloaded: true,
+  downloading: false,
   npu_driver_too_old: false,
   active: true,
   rating: {

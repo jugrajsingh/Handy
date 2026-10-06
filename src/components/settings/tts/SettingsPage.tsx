@@ -15,6 +15,7 @@ export function SettingsPage() {
   } = useSettings();
   const [models, setModels] = useState<TtsModelInfo[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Selection | null>(null);
   useEffect(() => {
     let alive = true;
     void commands
@@ -47,22 +48,32 @@ export function SettingsPage() {
         },
         refresh: refreshSettingsChecked,
         error: setError,
+        display: setDraft,
       }),
     [refreshSettingsChecked],
   );
-  if (!settings) return null;
-  const id = settings.tts_model_id ?? "pocket-en";
+  const persisted = useMemo<Selection | null>(() => {
+    if (!settings) return null;
+    const id = settings.tts_model_id ?? "pocket-en";
+    const model = models.find((row) => row.id === id);
+    return {
+      model_id: id,
+      voice: settings.tts_voice?.[id] ?? model?.default_voice ?? "alba",
+      speed: settings.tts_speed ?? 1,
+      pitch: settings.tts_pitch_semitones ?? 0,
+      output_device: settings.tts_output_device ?? null,
+      read_code: settings.tts_read_code_blocks ?? false,
+    };
+  }, [settings, models]);
+  useEffect(() => {
+    if (persisted) choose.sync(persisted);
+  }, [choose, persisted]);
+  if (!persisted) return null;
+  const selected = draft ?? persisted;
+  const id = selected.model_id;
   const model = models.find((row) => row.id === id);
-  const selected: Selection = {
-    model_id: id,
-    voice: settings.tts_voice?.[id] ?? model?.voices[0] ?? "alba",
-    speed: settings.tts_speed ?? 1,
-    pitch: settings.tts_pitch_semitones ?? 0,
-    output_device: settings.tts_output_device ?? null,
-    read_code: settings.tts_read_code_blocks ?? false,
-  };
   const change = (patch: Partial<Selection>) =>
-    void choose.settings({ ...selected, ...patch });
+    void choose.edit(patch, selected);
   return (
     <section className="w-full max-w-3xl flex flex-col gap-4">
       <h2>{t("tts.settingsTitle")}</h2>
@@ -72,11 +83,12 @@ export function SettingsPage() {
         <select
           value={id}
           onChange={(event) => {
-            void commands
-              .setTtsModel(event.target.value)
-              .then(unwrapTts)
-              .then(refreshSettingsChecked)
-              .catch(() => setError("tts.errors.selection"));
+            const next = models.find((row) => row.id === event.target.value);
+            if (next)
+              change({
+                model_id: next.id,
+                voice: settings?.tts_voice?.[next.id] ?? next.default_voice,
+              });
           }}
         >
           {models

@@ -23,7 +23,9 @@ pub struct TtsModelInfo {
     pub card_url: String,
     pub size_bytes: u64,
     pub voices: Vec<String>,
+    pub default_voice: String,
     pub downloaded: bool,
+    pub downloading: bool,
     pub active: bool,
     pub rating: ModelRating,
     pub run_on: RunOn,
@@ -48,6 +50,7 @@ pub async fn get_tts_models(
         let ready = service.ready()?;
         let settings = crate::settings::get_settings(&app);
         let snapshot = ready.manager.snapshot();
+        let downloads = active_downloads(&service.cancellations);
         catalog::entries()
             .map_err(|e| e.to_string())?
             .iter()
@@ -66,7 +69,9 @@ pub async fn get_tts_models(
                     card_url: entry.card.into(),
                     size_bytes: entry.bytes,
                     voices: entry.voices.iter().map(|voice| voice.to_string()).collect(),
+                    default_voice: entry.default_voice.into(),
                     downloaded: download::is_downloaded(&ready.root, entry),
+                    downloading: downloads.contains(entry.id),
                     active: entry.id == settings.tts_model_id,
                     rating,
                     run_on: settings
@@ -376,6 +381,15 @@ struct DownloadOwnership<'a> {
     map: &'a std::sync::Mutex<std::collections::BTreeMap<String, Arc<AtomicBool>>>,
     model: &'a str,
 }
+fn active_downloads(
+    map: &std::sync::Mutex<std::collections::BTreeMap<String, Arc<AtomicBool>>>,
+) -> std::collections::BTreeSet<String> {
+    map.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .keys()
+        .cloned()
+        .collect()
+}
 impl<'a> DownloadOwnership<'a> {
     fn claim(
         map: &'a std::sync::Mutex<std::collections::BTreeMap<String, Arc<AtomicBool>>>,
@@ -402,6 +416,18 @@ impl Drop for DownloadOwnership<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn download_snapshot_tracks_backend_ownership_until_job_settles() {
+        let map = std::sync::Mutex::new(std::collections::BTreeMap::new());
+        assert!(active_downloads(&map).is_empty());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let job = DownloadOwnership::claim(&map, "pocket-en", cancel.clone()).unwrap();
+        assert!(active_downloads(&map).contains("pocket-en"));
+        cancel.store(true, Ordering::Release);
+        assert!(active_downloads(&map).contains("pocket-en"));
+        drop(job);
+        assert!(active_downloads(&map).is_empty());
+    }
     #[test]
     fn second_download_cannot_steal_cancel_ownership_and_error_drop_releases_it() {
         let map = std::sync::Mutex::new(std::collections::BTreeMap::new());
