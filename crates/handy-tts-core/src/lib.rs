@@ -1,7 +1,9 @@
 pub mod catalog;
 pub mod device;
 pub mod download;
+pub mod dsp;
 pub mod memory;
+pub mod playback;
 pub mod protocol;
 pub mod selection_options;
 pub mod text;
