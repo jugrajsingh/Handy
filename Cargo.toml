@@ -1,0 +1,56 @@
+[workspace]
+members = ["src-tauri", "crates/handy-tts-core"]
+default-members = ["src-tauri"]
+resolver = "2"
+
+[workspace.dependencies]
+specta = { version = "=2.0.0-rc.22", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ort = "=2.0.0-rc.12"
+ndarray = "0.17"
+rand = "0.8"
+rand_distr = "0.4"
+regex = "1"
+unicode-normalization = "0.1"
+sentencepiece-rs = "=0.2.2"
+misaki-rs = { version = "=0.3.0", default-features = false }
+signalsmith-stretch = "=0.1.3"
+openvino = { version = "=0.11.0", features = ["runtime-linking"] }
+openvino-sys = { version = "=0.11.0", features = ["runtime-linking"] }
+
+[workspace.lints.clippy]
+allow_attributes_without_reason = "warn"
+
+# TEMPORARY: tao pinned past 0.35.3 for the Wayland client-side-decorations fix
+# (tao #1218, fixes tauri #11856 - dead titlebar buttons after visible(false) →
+# show()). Drop this once a tao release containing it lands in tauri.
+#
+# The rev is a cjpais/tao branch, not upstream: dev past 0.35.3 also carries
+# tao #1231 (removed window subclassing), which left the thread event target's
+# WNDPROC falling through to DefSubclassProc. On a no-longer-subclassed window
+# that returns 0, so WM_QUERYENDSESSION answered FALSE and vetoed Windows
+# shutdown (Handy #1710). `handy` = 07f3742b + a cherry-pick of tao #1274
+# (DefSubclassProc → DefWindowProcW). Repoint at upstream once #1274 merges.
+#
+# tao-macros must be patched to the SAME rev even though nothing here depends on
+# it directly: wry pulls tao-macros 0.1.3 from crates.io, so without this the
+# lockfile carries two tao-macros 0.1.3 entries (registry + git). cargo tolerates
+# that, but Nix's importCargoLock vendors both to the same `tao-macros-0.1.3`
+# dir and fails with a symlink collision. Unifying the source removes the dup.
+[patch.crates-io]
+tao = { git = "https://github.com/cjpais/tao", rev = "c3bee28c1d446d95f08c95c3b6f8d4bde052b876" }
+tao-macros = { git = "https://github.com/cjpais/tao", rev = "c3bee28c1d446d95f08c95c3b6f8d4bde052b876" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+[profile.dev]
+incremental = true # Compile your binary in smaller steps.
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

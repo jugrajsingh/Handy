@@ -19,3 +19,5 @@ src-tauri/src/catalog/catalog.json
 # Misc
 .DS_Store
 *.log
+
+.superpowers/

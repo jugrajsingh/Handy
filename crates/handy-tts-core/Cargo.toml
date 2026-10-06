@@ -1,0 +1,19 @@
+[package]
+name = "handy-tts-core"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+signalsmith-stretch.workspace = true
+regex.workspace = true
+pulldown-cmark = "=0.13.0"
+reqwest = { version = "0.12", features = ["blocking"] }
+sha2 = "0.10"
+specta.workspace = true

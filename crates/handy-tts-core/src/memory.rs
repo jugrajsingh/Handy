@@ -1,0 +1,1 @@
+pub const MIN_AVAILABLE_BYTES: u64 = 1024 * 1024 * 1024;
