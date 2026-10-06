@@ -51,8 +51,8 @@ function PopupApp() {
           stop: async () => {
             unwrap(await commands.readAloudStop());
           },
-          replaceText: async (value) => {
-            unwrap(await commands.readAloudReplaceText(value));
+          replaceText: async (value, clientRevision) => {
+            unwrap(await commands.readAloudReplaceText(value, clientRevision));
           },
           close: async () => {
             unwrap(await commands.readAloudClose());

@@ -91,20 +91,36 @@ impl Worker for ManagerWorker {
 }
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 pub struct SessionView {
+    pub client_revision: Option<u64>,
+    pub document_id: u64,
     pub text: String,
     pub visible: bool,
     pub snapshot: SessionSnapshot,
 }
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 pub struct SessionEvent {
+    pub client_revision: Option<u64>,
+    pub document_id: u64,
     pub text: Option<String>,
     pub visible: bool,
     pub snapshot: SessionSnapshot,
+}
+impl SessionView {
+    fn event(&self, text: Option<String>) -> SessionEvent {
+        SessionEvent {
+            client_revision: self.client_revision,
+            document_id: self.document_id,
+            text,
+            visible: self.visible,
+            snapshot: self.snapshot.clone(),
+        }
+    }
 }
 pub enum SessionCommand {
     Interrupt(mpsc::Sender<()>),
     PauseAcknowledged(mpsc::Sender<()>),
     Replace {
+        client_revision: Option<u64>,
         text: String,
         autoplay: bool,
     },
@@ -186,6 +202,8 @@ impl ReadAloudSession {
             head_start_seconds: None,
         };
         let view = Arc::new(Mutex::new(SessionView {
+            client_revision: None,
+            document_id: 0,
             text: String::new(),
             visible: false,
             snapshot: empty,
@@ -197,6 +215,8 @@ impl ReadAloudSession {
         let join = std::thread::spawn(move || {
             let began = Instant::now();
             let mut source = String::new();
+            let mut client_revision = None;
+            let mut document_id = 0;
             let mut selected = selection;
             let mut visible = false;
             let mut autoplay = false;
@@ -213,12 +233,13 @@ impl ReadAloudSession {
                     Ok(session) => session,
                     Err(error) => {
                         let mut current = cached.lock().unwrap_or_else(|p| p.into_inner());
+                        current.text = source.clone();
+                        current.client_revision = client_revision;
+                        current.document_id = document_id;
+                        current.visible = visible;
+                        current.snapshot.epoch = epoch;
                         current.snapshot.error = Some(error);
-                        emit(SessionEvent {
-                            text: Some(current.text.clone()),
-                            visible: current.visible,
-                            snapshot: current.snapshot.clone(),
-                        });
+                        emit(current.event(Some(source.clone())));
                         break;
                     }
                 };
@@ -243,11 +264,16 @@ impl ReadAloudSession {
                         Ok(SessionCommand::Replace {
                             text,
                             autoplay: start,
+                            client_revision: applied_revision,
                         }) => {
                             session.stop();
                             epoch = session.queue.epoch;
                             drop(session);
                             source = text;
+                            client_revision = applied_revision;
+                            if client_revision.is_none() {
+                                document_id += 1;
+                            }
                             autoplay = start;
                             visible = true;
                             continue 'document;
@@ -311,17 +337,15 @@ impl ReadAloudSession {
                         current.text = source.clone();
                     }
                     current.visible = visible;
+                    current.client_revision = client_revision;
+                    current.document_id = document_id;
                     current.snapshot = snapshot;
                     if last_emit.elapsed() >= Duration::from_millis(200) {
-                        emit(SessionEvent {
-                            text: if text_sent {
-                                None
-                            } else {
-                                Some(source.clone())
-                            },
-                            visible,
-                            snapshot: current.snapshot.clone(),
-                        });
+                        emit(current.event(if text_sent {
+                            None
+                        } else {
+                            Some(source.clone())
+                        }));
                         text_sent = true;
                         last_emit = Instant::now();
                     }
@@ -569,6 +593,73 @@ mod tests {
         panic!("session did not reach {state:?}");
     }
     #[test]
+    fn replacement_revision_is_echoed_in_text_and_snapshot_events() {
+        let (tx, rx) = mpsc::channel();
+        let reading = ReadAloudSession::spawn_with(
+            manager(),
+            Engine,
+            Audio::default,
+            selection(),
+            None,
+            Arc::new(move |event| {
+                tx.send(event).unwrap();
+            }),
+        );
+        fn text_event(rx: &mpsc::Receiver<SessionEvent>) -> SessionEvent {
+            for _ in 0..20 {
+                let event = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+                if event.text.as_deref() == Some("A") {
+                    return event;
+                }
+            }
+            panic!("replacement text event was not emitted");
+        }
+        reading
+            .send(SessionCommand::Replace {
+                text: "A".into(),
+                autoplay: false,
+                client_revision: Some(7),
+            })
+            .unwrap();
+        let first = text_event(&rx);
+        assert_eq!(
+            first.client_revision,
+            Some(7),
+            "text event echoes applied client revision"
+        );
+        assert_eq!(first.document_id, 0);
+        let snapshot = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(snapshot.text.is_none());
+        assert_eq!(
+            snapshot.client_revision,
+            Some(7),
+            "snapshot event echoes applied client revision"
+        );
+        assert_eq!(reading.snapshot().client_revision, Some(7));
+        reading
+            .send(SessionCommand::Replace {
+                text: "A".into(),
+                autoplay: false,
+                client_revision: Some(9),
+            })
+            .unwrap();
+        let repeated = text_event(&rx);
+        assert_eq!(repeated.client_revision, Some(9));
+        assert_eq!(repeated.document_id, first.document_id);
+        reading
+            .send(SessionCommand::Replace {
+                text: "A".into(),
+                autoplay: false,
+                client_revision: None,
+            })
+            .unwrap();
+        let external = text_event(&rx);
+        assert_eq!(external.client_revision, None);
+        assert_eq!(external.document_id, first.document_id + 1);
+        assert_eq!(reading.snapshot().client_revision, None);
+        assert!(reading.shutdown());
+    }
+    #[test]
     fn fix1_idle_session_acknowledges_dictation_stop_and_retries_output_after_failure() {
         let audio = Arc::new(Mutex::new(SharedAudio {
             unavailable: true,
@@ -583,6 +674,7 @@ mod tests {
         );
         reading
             .send(SessionCommand::Replace {
+                client_revision: None,
                 text: "Retained document.".into(),
                 autoplay: true,
             })
@@ -602,6 +694,7 @@ mod tests {
         let reading = actor(audio.clone());
         reading
             .send(SessionCommand::Replace {
+                client_revision: None,
                 text: "Retain me.".into(),
                 autoplay: true,
             })
@@ -638,6 +731,7 @@ mod tests {
         let document = "The owner's original reading document.";
         reading
             .send(SessionCommand::Replace {
+                client_revision: None,
                 text: document.into(),
                 autoplay: true,
             })
@@ -654,6 +748,7 @@ mod tests {
                 cancelled = Some(flag);
                 preview
                     .send(SessionCommand::Replace {
+                        client_revision: None,
                         text: "Independent preview text.".into(),
                         autoplay: true,
                     })

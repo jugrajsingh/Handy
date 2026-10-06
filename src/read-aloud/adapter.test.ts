@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
-import { createPopupAdapter, type PopupView } from "./adapter";
-import type { PopupDependencies } from "./actions";
+import {
+  createPopupAdapter,
+  type PopupView,
+  type PopupAdapterDependencies,
+} from "./adapter";
 
 function deferred() {
   let resolve = () => {};
@@ -28,7 +31,7 @@ const initial: PopupView = {
   head_start_seconds: null,
 };
 function fixture(
-  dependencies: Partial<PopupDependencies> = {},
+  dependencies: Partial<PopupAdapterDependencies> = {},
   state = initial,
 ) {
   let view = { ...state };
@@ -64,10 +67,18 @@ function fixture(
 }
 async function draftAcknowledgements() {
   const f = fixture();
-  f.adapter.event({ text: "original", visible: true, snapshot: initial });
+  f.adapter.event({
+    text: "original",
+    visible: true,
+    snapshot: initial,
+    client_revision: null,
+    document_id: 1,
+  });
   await f.adapter.edit("A");
   const ab = f.adapter.edit("AB");
   f.adapter.event({
+    client_revision: 1,
+    document_id: 1,
     text: "A",
     visible: true,
     snapshot: { ...initial, epoch: 5 },
@@ -90,18 +101,24 @@ async function draftAcknowledgements() {
     "latest replacement retains every typed character",
   );
   f.adapter.event({
+    client_revision: 3,
+    document_id: 1,
     text: "ABC",
     visible: true,
     snapshot: { ...initial, epoch: 8 },
   });
   assert.equal(f.view().text, "ABC");
   f.adapter.event({
+    client_revision: 1,
+    document_id: 1,
     text: "A",
     visible: true,
     snapshot: { ...initial, epoch: 5 },
   });
   assert.equal(f.view().text, "ABC", "acknowledgement rejects older epochs");
   f.adapter.event({
+    client_revision: null,
+    document_id: 2,
     text: "new document",
     visible: true,
     snapshot: { ...initial, epoch: 9 },
@@ -113,6 +130,8 @@ async function draftAcknowledgements() {
   );
   await f.adapter.close();
   f.adapter.event({
+    client_revision: null,
+    document_id: 2,
     text: "new document",
     visible: true,
     snapshot: { ...initial, epoch: 10 },
@@ -123,11 +142,15 @@ async function draftAcknowledgements() {
     "late document echo cannot reopen a closed popup",
   );
   f.adapter.event({
+    client_revision: null,
+    document_id: 2,
     text: null,
     visible: false,
     snapshot: { ...initial, epoch: 11 },
   });
   f.adapter.event({
+    client_revision: null,
+    document_id: 3,
     text: "new document",
     visible: true,
     snapshot: { ...initial, epoch: 12 },
@@ -228,6 +251,98 @@ async function editBeforePlay() {
     "popup adapter edit-before-play and cancellation assertions passed",
   );
 }
+async function repeatedTextAcknowledgements() {
+  const replacements: { text: string; revision: number | undefined }[] = [];
+  const f = fixture({
+    replaceText: async (text, clientRevision?: number) => {
+      replacements.push({ text, revision: clientRevision });
+    },
+  });
+  const event = (
+    text: string | null,
+    epoch: number,
+    client_revision: number | null,
+  ) =>
+    f.adapter.event({
+      text,
+      visible: true,
+      snapshot: { ...initial, epoch },
+      client_revision,
+      document_id: 1,
+    });
+  event("original", 1, null);
+  await f.adapter.edit("A");
+  await f.adapter.edit("AB");
+  await f.adapter.edit("A");
+  event("A", 3, 1);
+  assert.equal(
+    f.view().text,
+    "A",
+    "first A echo cannot acknowledge the later A draft",
+  );
+  event("AB", 5, 2);
+  assert.equal(
+    f.view().text,
+    "A",
+    "repeated-text echoes preserve the backspaced A draft",
+  );
+  await f.adapter.edit(f.view().text + "C");
+  assert.equal(f.view().text, "AC", "typing after backspace retains AC");
+  assert.deepEqual(
+    replacements[replacements.length - 1],
+    { text: "AC", revision: 4 },
+    "replacement carries AC and its monotonically increasing client revision",
+  );
+  assert.deepEqual(
+    replacements.map((entry) => entry.revision),
+    [1, 2, 3, 4],
+  );
+  event(null, 6, 2);
+  assert.equal(
+    f.view().text,
+    "AC",
+    "snapshot-only older revision preserves the draft",
+  );
+  event("original", 6, null);
+  assert.equal(
+    f.view().text,
+    "AC",
+    "revision-less echo for the current document preserves the draft",
+  );
+  event("AC", 7, 4);
+  assert.equal(
+    f.view().text,
+    "AC",
+    "coalesced latest acknowledgement settles the draft",
+  );
+  f.adapter.event({
+    text: "clipboard",
+    visible: true,
+    snapshot: { ...initial, epoch: 8 },
+    client_revision: null,
+    document_id: 2,
+  });
+  assert.equal(
+    f.view().text,
+    "clipboard",
+    "new document identity resets acknowledgement state",
+  );
+  await f.adapter.edit("clipboard edit");
+  assert.equal(
+    replacements[replacements.length - 1].revision,
+    5,
+    "client revisions remain monotonic across new documents",
+  );
+  event("AC", 9, 4);
+  assert.equal(
+    f.view().text,
+    "clipboard edit",
+    "older document cannot overwrite a newer draft",
+  );
+  console.log("popup adapter repeated-text revision assertions passed");
+}
+if (!process.argv[2] || process.argv[2] === "repeated")
+  await repeatedTextAcknowledgements();
 if (!process.argv[2] || process.argv[2] === "draft")
   await draftAcknowledgements();
 if (!process.argv[2] || process.argv[2] === "ordering") await editBeforePlay();

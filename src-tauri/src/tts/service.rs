@@ -391,6 +391,7 @@ impl TtsService {
                 Effect::OpenPopup { text } => {
                     if let Ok(ready) = self.ready() {
                         let _ = ready.session.send(SessionCommand::Replace {
+                            client_revision: None,
                             text,
                             autoplay: true,
                         });

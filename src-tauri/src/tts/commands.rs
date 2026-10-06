@@ -114,11 +114,13 @@ pub async fn get_read_aloud_state(
 #[specta::specta]
 pub async fn read_aloud_replace_text(
     text: String,
+    client_revision: u64,
     service: State<'_, Arc<TtsService>>,
 ) -> Result<(), String> {
     let service = service.inner().clone();
     blocking(move || {
         service.reading_command(SessionCommand::Replace {
+            client_revision: Some(client_revision),
             text,
             autoplay: false,
         })
