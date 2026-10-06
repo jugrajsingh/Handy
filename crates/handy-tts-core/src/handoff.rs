@@ -38,10 +38,14 @@ impl PipelineFence {
 }
 
 type Job = Box<dyn FnOnce() + Send>;
+enum DeferredJob {
+    Queue(Job),
+    Paste(Job),
+}
 #[derive(Default)]
 struct FenceState {
     capture: bool,
-    deferred: Vec<Job>,
+    deferred: Vec<DeferredJob>,
 }
 #[derive(Default)]
 /// Reserves clipboard capture ahead of native paste.
@@ -58,7 +62,7 @@ impl PasteFence {
         state.capture = true;
         true
     }
-    /// Releases capture and runs deferred work outside the fence lock.
+    /// Releases capture and replays deferred work through its queue or paste barrier.
     pub fn release_capture(&self) {
         let jobs = {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -66,13 +70,16 @@ impl PasteFence {
             std::mem::take(&mut state.deferred)
         };
         for job in jobs {
-            job();
+            match job {
+                DeferredJob::Queue(job) => self.before_queue(job),
+                DeferredJob::Paste(job) => self.before_paste(job),
+            }
         }
     }
     fn dispatch(&self, job: Job) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if state.capture {
-            state.deferred.push(job);
+            state.deferred.push(DeferredJob::Paste(job));
         } else {
             job();
         }
@@ -82,7 +89,7 @@ impl PasteFence {
         {
             let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if state.capture {
-                state.deferred.push(job);
+                state.deferred.push(DeferredJob::Queue(job));
                 return;
             }
         }
@@ -99,6 +106,27 @@ mod tests {
     use super::*;
     use crate::referee::{Effect, Event, Referee};
     use std::sync::Arc;
+    #[test]
+    fn deferred_native_paste_waits_for_capture_reserved_during_release() {
+        let fence = Arc::new(PasteFence::default());
+        let clipboard = Arc::new(Mutex::new("original clipboard"));
+        assert!(fence.reserve_capture());
+        let next_capture = fence.clone();
+        fence.before_queue(Box::new(move || {
+            assert!(next_capture.reserve_capture());
+        }));
+        let pasted = clipboard.clone();
+        fence.before_paste(Box::new(move || {
+            *pasted.lock().unwrap() = "Handy paste";
+        }));
+        fence.release_capture();
+        assert_eq!(*clipboard.lock().unwrap(), "original clipboard");
+        assert!(!fence.reserve_capture());
+        fence.release_capture();
+        assert_eq!(*clipboard.lock().unwrap(), "Handy paste");
+        assert!(fence.reserve_capture());
+        fence.release_capture();
+    }
     #[test]
     fn immediate_queue_callback_can_enter_native_paste_fence() {
         let fence = Arc::new(PasteFence::default());
