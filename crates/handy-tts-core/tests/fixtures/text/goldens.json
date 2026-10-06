@@ -1,7 +1,5 @@
 {
-  "01-heading.txt": [
-    "Reading clearly, one phrase at a time."
-  ],
+  "01-heading.txt": ["Reading clearly, one phrase at a time."],
   "02-long-sentence.txt": [
     "When a reader opens a long document after a busy morning,",
     "the application should begin speaking promptly in a calm and consistent voice, preserve the meaning of every paragraph, pronounce unfamiliar names carefully,",
