@@ -13,6 +13,7 @@ pub enum PlaybackError {
 }
 pub trait Output {
     fn names(&self) -> Result<Vec<String>, PlaybackError>;
+    /// Opens a replacement stream, preserving the active stream on failure.
     fn open(&mut self, name: Option<&str>) -> Result<(), PlaybackError>;
     fn play(&mut self, pcm: Pcm, pause_ms: u32) -> Result<(), PlaybackError>;
     fn poll(&mut self) -> Poll;
@@ -68,17 +69,19 @@ impl<B: Output> Playback<B> {
         })
     }
     pub fn reopen(&mut self, tts: Option<&str>, handy: Option<&str>) -> Result<(), PlaybackError> {
-        self.output.stop();
-        self.replay_pending = self.current.is_some();
         let (selected, fallback) = match self.output.names() {
             Ok(names) => resolve_output(tts, handy, &names),
             Err(_) => (None, true),
         };
-        self.pending_fallback |= fallback;
-        if self.output.open(selected.as_deref()).is_err() {
+        let fell_back = if self.output.open(selected.as_deref()).is_ok() {
+            fallback
+        } else {
             self.output.open(None)?;
-            self.pending_fallback = true;
-        }
+            true
+        };
+        self.output.stop();
+        self.replay_pending = self.current.is_some();
+        self.pending_fallback |= fell_back;
         if self.paused {
             self.output.pause();
         }

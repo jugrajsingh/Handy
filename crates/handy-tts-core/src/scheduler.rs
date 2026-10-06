@@ -89,16 +89,18 @@ impl Queue {
     pub fn target_seconds(&self) -> f64 {
         (1.0 + (self.measured_rtf - 0.25).max(0.0) * 8.0 * f64::from(self.speed)).clamp(1.0, 5.0)
     }
-    /// Invalidates old audio and returns the sentence to replay.
-    pub fn switch_selection(&mut self, downloaded: bool) -> usize {
-        let index = self
-            .playing
+    pub(crate) fn next_unspoken(&self) -> usize {
+        self.playing
             .as_ref()
             .map(|chunk| chunk.ticket.index)
-            .or(self.failed_index)
             .or_else(|| self.waiting.front().map(|chunk| chunk.ticket.index))
+            .or(self.failed_index)
             .or_else(|| self.in_flight.map(|ticket| ticket.index))
-            .unwrap_or(self.next_index);
+            .unwrap_or(self.next_index)
+    }
+    /// Invalidates old audio and returns the sentence to replay.
+    pub fn switch_selection(&mut self, downloaded: bool) -> usize {
+        let index = self.next_unspoken();
         self.epoch = self.epoch.wrapping_add(1);
         self.in_flight = None;
         self.playing = None;
@@ -128,8 +130,11 @@ impl Queue {
             self.advance();
             return;
         }
-        if self.state == PlaybackState::Error {
-            self.next_index = self.failed_index.unwrap_or(0);
+        if self.state == PlaybackState::Finished {
+            self.buffering_pauses = 0;
+        }
+        if matches!(self.state, PlaybackState::Error | PlaybackState::Starting) {
+            self.next_index = self.failed_index.unwrap_or(self.next_index);
         } else if !matches!(
             self.state,
             PlaybackState::Playing | PlaybackState::Buffering
@@ -300,6 +305,38 @@ mod tests {
     fn finish_request(q: &mut Queue) {
         let t = q.request_next().unwrap();
         q.complete(t, Ok(chunk(t)));
+    }
+    #[test]
+    fn fix2_selection_keeps_earliest_waiting_sentence_after_paused_failure() {
+        let mut q = Queue::with_speed(2.0);
+        q.play();
+        for _ in 0..2 {
+            let ticket = q.request_next().unwrap();
+            q.complete_timed(ticket, Ok(chunk(ticket)), 1.2);
+        }
+        let failed = q.request_next().unwrap();
+        q.pause();
+        q.complete(failed, Err(()));
+        assert_eq!(q.waiting.len(), 2);
+        assert_eq!(q.failed_index, Some(2));
+        assert_eq!(q.switch_selection(true), 0);
+    }
+    #[test]
+    fn fix2_starting_retains_cursor_and_finished_restart_resets_pause_count() {
+        let mut q = Queue {
+            state: PlaybackState::Starting,
+            next_index: 7,
+            failed_index: Some(7),
+            ..Queue::default()
+        };
+        q.play();
+        assert_eq!(q.request_next().unwrap().index, 7);
+        q.stop();
+        q.state = PlaybackState::Finished;
+        q.buffering_pauses = 9;
+        q.play();
+        assert_eq!(q.buffering_pauses, 0);
+        assert_eq!(q.request_next().unwrap().index, 0);
     }
     #[test]
     fn either_queue_reservation_or_admission_guard_bounds_audio() {

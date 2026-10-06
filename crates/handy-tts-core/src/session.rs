@@ -6,7 +6,27 @@ use crate::{
     selection::{Selection, SelectionChange, SelectionError, select_with},
     text::{TextChunk, TextCursor},
 };
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
+
+type ReportedPosition = (u32, u32, f64, f64);
+type CursorFactory = for<'s> fn(&'s str, bool) -> Result<TextCursor<'s>, String>;
+
+fn text_cursor(source: &str, read_code: bool) -> Result<TextCursor<'_>, String> {
+    TextCursor::new(source, read_code).map_err(|_| "tts.errors.text".to_string())
+}
+
+fn dsp_clock() -> Box<dyn Fn() -> f64 + Send> {
+    #[cfg(test)]
+    {
+        Box::new(|| 0.0)
+    }
+    #[cfg(not(test))]
+    {
+        let origin = std::time::Instant::now();
+        Box::new(move || origin.elapsed().as_secs_f64())
+    }
+}
 
 /// Splits NPU input at word boundaries using the engine's token or frame capacity check.
 pub fn synthesize_for_device(
@@ -99,6 +119,10 @@ pub struct Session<'a, W: Worker, O: Output> {
     source_utf16: usize,
     handy_output: Option<String>,
     cursor: TextCursor<'a>,
+    cursor_factory: CursorFactory,
+    pending_text: Option<TextChunk>,
+    dsp_clock: Box<dyn Fn() -> f64 + Send>,
+    reported_position: Cell<Option<ReportedPosition>>,
     pub worker: W,
     pub playback: Playback<O>,
     pub queue: Queue,
@@ -133,6 +157,10 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             source_utf16: source.encode_utf16().count(),
             handy_output: handy_output.map(str::to_owned),
             cursor,
+            cursor_factory: text_cursor,
+            pending_text: None,
+            dsp_clock: dsp_clock(),
+            reported_position: Cell::new(None),
             worker,
             playback,
             queue: Queue::with_speed(selection.speed),
@@ -150,19 +178,28 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             output_fallback: false,
         })
     }
-    fn seek(&mut self, index: usize) -> Result<(), String> {
-        let mut cursor = TextCursor::new(self.source, self.selection.read_code)
-            .map_err(|_| "tts.errors.text".to_string())?;
-        for _ in 0..index {
-            if cursor
-                .next_chunk()
-                .map_err(|_| "tts.errors.text".to_string())?
-                .is_none()
-            {
-                break;
+    fn prepare_cursor(
+        &self,
+        read_code: bool,
+        index: usize,
+        position: Option<u32>,
+    ) -> Result<(TextCursor<'a>, Option<TextChunk>), String> {
+        let mut cursor = (self.cursor_factory)(self.source, read_code)?;
+        while let Some(text) = cursor
+            .next_chunk()
+            .map_err(|_| "tts.errors.text".to_string())?
+        {
+            let found = position.map_or(text.index >= index, |pos| text.source_end > pos);
+            if found {
+                return Ok((cursor, Some(text)));
             }
         }
+        Ok((cursor, None))
+    }
+    fn seek(&mut self, index: usize) -> Result<(), String> {
+        let (cursor, pending) = self.prepare_cursor(self.selection.read_code, index, None)?;
         self.cursor = cursor;
+        self.pending_text = pending;
         self.metadata.clear();
         self.parts = None;
         self.output_ticket = None;
@@ -181,6 +218,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         } else if !matches!(old, PlaybackState::Playing | PlaybackState::Buffering) {
             self.seek(self.queue.next_index)?;
             if old != PlaybackState::Error {
+                self.reported_position.set(None);
                 self.played_seconds = 0.0;
                 self.current_elapsed = 0.0;
             }
@@ -215,6 +253,8 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         self.parts = None;
         self.output_ticket = None;
         self.error = None;
+        self.pending_text = None;
+        self.reported_position.set(None);
         self.played_seconds = 0.0;
         self.current_elapsed = 0.0;
         self.first_play = None;
@@ -240,10 +280,40 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         downloaded: bool,
         persist: impl FnOnce(&Selection) -> Result<(), SelectionError>,
     ) -> Result<SelectionChange, SelectionError> {
+        let index = self.queue.next_unspoken();
+        let position = (self.selection.read_code != selection.read_code)
+            .then(|| self.metadata.get(&index).map(|text| text.source_start))
+            .flatten();
+        let (cursor, pending) = self
+            .prepare_cursor(selection.read_code, index, position)
+            .map_err(|_| SelectionError::Controls)?;
+        let new_index = pending.as_ref().map_or(index, |text| text.index);
         let old_ticket = self.queue.in_flight;
         let reload = self.selection.model_id != selection.model_id
             || self.selection.voice != selection.voice;
-        let changed = select_with(&mut self.queue, selection.clone(), downloaded, persist)?;
+        let output_changed = self.selection.output_device != selection.output_device;
+        let mut changed = select_with(&mut self.queue, selection.clone(), downloaded, |value| {
+            if output_changed {
+                self.playback
+                    .reopen(
+                        selection.output_device.as_deref(),
+                        self.handy_output.as_deref(),
+                    )
+                    .map_err(|_| SelectionError::Controls)?;
+            }
+            if let Err(error) = persist(value) {
+                if output_changed {
+                    self.playback
+                        .reopen(
+                            self.selection.output_device.as_deref(),
+                            self.handy_output.as_deref(),
+                        )
+                        .map_err(|_| SelectionError::Controls)?;
+                }
+                return Err(error);
+            }
+            Ok(())
+        })?;
         self.playback.stop();
         if let Some(ticket) = old_ticket {
             self.worker.cancel(ticket);
@@ -251,22 +321,21 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         if reload {
             self.worker.selection_changed();
         }
-        if self.selection.output_device != selection.output_device {
-            self.playback
-                .reopen(
-                    selection.output_device.as_deref(),
-                    self.handy_output.as_deref(),
-                )
-                .map_err(|_| SelectionError::Controls)?;
-        }
         self.selection = selection;
         self.queue.speed = self.selection.speed;
-        let retained = self.metadata.remove(&changed.sentence_index);
-        self.seek(changed.sentence_index)
-            .map_err(|_| SelectionError::Controls)?;
-        if let Some(text) = retained {
-            self.metadata.insert(changed.sentence_index, text);
+        self.queue.next_index = new_index;
+        if self.queue.failed_index.is_some() {
+            self.queue.failed_index = Some(new_index);
         }
+        changed.sentence_index = new_index;
+        self.cursor = cursor;
+        self.pending_text = pending;
+        self.metadata.clear();
+        if let Some(text) = &self.pending_text {
+            self.metadata.insert(text.index, text.clone());
+        }
+        self.parts = None;
+        self.output_ticket = None;
         self.current_elapsed = 0.0;
         self.error = changed
             .missing_download
@@ -287,7 +356,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 return;
             }
         };
-        let began = std::time::Instant::now();
+        let began = (self.dsp_clock)();
         let pcm = match dsp::transform(
             pcm,
             self.selection.speed,
@@ -301,7 +370,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 return;
             }
         };
-        let elapsed = completion.synthesis_seconds + began.elapsed().as_secs_f64();
+        let elapsed = completion.synthesis_seconds + ((self.dsp_clock)() - began).max(0.0);
         let seconds = pcm.samples.len() as f64 / f64::from(pcm.sample_rate);
         let limit = (QUEUED_AUDIO_CEILING * f64::from(pcm.sample_rate)) as usize;
         let mut data = pcm.samples.into_iter();
@@ -330,6 +399,8 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         while let Some(pcm) = parts.samples.pop_front() {
             let seconds = pcm.samples.len() as f64 / f64::from(pcm.sample_rate);
             let Some(text) = self.metadata.get(&parts.ticket.index) else {
+                self.error = Some("tts.errors.text".into());
+                self.queue.complete(parts.ticket, Err(()));
                 return;
             };
             let last = parts.samples.is_empty();
@@ -387,11 +458,14 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             )
             && let Some(ticket) = self.queue.request_next()
         {
-            match self
-                .cursor
-                .next_chunk()
-                .map_err(|_| "tts.errors.text".to_string())?
-            {
+            let next = match self.pending_text.take() {
+                Some(text) => Some(text),
+                None => self
+                    .cursor
+                    .next_chunk()
+                    .map_err(|_| "tts.errors.text".to_string())?,
+            };
+            match next {
                 Some(mut text) => {
                     text.index = ticket.index;
                     let result = self.worker.request(ticket, &text.text, &self.selection);
@@ -420,6 +494,8 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             self.output_ticket = Some(audio.ticket);
             self.current_started = now;
             self.first_play.get_or_insert(now);
+            self.reported_position.set(None);
+            self.snapshot();
         }
         let min = self
             .queue
@@ -468,19 +544,37 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         } else {
             15.0 * f64::from(self.selection.speed)
         };
-        SessionSnapshot {
-            epoch: self.queue.epoch,
-            state: self.queue.state,
-            source_start: range.0,
-            source_end: range.1,
-            elapsed_seconds: elapsed,
-            remaining_seconds: if self.queue.state == PlaybackState::Finished {
+        let mut position = (
+            range.0,
+            range.1,
+            progress,
+            if self.queue.state == PlaybackState::Finished {
                 0.0
             } else {
                 ((chars - f64::from(range.0)) / rate).max(0.0)
             },
-            progress,
-            error: self.error.clone(),
+        );
+        if matches!(
+            self.queue.state,
+            PlaybackState::Buffering | PlaybackState::Paused
+        ) {
+            position = self.reported_position.get().unwrap_or(position);
+        } else {
+            self.reported_position.set(Some(position));
+        }
+        SessionSnapshot {
+            epoch: self.queue.epoch,
+            state: self.queue.state,
+            source_start: position.0,
+            source_end: position.1,
+            elapsed_seconds: elapsed,
+            remaining_seconds: position.3,
+            progress: position.2,
+            error: if self.queue.state == PlaybackState::Error {
+                self.error.clone()
+            } else {
+                None
+            },
             output_fallback: self.output_fallback,
             queued_audio_seconds: self.queue.queued_seconds(),
             buffering_pauses: self.queue.buffering_pauses,
@@ -563,12 +657,16 @@ mod tests {
         opens: usize,
         names: Vec<String>,
         last_open: Option<String>,
+        fail_open: bool,
     }
     impl Output for FakeOutput {
         fn names(&self) -> Result<Vec<String>, PlaybackError> {
             Ok(self.names.clone())
         }
         fn open(&mut self, name: Option<&str>) -> Result<(), PlaybackError> {
+            if self.fail_open {
+                return Err(PlaybackError::Unavailable);
+            }
             self.last_open = name.map(str::to_owned);
             self.opens += 1;
             Ok(())
@@ -637,6 +735,260 @@ mod tests {
         s.playback.output.now = now;
         s.tick(now).unwrap();
         assert!(s.queue.queued_seconds() <= 30.00001);
+    }
+    #[test]
+    fn fix2_reopen_or_seek_error_preserves_the_entire_old_session() {
+        let source =
+            "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(20);
+        for seek_error in [false, true] {
+            let mut s = session(&source, 0.1);
+            s.play().unwrap();
+            for i in 0..5 {
+                step(&mut s, f64::from(i) * 0.1);
+            }
+            let old_selection = s.selection.clone();
+            let epoch = s.queue.epoch;
+            let ticket = s.queue.playing.as_ref().unwrap().ticket;
+            let waiting: Vec<_> = s.queue.waiting.iter().map(|c| c.ticket).collect();
+            let in_flight = s.queue.in_flight;
+            let old_output = (
+                s.playback.output.deadline,
+                s.playback.output.paused,
+                s.playback.output.stops,
+            );
+            if seek_error {
+                s.cursor_factory = |_, _| Err("tts.errors.text".into());
+            } else {
+                s.playback.output.fail_open = true;
+            }
+            let mut chosen = selection();
+            chosen.voice = "M1".into();
+            chosen.output_device = Some("Default".into());
+            assert_eq!(
+                s.select(chosen, true, |_| panic!(
+                    "failed preparation must not persist"
+                )),
+                Err(SelectionError::Controls)
+            );
+            assert_eq!(s.selection, old_selection);
+            assert_eq!(s.queue.epoch, epoch);
+            assert_eq!(s.queue.playing.as_ref().unwrap().ticket, ticket);
+            assert_eq!(
+                s.queue.waiting.iter().map(|c| c.ticket).collect::<Vec<_>>(),
+                waiting
+            );
+            assert_eq!(s.queue.in_flight, in_flight);
+            assert_eq!(
+                (
+                    s.playback.output.deadline,
+                    s.playback.output.paused,
+                    s.playback.output.stops
+                ),
+                old_output
+            );
+            assert!(s.worker.cancelled.is_empty());
+            assert_eq!(s.worker.selections, 0);
+        }
+    }
+    #[test]
+    fn fix2_dsp_time_uses_the_injected_clock_for_pocket_audio() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let mut s = session("A sufficiently long sentence for an audio request.", 0.1);
+        s.selection.model_id = "pocket-en".into();
+        s.selection.voice = "alba".into();
+        s.selection.speed = 2.0;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let clock = calls.clone();
+        s.dsp_clock = Box::new(move || clock.fetch_add(1, Ordering::SeqCst) as f64 * 0.25);
+        s.play().unwrap();
+        step(&mut s, 0.0);
+        step(&mut s, 0.2);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!((s.queue.measured_rtf - 0.7).abs() < 1e-12);
+    }
+    #[test]
+    fn fix2_paused_selection_plays_all_waiting_sentences_before_failure() {
+        let source =
+            "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(12);
+        let mut s = session(&source, 1.2);
+        s.worker.fail_once = Some(2);
+        s.play().unwrap();
+        let mut now = 0.0;
+        for _ in 0..200 {
+            step(&mut s, now);
+            now += 0.1;
+            if s.queue.in_flight.is_some_and(|t| t.index == 2) {
+                break;
+            }
+        }
+        assert_eq!(s.queue.state, PlaybackState::Buffering);
+        assert_eq!(s.queue.waiting.len(), 2);
+        s.pause();
+        for _ in 0..20 {
+            step(&mut s, now);
+            now += 0.1;
+        }
+        assert_eq!(s.queue.failed_index, Some(2));
+        let chosen = Selection {
+            voice: "M1".into(),
+            ..selection()
+        };
+        assert_eq!(
+            s.select(chosen, true, |_| Ok(())).unwrap().sentence_index,
+            0
+        );
+        s.play().unwrap();
+        for _ in 0..400 {
+            step(&mut s, now);
+            now += 0.1;
+        }
+        assert_eq!(s.playback.output.played, (1..=12).collect::<Vec<_>>());
+    }
+    #[test]
+    fn fix2_buffering_and_paused_snapshots_retain_reported_position() {
+        let source =
+            "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(40);
+        let mut s = session(&source, 1.6);
+        s.play().unwrap();
+        let mut last = s.snapshot();
+        let mut now = 0.0;
+        for _ in 0..1000 {
+            step(&mut s, now);
+            now += 0.1;
+            let snap = s.snapshot();
+            if snap.state == PlaybackState::Buffering && snap.buffering_pauses > 0 {
+                assert!(last.source_start > 0);
+                assert_eq!(
+                    (
+                        snap.source_start,
+                        snap.source_end,
+                        snap.progress,
+                        snap.remaining_seconds
+                    ),
+                    (
+                        last.source_start,
+                        last.source_end,
+                        last.progress,
+                        last.remaining_seconds
+                    )
+                );
+                s.pause();
+                step(&mut s, now + 1.0);
+                let paused = s.snapshot();
+                assert_eq!(
+                    (
+                        paused.source_start,
+                        paused.source_end,
+                        paused.progress,
+                        paused.remaining_seconds
+                    ),
+                    (
+                        last.source_start,
+                        last.source_end,
+                        last.progress,
+                        last.remaining_seconds
+                    )
+                );
+                s.select(
+                    Selection {
+                        voice: "M1".into(),
+                        ..selection()
+                    },
+                    true,
+                    |_| Ok(()),
+                )
+                .unwrap();
+                let selected = s.snapshot();
+                assert_eq!(
+                    (
+                        selected.source_start,
+                        selected.source_end,
+                        selected.progress,
+                        selected.remaining_seconds
+                    ),
+                    (
+                        last.source_start,
+                        last.source_end,
+                        last.progress,
+                        last.remaining_seconds
+                    )
+                );
+                s.stop();
+                assert_eq!(s.snapshot().source_start, 0);
+                return;
+            }
+            last = snap;
+        }
+        panic!("no underrun observed");
+    }
+    #[test]
+    fn fix2_error_is_exposed_only_after_earlier_audio_drains() {
+        let source =
+            "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(20);
+        let mut s = session(&source, 0.1);
+        s.worker.fail_once = Some(5);
+        s.play().unwrap();
+        let mut draining = false;
+        for i in 0..300 {
+            step(&mut s, f64::from(i) * 0.1);
+            if s.queue.failed_index.is_some() && s.queue.state != PlaybackState::Error {
+                draining = true;
+                assert!(s.snapshot().error.is_none());
+            }
+            if s.queue.state == PlaybackState::Error {
+                assert!(draining);
+                assert_eq!(s.snapshot().error.as_deref(), Some("tts.errors.worker"));
+                return;
+            }
+        }
+        panic!("failure did not drain");
+    }
+    #[test]
+    fn fix2_missing_part_metadata_ends_the_pending_request() {
+        let mut s = session("A sufficiently long sentence for an audio request.", 0.1);
+        s.play().unwrap();
+        step(&mut s, 0.0);
+        s.metadata.clear();
+        step(&mut s, 0.2);
+        assert!(s.queue.in_flight.is_none());
+        assert_eq!(s.queue.state, PlaybackState::Error);
+        assert!(s.snapshot().error.is_some());
+    }
+    #[test]
+    fn fix2_read_code_toggle_preserves_original_position_in_both_directions() {
+        let source = format!(
+            "# Start\n\n```\n{}\n```\n\nThe destination sentence must remain the active source after switching.\n\nAnother long sentence follows the destination sentence here.",
+            "alpha beta gamma delta ".repeat(60)
+        );
+        let target = source.find("The destination").unwrap() as u32;
+        for initial in [false, true] {
+            let mut s = session(&source, 0.01);
+            s.selection.read_code = initial;
+            s.play().unwrap();
+            let mut now = 0.0;
+            for _ in 0..500 {
+                step(&mut s, now);
+                now += 0.1;
+                if s.snapshot().source_start == target {
+                    break;
+                }
+            }
+            assert_eq!(s.snapshot().source_start, target);
+            let mut chosen = s.selection.clone();
+            chosen.read_code = !initial;
+            s.select(chosen, true, |_| Ok(())).unwrap();
+            for _ in 0..20 {
+                step(&mut s, now);
+                now += 0.1;
+                if s.queue.playing.is_some() {
+                    break;
+                }
+            }
+            assert_eq!(s.snapshot().source_start, target);
+        }
     }
     #[test]
     fn repeated_play_and_idle_pause_do_not_stall_output() {
