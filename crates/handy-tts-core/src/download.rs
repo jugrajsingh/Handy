@@ -5,7 +5,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 use thiserror::Error;
 
 #[derive(Debug, Error, Clone, PartialEq)]
@@ -16,6 +17,10 @@ pub enum DownloadError {
     TokenRejected,
     #[error("tts.errors.download")]
     Transport,
+    #[error("tts.errors.accessDenied")]
+    AccessDenied,
+    #[error("tts.errors.localIo")]
+    LocalIo,
     #[error("tts.errors.integrity")]
     Integrity,
     #[error("tts.errors.cancelled")]
@@ -43,6 +48,7 @@ impl Credentials {
     }
     /// Replaces the session token, clearing it when the input is blank.
     pub fn set(&self, value: String) {
+        let value = value.trim().to_owned();
         *self.0.lock().unwrap_or_else(|p| p.into_inner()) = if value.trim().is_empty() {
             None
         } else {
@@ -54,18 +60,16 @@ impl Credentials {
         self.token().is_some()
     }
     fn token(&self) -> Option<String> {
+        self.token_with(|| std::env::var("HF_TOKEN").ok())
+    }
+    fn token_with(&self, environment: impl FnOnce() -> Option<String>) -> Option<String> {
         self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
-            .or_else(|| {
-                if self.1 {
-                    std::env::var("HF_TOKEN").ok()
-                } else {
-                    None
-                }
-            })
-            .filter(|value| !value.trim().is_empty())
+            .or_else(|| if self.1 { environment() } else { None })
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,16 +100,41 @@ pub struct HttpTransport {
     base: String,
 }
 impl HttpTransport {
-    /// Creates a transport with a bounded request timeout.
+    /// Creates an HTTPS transport with bounded connection and read waits.
     pub fn new(base: &str) -> Result<Self, DownloadError> {
+        let url = reqwest::Url::parse(base).map_err(|_| DownloadError::Transport)?;
+        if url.scheme() != "https" || url.host_str().is_none() {
+            return Err(DownloadError::Transport);
+        }
+        Self::build(base, Duration::from_secs(60))
+    }
+    fn build(base: &str, read_timeout: Duration) -> Result<Self, DownloadError> {
         let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(Duration::from_secs(30))
+            // Blocking reqwest applies this timeout separately to each body read.
+            .timeout(read_timeout)
             .build()
             .map_err(|_| DownloadError::Transport)?;
         Ok(Self {
             client,
             base: base.trim_end_matches('/').into(),
         })
+    }
+    #[cfg(test)]
+    fn loopback(base: &str) -> Result<Self, DownloadError> {
+        let url = reqwest::Url::parse(base).map_err(|_| DownloadError::Transport)?;
+        let loopback = url
+            .host_str()
+            .and_then(|host| {
+                host.trim_matches(['[', ']'])
+                    .parse::<std::net::IpAddr>()
+                    .ok()
+            })
+            .is_some_and(|ip| ip.is_loopback());
+        if url.scheme() != "http" || !loopback {
+            return Err(DownloadError::Transport);
+        }
+        Self::build(base, Duration::from_secs(60))
     }
 }
 impl Transport for HttpTransport {
@@ -132,7 +161,11 @@ impl Transport for HttpTransport {
         let response = request.send().map_err(|_| DownloadError::Transport)?;
         let status = response.status().as_u16();
         if status == 401 || status == 403 {
-            return Err(DownloadError::TokenRejected);
+            return Err(if file.gated {
+                DownloadError::TokenRejected
+            } else {
+                DownloadError::AccessDenied
+            });
         }
         let start = response
             .headers()
@@ -150,16 +183,13 @@ impl Transport for HttpTransport {
 }
 /// Verifies both the exact byte count and SHA-256 of a downloaded file.
 pub fn verify(path: &Path, file: &ModelFile) -> Result<bool, DownloadError> {
-    if !path.is_file() {
-        return Ok(false);
-    }
-    let mut reader = File::open(path).map_err(|_| DownloadError::Transport)?;
-    if reader
-        .metadata()
-        .map_err(|_| DownloadError::Transport)?
-        .len()
-        != file.bytes
-    {
+    let mut reader = match File::open(path) {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(DownloadError::LocalIo),
+    };
+    let metadata = reader.metadata().map_err(|_| DownloadError::LocalIo)?;
+    if !metadata.is_file() || metadata.len() != file.bytes {
         return Ok(false);
     }
     let mut digest = Sha256::new();
@@ -167,7 +197,7 @@ pub fn verify(path: &Path, file: &ModelFile) -> Result<bool, DownloadError> {
     loop {
         let size = reader
             .read(&mut buffer)
-            .map_err(|_| DownloadError::Transport)?;
+            .map_err(|_| DownloadError::LocalIo)?;
         if size == 0 {
             break;
         }
@@ -175,41 +205,92 @@ pub fn verify(path: &Path, file: &ModelFile) -> Result<bool, DownloadError> {
     }
     Ok(format!("{:x}", digest.finalize()) == file.sha256)
 }
-/// Checks the verification marker and file sizes without rehashing the model.
+fn fingerprint(entry: &ModelEntry) -> String {
+    const VERSION: &str = "handy-tts-manifest-v1";
+    let mut files: Vec<_> = entry
+        .files
+        .iter()
+        .map(|file| {
+            (
+                file.revision.as_str(),
+                file.path.as_str(),
+                file.bytes,
+                file.sha256.as_str(),
+            )
+        })
+        .collect();
+    files.sort_unstable();
+    let mut digest = Sha256::new();
+    digest.update(VERSION.as_bytes());
+    for (revision, path, bytes, sha256) in files {
+        for value in [revision, path, sha256] {
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        digest.update(bytes.to_le_bytes());
+    }
+    format!("{VERSION}\n{:x}\n", digest.finalize())
+}
+/// Checks the manifest fingerprint and file sizes without rehashing the model.
 pub fn is_downloaded(root: &Path, entry: &ModelEntry) -> bool {
     let directory = root.join(entry.id);
-    directory.join(".verified").is_file()
+    fs::read_to_string(directory.join(".verified")).is_ok_and(|marker| marker == fingerprint(entry))
         && entry.files.iter().all(|file| {
             fs::metadata(directory.join(&file.path))
                 .is_ok_and(|metadata| metadata.is_file() && metadata.len() == file.bytes)
         })
 }
-/// Removes a model directory, including any incomplete files.
-pub fn delete(root: &Path, entry: &ModelEntry) -> Result<(), DownloadError> {
-    let path = root.join(entry.id);
-    if path.exists() {
-        fs::remove_dir_all(path).map_err(|_| DownloadError::Transport)?;
+fn remove_file_if_present(path: &Path) -> Result<(), DownloadError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(DownloadError::LocalIo),
     }
-    Ok(())
 }
-#[derive(Default)]
-/// Serializes downloads per model while retaining verified files for retries.
-pub struct Downloader {
-    active: Mutex<std::collections::HashSet<String>>,
-    pub credentials: Credentials,
-}
-struct Claim<'a> {
-    downloader: &'a Downloader,
-    id: &'a str,
-}
-impl Drop for Claim<'_> {
-    fn drop(&mut self) {
-        self.downloader
-            .active
+static CLAIMS: OnceLock<Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
+struct Claim(PathBuf);
+impl Claim {
+    fn acquire(directory: PathBuf) -> Result<Self, DownloadError> {
+        let active = CLAIMS.get_or_init(Mutex::default);
+        if !active
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(self.id);
+            .insert(directory.clone())
+        {
+            return Err(DownloadError::Busy);
+        }
+        Ok(Self(directory))
     }
+}
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Some(active) = CLAIMS.get() {
+            active
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&self.0);
+        }
+    }
+}
+/// Removes an unclaimed model directory, including any incomplete files.
+pub fn delete(root: &Path, entry: &ModelEntry) -> Result<(), DownloadError> {
+    let root = match root.canonicalize() {
+        Ok(root) => root,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(DownloadError::LocalIo),
+    };
+    let path = root.join(entry.id);
+    let _claim = Claim::acquire(path.clone())?;
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(DownloadError::LocalIo),
+    }
+}
+/// Serializes downloads per model directory while retaining verified files for retries.
+#[derive(Default)]
+pub struct Downloader {
+    pub credentials: Credentials,
 }
 impl Downloader {
     /// Downloads and verifies every file before marking a model available.
@@ -221,25 +302,17 @@ impl Downloader {
         cancel: &AtomicBool,
         progress: impl Fn(Progress),
     ) -> Result<PathBuf, DownloadError> {
-        if !self
-            .active
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(entry.id.into())
-        {
-            return Err(DownloadError::Busy);
-        }
-        let _claim = Claim {
-            downloader: self,
-            id: entry.id,
-        };
+        fs::create_dir_all(root).map_err(|_| DownloadError::LocalIo)?;
+        let directory = root
+            .canonicalize()
+            .map_err(|_| DownloadError::LocalIo)?
+            .join(entry.id);
+        let _claim = Claim::acquire(directory.clone())?;
         let token = self.credentials.token();
-        let directory = root.join(entry.id);
-        fs::create_dir_all(&directory).map_err(|_| DownloadError::Transport)?;
-        match fs::remove_file(directory.join(".verified")) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(DownloadError::Transport),
+        fs::create_dir_all(&directory).map_err(|_| DownloadError::LocalIo)?;
+        let marker = directory.join(".verified");
+        if !is_downloaded(root, entry) {
+            remove_file_if_present(&marker)?;
         }
         let mut completed = 0u64;
         for file in &entry.files {
@@ -250,9 +323,21 @@ impl Downloader {
                 return Err(DownloadError::Integrity);
             }
             let final_path = directory.join(&file.path);
-            if verify(&final_path, file)? {
-                completed += file.bytes;
-                continue;
+            match verify(&final_path, file) {
+                Ok(true) => {
+                    completed += file.bytes;
+                    progress(Progress {
+                        model_id: entry.id.into(),
+                        downloaded_bytes: completed,
+                        total_bytes: entry.bytes,
+                    });
+                    continue;
+                }
+                Ok(false) => remove_file_if_present(&marker)?,
+                Err(error) => {
+                    remove_file_if_present(&marker)?;
+                    return Err(error);
+                }
             }
             let partial = final_path.with_file_name(format!(
                 "{}.partial",
@@ -262,20 +347,35 @@ impl Downloader {
                     .ok_or(DownloadError::Integrity)?
             ));
             fs::create_dir_all(final_path.parent().ok_or(DownloadError::Integrity)?)
-                .map_err(|_| DownloadError::Transport)?;
+                .map_err(|_| DownloadError::LocalIo)?;
             if verify(&partial, file)? {
-                fs::rename(&partial, &final_path).map_err(|_| DownloadError::Transport)?;
+                fs::rename(&partial, &final_path).map_err(|_| DownloadError::LocalIo)?;
                 completed += file.bytes;
                 continue;
             }
             if file.gated && token.is_none() {
                 return Err(DownloadError::TokenRequired);
             }
-            if fs::metadata(&partial).is_ok_and(|metadata| metadata.len() >= file.bytes) {
-                fs::remove_file(&partial).map_err(|_| DownloadError::Transport)?;
+            let mut offset = match fs::metadata(&partial) {
+                Ok(metadata) => metadata.len(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+                Err(_) => return Err(DownloadError::LocalIo),
+            };
+            if offset >= file.bytes {
+                remove_file_if_present(&partial)?;
+                offset = 0;
             }
-            let offset = fs::metadata(&partial).map(|m| m.len()).unwrap_or(0);
             let mut response = transport.get(file, offset, token.as_deref())?;
+            if response.status == 416 || (response.status == 206 && response.start != Some(offset))
+            {
+                drop(response);
+                remove_file_if_present(&partial)?;
+                offset = 0;
+                if cancel.load(Ordering::Acquire) {
+                    return Err(DownloadError::Cancelled);
+                }
+                response = transport.get(file, offset, token.as_deref())?;
+            }
             let resume = response.status == 206 && response.start == Some(offset);
             if response.status != 200 && !resume {
                 return Err(DownloadError::Transport);
@@ -286,7 +386,7 @@ impl Downloader {
                 .truncate(!resume)
                 .append(resume)
                 .open(&partial)
-                .map_err(|_| DownloadError::Transport)?;
+                .map_err(|_| DownloadError::LocalIo)?;
             let mut count = if resume { offset } else { 0 };
             let mut buffer = [0u8; 65536];
             loop {
@@ -308,23 +408,25 @@ impl Downloader {
                 }
                 output
                     .write_all(&buffer[..size])
-                    .map_err(|_| DownloadError::Transport)?;
+                    .map_err(|_| DownloadError::LocalIo)?;
                 progress(Progress {
                     model_id: entry.id.into(),
                     downloaded_bytes: completed + count,
                     total_bytes: entry.bytes,
                 });
             }
-            output.sync_all().map_err(|_| DownloadError::Transport)?;
+            output.sync_all().map_err(|_| DownloadError::LocalIo)?;
             if !verify(&partial, file)? {
-                let _ = fs::remove_file(&partial);
+                remove_file_if_present(&partial)?;
                 return Err(DownloadError::Integrity);
             }
-            fs::rename(&partial, &final_path).map_err(|_| DownloadError::Transport)?;
+            fs::rename(&partial, &final_path).map_err(|_| DownloadError::LocalIo)?;
             completed += file.bytes;
         }
-        fs::write(directory.join(".verified"), b"verified\n")
-            .map_err(|_| DownloadError::Transport)?;
+        if cancel.load(Ordering::Acquire) {
+            return Err(DownloadError::Cancelled);
+        }
+        fs::write(&marker, fingerprint(entry)).map_err(|_| DownloadError::LocalIo)?;
         progress(Progress {
             model_id: entry.id.into(),
             downloaded_bytes: entry.bytes,
@@ -390,47 +492,23 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success(), "transport error fixture failed");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("1 passed;"),
+            "redaction child must run one test"
+        );
         for stream in [&output.stdout, &output.stderr] {
             assert!(
                 !String::from_utf8_lossy(stream).contains("hf_fixture_secret_never_log"),
                 "HTTP errors must not expose credentials"
             );
         }
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let requests = Arc::new(Mutex::new(Vec::new()));
-        let capture = requests.clone();
-        let server = std::thread::spawn(move || {
-            for body in [b"public".as_slice(), b"voice".as_slice()] {
-                let (mut socket, _) = listener.accept().unwrap();
-                socket
-                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .unwrap();
-                let mut bytes = Vec::new();
-                while !bytes.ends_with(b"\r\n\r\n") {
-                    let mut one = [0];
-                    socket.read_exact(&mut one).unwrap();
-                    bytes.push(one[0]);
-                }
-                capture
-                    .lock()
-                    .unwrap()
-                    .push(String::from_utf8(bytes).unwrap());
-                write!(
-                    socket,
-                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
-                )
-                .unwrap();
-                socket.write_all(body).unwrap();
-            }
-        });
+        let server = TestServer::start(vec![reply(200, "", b"public"), reply(200, "", b"voice")]);
+        let requests = server.requests.clone();
         let root = root("gated-http");
         let downloader = Downloader {
             credentials: Credentials::memory_only(),
-            ..Downloader::default()
         };
-        let transport = HttpTransport::new(&base).unwrap();
+        let transport = HttpTransport::loopback(&server.base).unwrap();
         let entry = fixture();
         let result =
             downloader.download(&root, &entry, &transport, &AtomicBool::new(false), |_| {});
@@ -450,10 +528,10 @@ mod tests {
                 |value| progress.lock().unwrap().push(value),
             )
             .unwrap();
-        server.join().unwrap();
+        server.finish();
         let captured = requests.lock().unwrap();
         assert!(!captured[0].to_lowercase().contains("authorization:"));
-        assert!(captured[1].contains(secret));
+        assert_authorization_only(&captured[1], Some(secret));
         let logs = format!(
             "{:?} {:?} {:?}",
             downloader.credentials,
@@ -484,36 +562,42 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     fn transport_errors_are_redacted() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!(
-            "http://{}/hf_fixture_secret_never_log",
-            listener.local_addr().unwrap()
-        );
-        let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
-            socket
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                .unwrap();
-            let mut byte = [0];
-            let mut request = Vec::new();
-            while !request.ends_with(b"\r\n\r\n") {
-                socket.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
-            }
-            socket.write_all(b"invalid HTTP response\r\n\r\n").unwrap();
-        });
-        let result = HttpTransport::new(&base).unwrap().get(
+        static LOGGER: CapturingLogger = CapturingLogger(Mutex::new(Vec::new()));
+        log::set_logger(&LOGGER).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+        log::info!("capture-probe");
+        let server = TestServer::start(vec!["invalid HTTP response\r\n\r\n".into()]);
+        let base = format!("{}/hf_fixture_secret_never_log", server.base);
+        let result = HttpTransport::loopback(&base).unwrap().get(
             &fixture().files[1],
             0,
             Some("hf_fixture_secret_never_log"),
         );
-        server.join().unwrap();
+        server.finish();
         let error = result.err().expect("malformed HTTP response is rejected");
         assert_eq!(error, DownloadError::Transport);
         assert_eq!(
             format!("{error} {error:?}"),
             "tts.errors.download Transport"
         );
+        let logs = LOGGER.0.lock().unwrap();
+        assert!(logs.iter().any(|line| line.contains("capture-probe")));
+        assert!(
+            !logs
+                .iter()
+                .any(|line| line.contains("hf_fixture_secret_never_log")),
+            "logger must not expose credentials"
+        );
+    }
+    struct CapturingLogger(Mutex<Vec<String>>);
+    impl log::Log for CapturingLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            self.0.lock().unwrap().push(record.args().to_string());
+        }
+        fn flush(&self) {}
     }
     struct MemoryTransport {
         body: Vec<u8>,
@@ -554,7 +638,7 @@ mod tests {
         let directory = root.join(entry.id);
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("public.bin.partial"), b"pub").unwrap();
-        let downloader = Downloader::default();
+        let downloader = downloader_without_environment();
         downloader
             .download(
                 &root,
@@ -617,7 +701,7 @@ mod tests {
         let root = root("oversized");
         let entry = public_fixture();
         let progress = Mutex::new(Vec::new());
-        let result = Downloader::default().download(
+        let result = downloader_without_environment().download(
             &root,
             &entry,
             &MemoryTransport {
@@ -644,7 +728,7 @@ mod tests {
         let directory = root.join(entry.id);
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("public.bin.partial"), b"pub").unwrap();
-        Downloader::default()
+        downloader_without_environment()
             .download(
                 &root,
                 &entry,
@@ -665,7 +749,7 @@ mod tests {
         let root = root("cancel-during-read");
         let entry = public_fixture();
         let cancel = AtomicBool::new(false);
-        let result = Downloader::default().download(
+        let result = downloader_without_environment().download(
             &root,
             &entry,
             &MemoryTransport {
@@ -683,7 +767,7 @@ mod tests {
             fs::read(root.join(entry.id).join("public.bin.partial")).unwrap(),
             b"public"
         );
-        Downloader::default()
+        downloader_without_environment()
             .download(
                 &root,
                 &entry,
@@ -701,7 +785,7 @@ mod tests {
     fn same_model_download_is_busy_until_claim_is_released() {
         let root = root("busy");
         let entry = public_fixture();
-        let downloader = Downloader::default();
+        let downloader = downloader_without_environment();
         let transport = MemoryTransport {
             body: b"public".to_vec(),
             offset: 0,
@@ -727,5 +811,477 @@ mod tests {
         assert!(!is_downloaded(&root, &entry));
         delete(&root, &entry).unwrap();
         fs::remove_dir_all(root).unwrap();
+    }
+
+    struct TestServer {
+        base: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        done: std::sync::mpsc::Receiver<()>,
+        thread: std::thread::JoinHandle<()>,
+    }
+    impl TestServer {
+        fn start(replies: Vec<String>) -> Self {
+            Self::start_chunks(
+                replies
+                    .into_iter()
+                    .map(|reply| vec![(Duration::ZERO, reply)])
+                    .collect(),
+            )
+        }
+        fn start_chunks(replies: Vec<Vec<(Duration, String)>>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let captured = requests.clone();
+            let (sender, done) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+                for reply in replies {
+                    let mut socket = loop {
+                        match listener.accept() {
+                            Ok((socket, _)) => break socket,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "HTTP fixture request missing"
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("fixture accept: {error}"),
+                        }
+                    };
+                    socket
+                        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+                        .unwrap();
+                    socket
+                        .set_write_timeout(Some(std::time::Duration::from_secs(1)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    for _ in 0..16384 {
+                        let mut byte = [0];
+                        socket.read_exact(&mut byte).unwrap();
+                        request.push(byte[0]);
+                        if request.ends_with(b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    assert!(request.ends_with(b"\r\n\r\n"));
+                    captured
+                        .lock()
+                        .unwrap()
+                        .push(String::from_utf8(request).unwrap());
+                    for (delay, part) in reply {
+                        std::thread::sleep(delay);
+                        if socket.write_all(part.as_bytes()).is_err() {
+                            break;
+                        }
+                    }
+                }
+                sender.send(()).unwrap();
+            });
+            Self {
+                base,
+                requests,
+                done,
+                thread,
+            }
+        }
+        fn finish(self) {
+            let completion = self.done.recv_timeout(std::time::Duration::from_secs(5));
+            assert!(
+                completion.is_ok(),
+                "HTTP fixture did not finish before deadline"
+            );
+            self.thread.join().unwrap();
+        }
+    }
+    fn reply(status: u16, headers: &str, body: &[u8]) -> String {
+        format!(
+            "HTTP/1.1 {status} Fixture\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{}",
+            body.len(),
+            String::from_utf8_lossy(body)
+        )
+    }
+    fn assert_authorization_only(request: &str, token: Option<&str>) {
+        let mut lines = request.lines();
+        let target = lines.next().unwrap();
+        let auth: Vec<_> = lines
+            .filter(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+            .collect();
+        match token {
+            Some(token) => {
+                assert!(!target.contains(token), "credentials must never enter URLs");
+                assert_eq!(auth.len(), 1);
+                assert_eq!(
+                    auth[0].split_once(':').unwrap().1.trim(),
+                    format!("Bearer {token}")
+                );
+                assert_eq!(
+                    request.matches(token).count(),
+                    1,
+                    "only Authorization contains the token"
+                );
+            }
+            None => assert!(auth.is_empty()),
+        }
+    }
+    fn downloader_without_environment() -> Downloader {
+        Downloader {
+            credentials: Credentials::memory_only(),
+        }
+    }
+    #[test]
+    fn http_resume_and_gated_rejections_use_headers_only() {
+        let root = root("http-range");
+        let entry = public_fixture();
+        let directory = root.join(entry.id);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join("public.bin.partial"), b"pub").unwrap();
+        let server = TestServer::start(vec![reply(206, "Content-Range: bytes 3-5/6\r\n", b"lic")]);
+        let requests = server.requests.clone();
+        downloader_without_environment()
+            .download(
+                &root,
+                &entry,
+                &HttpTransport::loopback(&server.base).unwrap(),
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        server.finish();
+        assert_eq!(fs::read(directory.join("public.bin")).unwrap(), b"public");
+        assert!(
+            requests.lock().unwrap()[0]
+                .to_ascii_lowercase()
+                .contains("range: bytes=3-")
+        );
+        assert_authorization_only(&requests.lock().unwrap()[0], None);
+        for status in [401, 403] {
+            for gated in [true, false] {
+                let server = TestServer::start(vec![reply(status, "", b"")]);
+                let requests = server.requests.clone();
+                let mut file = entry.files[0].clone();
+                file.gated = gated;
+                let error = HttpTransport::loopback(&server.base)
+                    .unwrap()
+                    .get(&file, 0, Some("hf_fixture_header_only"))
+                    .err()
+                    .unwrap();
+                server.finish();
+                assert_eq!(
+                    error,
+                    if gated {
+                        DownloadError::TokenRejected
+                    } else {
+                        DownloadError::AccessDenied
+                    }
+                );
+                assert_authorization_only(
+                    &requests.lock().unwrap()[0],
+                    gated.then_some("hf_fixture_header_only"),
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn marker_binds_every_manifest_field_and_version_in_sorted_order() {
+        let root = root("fingerprint");
+        let entry = public_fixture();
+        let downloader = downloader_without_environment();
+        let transport = MemoryTransport {
+            body: b"public".to_vec(),
+            offset: 0,
+            status: 200,
+        };
+        downloader
+            .download(&root, &entry, &transport, &AtomicBool::new(false), |_| {})
+            .unwrap();
+        assert!(is_downloaded(&root, &entry));
+        for field in ["revision", "path", "bytes", "sha256"] {
+            let mut changed = entry.clone();
+            match field {
+                "revision" => changed.files[0].revision = "b".repeat(40),
+                "path" => {
+                    changed.files[0].path = "same-size.bin".into();
+                    fs::write(root.join(entry.id).join("same-size.bin"), b"public").unwrap();
+                }
+                "bytes" => changed.files[0].bytes += 1,
+                "sha256" => changed.files[0].sha256 = format!("{:x}", Sha256::digest(b"repin!")),
+                _ => unreachable!(),
+            }
+            assert!(!is_downloaded(&root, &changed), "marker must bind {field}");
+        }
+        let marker_path = root.join(entry.id).join(".verified");
+        let marker = fs::read(&marker_path).unwrap();
+        fs::write(&marker_path, b"verified\n").unwrap();
+        assert!(
+            !is_downloaded(&root, &entry),
+            "legacy marker has no fingerprint"
+        );
+        fs::write(&marker_path, &marker).unwrap();
+        let mut repinned = entry.clone();
+        repinned.files[0].revision = "b".repeat(40);
+        repinned.files[0].sha256 = format!("{:x}", Sha256::digest(b"repin!"));
+        downloader
+            .download(
+                &root,
+                &repinned,
+                &MemoryTransport {
+                    body: b"repin!".to_vec(),
+                    offset: 0,
+                    status: 200,
+                },
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        assert_eq!(
+            fs::read(root.join(entry.id).join("public.bin")).unwrap(),
+            b"repin!"
+        );
+        assert!(is_downloaded(&root, &repinned));
+        assert_ne!(fs::read(marker_path).unwrap(), marker);
+        let mut pair = repinned.clone();
+        let mut second = pair.files[0].clone();
+        second.path = "second.bin".into();
+        pair.files.push(second);
+        pair.bytes *= 2;
+        downloader
+            .download(
+                &root,
+                &pair,
+                &MemoryTransport {
+                    body: b"repin!".to_vec(),
+                    offset: 0,
+                    status: 200,
+                },
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
+        pair.files.reverse();
+        assert!(
+            is_downloaded(&root, &pair),
+            "manifest order must not change its identity"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn credentials_trim_memory_and_environment_seam_without_reading_environment() {
+        let credentials = Credentials::memory_only();
+        credentials.set(" \thf_fixture_trim\n".into());
+        assert_eq!(credentials.token().as_deref(), Some("hf_fixture_trim"));
+        credentials.set(" \n\t".into());
+        assert!(!credentials.configured());
+        let credentials = Credentials::default();
+        assert_eq!(
+            credentials
+                .token_with(|| Some(" \thf_fixture_trim\n".into()))
+                .as_deref(),
+            Some("hf_fixture_trim")
+        );
+        assert!(credentials.token_with(|| Some(" \n\t".into())).is_none());
+        assert!(
+            Credentials::memory_only()
+                .token_with(|| panic!("environment must not be consulted"))
+                .is_none()
+        );
+    }
+    #[test]
+    fn production_transport_requires_https_and_test_http_is_loopback_only() {
+        for base in [
+            "http://huggingface.co",
+            "http://127.0.0.1:1234",
+            "ftp://huggingface.co",
+            "not a url",
+        ] {
+            assert!(
+                HttpTransport::new(base).is_err(),
+                "production rejects {base}"
+            );
+        }
+        assert!(HttpTransport::new("https://huggingface.co").is_ok());
+        assert!(HttpTransport::loopback("http://127.0.0.1:1234").is_ok());
+        assert!(HttpTransport::loopback("http://example.com").is_err());
+    }
+    #[test]
+    fn delete_is_busy_and_cancelled_intact_recheck_preserves_marker() {
+        let root = root("delete-recheck");
+        let mut entry = public_fixture();
+        let mut second = entry.files[0].clone();
+        second.path = "second.bin".into();
+        entry.files.push(second);
+        entry.bytes *= 2;
+        let downloader = downloader_without_environment();
+        downloader
+            .download(
+                &root,
+                &entry,
+                &MemoryTransport {
+                    body: b"public".to_vec(),
+                    offset: 0,
+                    status: 200,
+                },
+                &AtomicBool::new(false),
+                |_| {
+                    assert_eq!(delete(&root, &entry), Err(DownloadError::Busy));
+                },
+            )
+            .unwrap();
+        let marker = fs::read(root.join(entry.id).join(".verified")).unwrap();
+        for pre_cancel in [true, false] {
+            let cancel = AtomicBool::new(pre_cancel);
+            assert_eq!(
+                downloader
+                    .download(&root, &entry, &RefuseTransport, &cancel, |_| cancel
+                        .store(true, Ordering::Release))
+                    .unwrap_err(),
+                DownloadError::Cancelled
+            );
+            assert_eq!(
+                fs::read(root.join(entry.id).join(".verified")).unwrap(),
+                marker
+            );
+            assert!(is_downloaded(&root, &entry));
+        }
+        delete(&root, &entry).unwrap();
+        assert!(!is_downloaded(&root, &entry));
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn bad_ranges_discard_partial_and_restart_once() {
+        for (name, first) in [
+            (
+                "mismatch",
+                reply(206, "Content-Range: bytes 1-3/6\r\n", b"ubl"),
+            ),
+            ("missing-range", reply(206, "", b"lic")),
+            ("416", reply(416, "", b"")),
+        ] {
+            let root = root(name);
+            let entry = public_fixture();
+            let directory = root.join(entry.id);
+            fs::create_dir_all(&directory).unwrap();
+            fs::write(directory.join("public.bin.partial"), b"bad").unwrap();
+            let server = TestServer::start(vec![first, reply(200, "", b"public")]);
+            let requests = server.requests.clone();
+            let partial = directory.join("public.bin.partial");
+            struct CheckDiscard<'a>(&'a Path, HttpTransport, AtomicBool);
+            impl Transport for CheckDiscard<'_> {
+                fn get(
+                    &self,
+                    file: &ModelFile,
+                    offset: u64,
+                    token: Option<&str>,
+                ) -> Result<Response, DownloadError> {
+                    if self.2.swap(true, Ordering::Relaxed) {
+                        assert_eq!(offset, 0);
+                        assert!(
+                            !self.0.exists(),
+                            "mismatched partial must be discarded before restart"
+                        );
+                    }
+                    self.1.get(file, offset, token)
+                }
+            }
+            let transport = CheckDiscard(
+                &partial,
+                HttpTransport::loopback(&server.base).unwrap(),
+                AtomicBool::new(false),
+            );
+            downloader_without_environment()
+                .download(&root, &entry, &transport, &AtomicBool::new(false), |_| {})
+                .unwrap();
+            server.finish();
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests[0].to_ascii_lowercase().contains("range: bytes=3-"));
+            assert!(!requests[1].to_ascii_lowercase().contains("range:"));
+            assert_eq!(fs::read(directory.join("public.bin")).unwrap(), b"public");
+            fs::remove_dir_all(root).unwrap();
+        }
+        let root = root("range-retry-limit");
+        let entry = public_fixture();
+        struct RejectedRanges(std::sync::atomic::AtomicUsize);
+        impl Transport for RejectedRanges {
+            fn get(
+                &self,
+                _: &ModelFile,
+                _: u64,
+                _: Option<&str>,
+            ) -> Result<Response, DownloadError> {
+                assert!(
+                    self.0.fetch_add(1, Ordering::Relaxed) < 2,
+                    "only one range restart is allowed"
+                );
+                Ok(Response {
+                    status: 416,
+                    start: None,
+                    body: Box::new(std::io::empty()),
+                })
+            }
+        }
+        let transport = RejectedRanges(std::sync::atomic::AtomicUsize::new(0));
+        assert_eq!(
+            downloader_without_environment()
+                .download(&root, &entry, &transport, &AtomicBool::new(false), |_| {})
+                .unwrap_err(),
+            DownloadError::Transport
+        );
+        assert_eq!(transport.0.load(Ordering::Relaxed), 2);
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn local_io_failures_are_distinct_from_network_errors() {
+        let root = root("local-io");
+        let entry = public_fixture();
+        let directory = root.join(entry.id);
+        fs::write(&directory, b"not a directory").unwrap();
+        let result = downloader_without_environment().download(
+            &root,
+            &entry,
+            &RefuseTransport,
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        assert_eq!(result.unwrap_err(), DownloadError::LocalIo);
+        assert_eq!(
+            verify(&directory.join("child"), &entry.files[0]),
+            Err(DownloadError::LocalIo)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn blocking_timeout_is_per_read_and_stalls_are_bounded() {
+        let header = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n";
+        let mut chunks = vec![(Duration::ZERO, header.into())];
+        chunks.extend(
+            "public"
+                .chars()
+                .map(|c| (Duration::from_millis(100), c.to_string())),
+        );
+        let server = TestServer::start_chunks(vec![chunks]);
+        let root = root("slow-stream");
+        let entry = public_fixture();
+        let transport = HttpTransport::build(&server.base, Duration::from_millis(350)).unwrap();
+        downloader_without_environment()
+            .download(&root, &entry, &transport, &AtomicBool::new(false), |_| {})
+            .unwrap();
+        server.finish();
+        assert!(is_downloaded(&root, &entry));
+        fs::remove_dir_all(root).unwrap();
+
+        let server = TestServer::start_chunks(vec![vec![
+            (Duration::ZERO, header.into()),
+            (Duration::from_millis(700), "public".into()),
+        ]]);
+        let transport = HttpTransport::build(&server.base, Duration::from_millis(350)).unwrap();
+        let mut response = transport.get(&entry.files[0], 0, None).unwrap();
+        let started = std::time::Instant::now();
+        assert!(response.body.read(&mut [0; 6]).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.finish();
     }
 }
