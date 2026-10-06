@@ -193,6 +193,43 @@ impl<'a> TextCursor<'a> {
             Some(marker)
         }
     }
+    fn tag_separates_words(&self, tag: &str, source_end: usize) -> bool {
+        let name = tag
+            .trim_start_matches('<')
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/' || c == '>')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(name.as_str(), "br" | "p" | "div" | "li") {
+            return true;
+        }
+        if matches!(
+            name.as_str(),
+            "b" | "i"
+                | "em"
+                | "span"
+                | "strong"
+                | "u"
+                | "s"
+                | "small"
+                | "sup"
+                | "sub"
+                | "code"
+                | "mark"
+                | "del"
+                | "ins"
+        ) {
+            return false;
+        }
+        let word_character = |c: char| c.is_alphanumeric() || c == '_';
+        self.word.chars().last().is_some_and(word_character)
+            && self
+                .source
+                .get(source_end..)
+                .and_then(|text| text.chars().next())
+                .is_some_and(word_character)
+    }
     fn piece(&mut self) -> Option<Piece> {
         loop {
             if let Some(p) = self.pending.pop_front() {
@@ -212,14 +249,14 @@ impl<'a> TextCursor<'a> {
                     && let Some(end) = f.value[f.offset..].find('>')
                 {
                     let tag = &f.value[f.offset..f.offset + end];
-                    let block = tag
-                        .trim_start_matches('/')
-                        .split_whitespace()
-                        .next()
-                        .is_some_and(|name| matches!(name, "p" | "div" | "br" | "li"));
+                    let source_end = f
+                        .base
+                        .map(|base| base + f.offset + end + 1)
+                        .unwrap_or(f.range.end);
+                    let separates = self.tag_separates_words(tag, source_end);
                     f.offset += end + 1;
                     self.fragment = Some(f);
-                    if block && let Some(word) = self.finish_word() {
+                    if separates && let Some(word) = self.finish_word() {
                         return Some(word);
                     }
                     continue;
@@ -348,7 +385,14 @@ impl<'a> TextCursor<'a> {
                         fragment.html = true;
                     }
                 }
-                Event::InlineHtml(_) | Event::FootnoteReference(_) => {}
+                Event::InlineHtml(tag) => {
+                    if self.tag_separates_words(&tag, range.end)
+                        && let Some(word) = self.finish_word()
+                    {
+                        return Some(word);
+                    }
+                }
+                Event::FootnoteReference(_) => {}
                 _ => {}
             }
         }
@@ -573,6 +617,35 @@ mod fixes {
             spoken("<div>Read me &amp; you</div>\n\nEnd."),
             "Read me and you. End."
         );
+    }
+    #[test]
+    fn removed_html_tags_separate_text_without_splitting_formatted_words() {
+        for source in [
+            "Line one<br>line two",
+            "Line one<br/>line two",
+            "Line one<BR />line two",
+            "Line one</p><p>line two",
+            "Line one<div>line two</div>",
+            "Line one<li>line two</li>",
+            "Line one<custom>line two",
+            "Line one<br><br/>  line two",
+            "<div>Line one<br/>line two</div>",
+        ] {
+            assert_eq!(spoken(source), "Line one line two.", "{source}");
+        }
+        for source in [
+            "a<b>bold</b>word",
+            "a<i>bold</i>word",
+            "a<em>bold</em>word",
+            "a<span>bold</span>word",
+            "a<strong>bold</strong>word",
+            "<div>a<b>bold</b>word</div>",
+        ] {
+            assert_eq!(spoken(source), "aboldword.", "{source}");
+        }
+        assert_eq!(spoken("two<span> </span>words"), "two words.");
+        let table = chunks("| Words |\n| --- |\n| first<br>second |\n");
+        assert_eq!(table[1].text, "first second.");
     }
     #[test]
     fn later_limit_and_sentence_boundaries() {
