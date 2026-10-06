@@ -178,6 +178,10 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             output_fallback: false,
         })
     }
+    /// Supplies the monotonic DSP clock used when measuring completion latency.
+    pub fn set_dsp_clock(&mut self, clock: impl Fn() -> f64 + Send + 'static) {
+        self.dsp_clock = Box::new(clock);
+    }
     fn prepare_cursor(
         &self,
         read_code: bool,
@@ -556,7 +560,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         );
         if matches!(
             self.queue.state,
-            PlaybackState::Buffering | PlaybackState::Paused
+            PlaybackState::Buffering | PlaybackState::Paused | PlaybackState::Starting
         ) {
             position = self.reported_position.get().unwrap_or(position);
         } else {
@@ -1616,5 +1620,24 @@ mod tests {
         assert!(s.parts.is_none());
         assert!(s.queue.waiting.is_empty());
         assert_eq!(s.queue.state, PlaybackState::Waiting);
+    }
+    #[test]
+    fn starting_without_audio_keeps_last_reported_position() {
+        let source = "A sentence with sufficient characters for the opening chunk.\n\n".repeat(20);
+        let mut s = session(&source, 0.1);
+        s.play().unwrap();
+        for i in 0..30 {
+            step(&mut s, i as f64 * 0.1);
+        }
+        let prior = s.snapshot();
+        assert!(prior.progress > 0.0);
+        s.queue.playing = None;
+        s.queue.failed_index = None;
+        s.queue.state = PlaybackState::Starting;
+        let now = s.snapshot();
+        assert_eq!(now.source_start, prior.source_start);
+        assert_eq!(now.source_end, prior.source_end);
+        assert_eq!(now.progress, prior.progress);
+        assert_eq!(now.remaining_seconds, prior.remaining_seconds);
     }
 }

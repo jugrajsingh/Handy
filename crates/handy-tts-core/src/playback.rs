@@ -61,7 +61,7 @@ impl<B: Output> Playback<B> {
     ) -> Result<Self, PlaybackError> {
         let (selected, fallback) = match output.names() {
             Ok(names) => resolve_output(tts, handy, &names),
-            Err(_) => (None, true),
+            Err(_) => resolve_output(tts, handy, &[]),
         };
         let fell_back = if output.open(selected.as_deref()).is_ok() {
             fallback
@@ -86,7 +86,7 @@ impl<B: Output> Playback<B> {
     ) -> Result<PreparedOutput<B::Prepared>, PlaybackError> {
         let (selected, fallback) = match self.output.names() {
             Ok(names) => resolve_output(tts, handy, &names),
-            Err(_) => (None, true),
+            Err(_) => resolve_output(tts, handy, &[]),
         };
         let (stream, fell_back) = match self.output.prepare(selected.as_deref()) {
             Ok(stream) => (stream, fallback),
@@ -107,7 +107,7 @@ impl<B: Output> Playback<B> {
     pub fn reopen(&mut self, tts: Option<&str>, handy: Option<&str>) -> Result<(), PlaybackError> {
         let (selected, fallback) = match self.output.names() {
             Ok(names) => resolve_output(tts, handy, &names),
-            Err(_) => (None, true),
+            Err(_) => resolve_output(tts, handy, &[]),
         };
         let fell_back = if self.output.open(selected.as_deref()).is_ok() {
             fallback
@@ -381,5 +381,39 @@ mod tests {
         p.output.default_missing = true;
         assert_eq!(p.reopen(None, None), Err(PlaybackError::Unavailable));
         assert_eq!(p.current_index(), Some(7));
+    }
+    #[test]
+    fn enumeration_failure_on_default_does_not_report_fallback() {
+        for (tts, handy) in [
+            (None, None),
+            (Some("Default"), Some("Bluetooth")),
+            (None, Some("Default")),
+        ] {
+            let fake = Fake {
+                names_failed: true,
+                ..Fake::default()
+            };
+            let mut p = Playback::new(fake, tts, handy).unwrap();
+            assert!(!p.take_fallback());
+            p.reopen(tts, handy).unwrap();
+            assert!(!p.take_fallback());
+            let prepared = p.prepare(tts, handy).unwrap();
+            p.commit(prepared);
+            assert!(!p.take_fallback());
+        }
+    }
+    #[test]
+    fn reopen_while_paused_keeps_output_paused_and_replays_on_resume() {
+        let mut p = Playback::new(Fake::default(), None, None).unwrap();
+        p.play(7, chunk(), 0).unwrap();
+        p.pause();
+        p.reopen(None, None).unwrap();
+        assert!(p.output.paused);
+        p.poll().unwrap();
+        assert_eq!(p.output.played, [7]);
+        p.resume();
+        p.poll().unwrap();
+        assert_eq!(p.output.played, [7, 7]);
+        assert!(!p.output.paused);
     }
 }

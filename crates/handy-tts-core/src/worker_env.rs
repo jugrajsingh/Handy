@@ -47,9 +47,13 @@ pub fn discover_driver(root: &Path) -> Result<Option<NpuDriver>, DriverError> {
     Ok(choices.into_iter().next().map(|(_, driver)| driver))
 }
 pub fn worker_environment(
+    device: crate::device::Device,
     driver: Option<&NpuDriver>,
     parent_library_path: Option<&OsStr>,
 ) -> BTreeMap<OsString, OsString> {
+    if device != crate::device::Device::Npu {
+        return BTreeMap::new();
+    }
     let Some(driver) = driver else {
         return BTreeMap::new();
     };
@@ -79,7 +83,11 @@ mod tests {
             version: "1.38.0".into(),
             library_dir: PathBuf::from("/fixture/intel-npu/1.38.0/root/usr/lib/x86_64-linux-gnu"),
         };
-        let values = worker_environment(Some(&driver), Some(OsStr::new("/usr/lib/Handy/tts")));
+        let values = worker_environment(
+            crate::device::Device::Npu,
+            Some(&driver),
+            Some(OsStr::new("/usr/lib/Handy/tts")),
+        );
         let mut command = std::process::Command::new("handy-tts");
         command.envs(&values);
         assert_eq!(command.get_envs().count(), 2);
@@ -90,7 +98,19 @@ mod tests {
             )
         );
         assert_eq!(std::env::var_os("LD_LIBRARY_PATH"), before);
-        assert!(worker_environment(None, Some(OsStr::new("/system"))).is_empty());
+        assert!(
+            worker_environment(
+                crate::device::Device::Npu,
+                None,
+                Some(OsStr::new("/system"))
+            )
+            .is_empty()
+        );
+        for device in [crate::device::Device::Cpu, crate::device::Device::Gpu] {
+            assert!(
+                worker_environment(device, Some(&driver), Some(OsStr::new("/system"))).is_empty()
+            );
+        }
         assert_eq!(version_parts("1.38.0"), Some(vec![1, 38, 0]));
         assert!(version_parts("env.sh").is_none());
     }

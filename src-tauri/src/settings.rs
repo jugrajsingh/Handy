@@ -436,6 +436,21 @@ impl std::ops::DerefMut for SecretMap {
 #[derive(Serialize, Deserialize, Debug, Clone, Type)]
 #[serde(default)]
 pub struct AppSettings {
+    #[serde(default = "default_tts_model")]
+    pub tts_model_id: String,
+    #[serde(default = "default_tts_voices")]
+    pub tts_voice: HashMap<String, String>,
+    #[serde(default = "default_tts_speed")]
+    pub tts_speed: f32,
+    #[serde(default)]
+    pub tts_pitch_semitones: f32,
+    #[serde(default)]
+    pub tts_output_device: Option<String>,
+    #[serde(default)]
+    pub tts_read_code_blocks: bool,
+    #[serde(default)]
+    pub tts_run_on: std::collections::BTreeMap<String, handy_tts_core::device::RunOn>,
+
     /// Internal settings schema marker for one-time migrations. Fresh installs
     /// start at the current version; existing stores missing this key are
     /// treated as version 0 and migrated forward.
@@ -1016,6 +1031,23 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
 
 pub const SETTINGS_STORE_PATH: &str = "settings_store.json";
 
+pub fn default_tts_model() -> String {
+    "pocket-en".into()
+}
+pub fn default_tts_speed() -> f32 {
+    1.0
+}
+pub fn default_tts_voices() -> HashMap<String, String> {
+    [
+        ("pocket-en", "alba"),
+        ("supertonic-3", "F1"),
+        ("kokoro-82m-int8", "af_heart"),
+    ]
+    .into_iter()
+    .map(|(id, voice)| (id.into(), voice.into()))
+    .collect()
+}
+
 pub fn get_default_settings() -> AppSettings {
     #[cfg(target_os = "windows")]
     let default_shortcut = "ctrl+space";
@@ -1068,7 +1100,24 @@ pub fn get_default_settings() -> AppSettings {
         },
     );
 
+    bindings.insert(
+        "read_aloud".into(),
+        ShortcutBinding {
+            id: "read_aloud".into(),
+            name: "settings.general.readAloudShortcut.label".into(),
+            description: "settings.general.readAloudShortcut.description".into(),
+            default_binding: "super+alt+r".into(),
+            current_binding: "super+alt+r".into(),
+        },
+    );
     AppSettings {
+        tts_model_id: default_tts_model(),
+        tts_voice: default_tts_voices(),
+        tts_speed: default_tts_speed(),
+        tts_pitch_semitones: 0.0,
+        tts_output_device: None,
+        tts_read_code_blocks: false,
+        tts_run_on: std::collections::BTreeMap::new(),
         settings_schema_version: default_settings_schema_version(),
         bindings,
         shortcut_activation: ShortcutActivation::default(),
@@ -2323,5 +2372,37 @@ mod tests {
         let out = format!("{:?}", map);
         assert!(!out.contains("secret"));
         assert!(out.contains("[REDACTED]"));
+    }
+}
+
+#[cfg(test)]
+mod tts_defaults_tests {
+    use super::*;
+    #[test]
+    fn legacy_settings_get_tts_defaults_without_losing_existing_fields() {
+        let mut value = serde_json::to_value(get_default_settings()).unwrap();
+        for key in [
+            "tts_model_id",
+            "tts_voice",
+            "tts_speed",
+            "tts_pitch_semitones",
+            "tts_output_device",
+            "tts_read_code_blocks",
+            "tts_run_on",
+        ] {
+            value.as_object_mut().unwrap().remove(key);
+        }
+        let settings: AppSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(settings.tts_model_id, "pocket-en");
+        assert_eq!(settings.tts_speed, 1.0);
+        assert_eq!(settings.tts_pitch_semitones, 0.0);
+        assert_eq!(settings.tts_output_device, None);
+        assert!(!settings.tts_read_code_blocks);
+        assert!(settings.tts_run_on.is_empty());
+        assert_eq!(settings.tts_voice["pocket-en"], "alba");
+        assert_eq!(
+            settings.bindings["read_aloud"].current_binding,
+            "super+alt+r"
+        );
     }
 }

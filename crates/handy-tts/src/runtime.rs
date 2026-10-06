@@ -86,6 +86,46 @@ pub fn memory_available() -> Result<u64> {
     }
 }
 
+/// Retries over-cap NPU inputs as ordered word-boundary parts with bounded PCM.
+fn synthesize_bounded(
+    engine: &mut dyn SynthEngine,
+    text: &str,
+    speed: Option<f32>,
+    cancelled: &AtomicBool,
+) -> Result<Vec<f32>> {
+    let mut pending = vec![text];
+    let mut samples = Vec::new();
+    while let Some(part) = pending.pop() {
+        ensure!(!cancelled.load(Ordering::SeqCst), "cancelled");
+        match engine.synthesize(part, speed, cancelled) {
+            Ok(pcm) => {
+                ensure!(
+                    pcm.len() <= handy_tts_core::protocol::MAX_SAMPLES - samples.len(),
+                    "PCM limit exceeded"
+                );
+                samples.extend(pcm);
+            }
+            Err(error)
+                if engine.device() == handy_tts_core::device::Device::Npu
+                    && error
+                        .downcast_ref::<crate::padding::StaticCapacity>()
+                        .is_some() =>
+            {
+                let split = part
+                    .char_indices()
+                    .filter(|(i, ch)| *i > 0 && ch.is_whitespace() && !part[*i..].trim().is_empty())
+                    .min_by_key(|(i, _)| i.abs_diff(part.len() / 2))
+                    .map(|(i, _)| i)
+                    .context("NPU input cannot split at a word boundary")?;
+                pending.push(part[split..].trim_start());
+                pending.push(part[..split].trim_end());
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(samples)
+}
+
 pub fn run(
     reader: impl BufRead + Send + 'static,
     mut writer: impl Write,
@@ -236,7 +276,7 @@ pub fn run(
                         ensure!((0.5..=2.0).contains(&speed), "invalid speed");
                     }
                     let engine = engine.as_mut().context("model not loaded")?;
-                    let samples = engine.synthesize(&text, speed, &cancel)?;
+                    let samples = synthesize_bounded(engine.as_mut(), &text, speed, &cancel)?;
                     ensure!(
                         !samples.is_empty()
                             && samples.len() <= handy_tts_core::protocol::MAX_SAMPLES

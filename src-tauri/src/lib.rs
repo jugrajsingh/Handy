@@ -32,6 +32,7 @@ mod transcription_coordinator;
 mod transcription_hook;
 mod tray;
 mod tray_i18n;
+pub mod tts;
 mod utils;
 pub mod webkit_renderer;
 

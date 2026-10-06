@@ -1,9 +1,24 @@
 use anyhow::{Context, Result, ensure};
+#[derive(Debug)]
+pub struct StaticCapacity;
+impl std::fmt::Display for StaticCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NPU static input capacity exceeded")
+    }
+}
+impl std::error::Error for StaticCapacity {}
 pub fn pad<T: Default + Clone>(shape: &[i64], target: &[i64], data: &[T]) -> Result<Vec<T>> {
     ensure!(
-        shape.len() == target.len() && shape.iter().zip(target).all(|(a, b)| *a >= 0 && *a <= *b),
-        "static shape would truncate input"
+        shape.len() == target.len() && shape.iter().chain(target).all(|d| *d >= 0),
+        "invalid static shape"
     );
+    if shape
+        .iter()
+        .zip(target)
+        .any(|(actual, fixed)| actual > fixed)
+    {
+        return Err(StaticCapacity.into());
+    }
     let product = |s: &[i64]| {
         s.iter()
             .try_fold(1usize, |n, d| n.checked_mul(*d as usize))
