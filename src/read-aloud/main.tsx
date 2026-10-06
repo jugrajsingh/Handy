@@ -4,7 +4,7 @@ import { listen, emit } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useTranslation } from "react-i18next";
 import { commands, type SessionSnapshot, type Result } from "@/bindings";
-import { createPopupActions } from "./actions";
+import { createPopupAdapter, type PopupEvent } from "./adapter";
 import { ReadAloudPopup } from "./ReadAloudPopup";
 import "@/i18n";
 import "@/App.css";
@@ -34,7 +34,7 @@ function PopupApp() {
   current.current = { ...snapshot, text };
   const actions = useMemo(
     () =>
-      createPopupActions(
+      createPopupAdapter(
         () => current.current,
         (next) => {
           current.current = { ...current.current, ...next };
@@ -67,25 +67,14 @@ function PopupApp() {
   }, [t]);
   useEffect(() => {
     let alive = true;
-    const unlisten = listen<{
-      text: string | null;
-      visible: boolean;
-      snapshot: SessionSnapshot;
-    }>("read-aloud-state", ({ payload }) => {
-      if (alive && payload.snapshot.epoch >= current.current.epoch) {
-        const next = {
-          ...payload.snapshot,
-          text: payload.text ?? current.current.text,
-        };
-        if (payload.visible && payload.text !== null) actions.reopen(next);
-        else actions.event(next);
-      }
+    const unlisten = listen<PopupEvent>("read-aloud-state", ({ payload }) => {
+      if (alive) actions.event(payload);
     });
     void commands
       .getReadAloudState()
       .then(unwrap)
       .then((view) => {
-        if (alive) actions.event({ ...view.snapshot, text: view.text });
+        if (alive) actions.event(view);
       })
       .catch(() => {});
     return () => {
@@ -98,7 +87,6 @@ function PopupApp() {
       text={text}
       snapshot={snapshot}
       edit={(value) => {
-        setText(value);
         void actions.edit(value);
       }}
       toggle={() => {

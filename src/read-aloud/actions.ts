@@ -36,9 +36,21 @@ export function createPopupActions(
   dependencies: PopupDependencies,
 ) {
   let pending = false;
+  let intent = 0;
   let editSequence = 0;
+  let editing = false;
+  let localStopped = false;
+  let replacementReady = true;
   let closed = false;
   let writes = Promise.resolve();
+  const snapshot = () => {
+    const current = getSnapshot();
+    return localStopped ? { ...current, state: "waiting" as const } : current;
+  };
+  const cancelIntent = () => {
+    intent++;
+    pending = false;
+  };
   const attempt = async (action: () => Promise<void>) => {
     try {
       await action();
@@ -46,56 +58,83 @@ export function createPopupActions(
       dependencies.error("tts.errors.generic");
     }
   };
+  const playback = async (toggle: boolean) => {
+    pending = true;
+    const requested = ++intent;
+    const pause = toggle && controls(snapshot()).isPlaying;
+    try {
+      if (editing) await writes;
+      if (requested !== intent || closed || !replacementReady) return;
+      localStopped = false;
+      await attempt(pause ? dependencies.pause : dependencies.play);
+    } finally {
+      if (requested === intent) pending = false;
+    }
+  };
   return {
     async toggle() {
-      if (pending || closed || !controls(getSnapshot()).canPlay) return;
-      pending = true;
-      try {
-        await attempt(
-          controls(getSnapshot()).isPlaying
-            ? dependencies.pause
-            : dependencies.play,
-        );
-      } finally {
-        pending = false;
+      if (pending && editing) {
+        cancelIntent();
+        return;
       }
+      if (pending || closed || !controls(snapshot()).canPlay) return;
+      await playback(true);
     },
     edit(text: string) {
       const sequence = ++editSequence;
-      const stopped = dependencies.stop();
+      cancelIntent();
+      editing = true;
+      localStopped = true;
+      replacementReady = false;
+      const stopped = dependencies.stop().then(
+        () => true,
+        () => false,
+      );
       writes = writes
         .then(async () => {
-          await stopped;
-          if (sequence === editSequence && !closed)
-            await dependencies.replaceText(text);
+          if (!(await stopped)) throw new Error("Stop failed");
+          if (sequence !== editSequence || closed) return;
+          await dependencies.replaceText(text);
+          if (sequence === editSequence && !closed) replacementReady = true;
         })
-        .catch(() => dependencies.error("tts.errors.generic"));
+        .catch(() => {
+          if (sequence === editSequence && !closed)
+            dependencies.error("tts.errors.generic");
+        })
+        .finally(() => {
+          if (sequence === editSequence) editing = false;
+        });
       return writes;
     },
     async play() {
-      if (pending || closed || !controls(getSnapshot()).canPlay) return;
-      pending = true;
-      try {
-        await attempt(dependencies.play);
-      } finally {
-        pending = false;
-      }
+      if (pending || closed || !controls(snapshot()).canPlay) return;
+      await playback(false);
     },
     async stop() {
-      if (closed || !controls(getSnapshot()).canStop) return;
+      cancelIntent();
+      if (closed || !controls(snapshot()).canStop) return;
       await attempt(dependencies.stop);
     },
     async close() {
       closed = true;
       editSequence++;
+      cancelIntent();
       await attempt(dependencies.close);
     },
-    event(snapshot: PopupSnapshot) {
-      if (!closed && snapshot.epoch >= getSnapshot().epoch) apply(snapshot);
+    event(next: PopupSnapshot) {
+      if (!closed && next.epoch >= getSnapshot().epoch) {
+        if (!editing) localStopped = false;
+        apply(next);
+      }
     },
-    reopen(snapshot: PopupSnapshot) {
+    reopen(next: PopupSnapshot) {
       closed = false;
-      apply(snapshot);
+      editSequence++;
+      cancelIntent();
+      editing = false;
+      localStopped = false;
+      replacementReady = true;
+      apply(next);
     },
   };
 }
