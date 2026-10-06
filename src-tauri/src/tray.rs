@@ -195,6 +195,7 @@ struct MenuInputs {
     /// The notice to show as a menu line.
     notice: Option<NoticeCode>,
     cleanup: Option<CleanupMenu>,
+    tts: handy_tts_core::tray::TtsMenu,
     selected_cleanup_model: Option<String>,
     downloaded_cleanup_models: Vec<(String, String)>,
     model_loaded: bool,
@@ -583,6 +584,16 @@ fn compute_desired(app: &AppHandle, icon_state: TrayIconState) -> TrayDesired {
             secure_input,
             notice: notice.map(|notice| notice.code),
             cleanup,
+            tts: app
+                .try_state::<Arc<crate::tts::service::TtsService>>()
+                .map(|service| service.tray_snapshot())
+                .unwrap_or_else(|| {
+                    handy_tts_core::tray::tts_menu(
+                        &[],
+                        None,
+                        handy_tts_core::lifecycle::State::Unloaded,
+                    )
+                }),
             selected_cleanup_model: settings.local_llm_model_id.clone(),
             downloaded_cleanup_models,
             model_loaded,
@@ -1011,6 +1022,35 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
             menu.insert(&unload_item, 7)?;
             menu.insert(&separator()?, 8)?;
         }
+        let tts_label = tray_label(&strings.tts_model, &english.tts_model);
+        let tts_submenu = Submenu::with_id(app, "tts_model_submenu", tts_label, true)?;
+        for choice in &inputs.tts.choices {
+            tts_submenu.append(&CheckMenuItem::with_id(
+                app,
+                &choice.id,
+                &choice.label,
+                true,
+                choice.checked,
+                None::<&str>,
+            )?)?;
+        }
+        let status = tts_status_label(&inputs.tts.status_key, &strings, &english);
+        tts_submenu.append(&MenuItem::with_id(
+            app,
+            "tts_status",
+            status,
+            false,
+            None::<&str>,
+        )?)?;
+        tts_submenu.append(&MenuItem::with_id(
+            app,
+            "unload_tts_model",
+            tray_label(&strings.tts_unload, &english.tts_unload),
+            inputs.tts.unload_enabled,
+            None::<&str>,
+        )?)?;
+        menu.insert(&tts_submenu, 4)?;
+        menu.insert(&separator()?, 5)?;
         menu
     };
 
@@ -1042,6 +1082,17 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
     }
 
     Ok((menu, tooltip))
+}
+
+fn tts_status_label<'a>(key: &str, strings: &'a TrayStrings, english: &'a TrayStrings) -> &'a str {
+    let (translated, fallback) = match key {
+        "tts.status.starting" => (&strings.tts_starting, &english.tts_starting),
+        "tts.status.ready" => (&strings.tts_ready, &english.tts_ready),
+        "tts.status.stopping" => (&strings.tts_stopping, &english.tts_stopping),
+        "tts.status.failed" => (&strings.tts_failed, &english.tts_failed),
+        _ => (&strings.tts_unloaded, &english.tts_unloaded),
+    };
+    tray_label(translated, fallback)
 }
 
 fn last_transcript_text(entry: &HistoryEntry) -> &str {
@@ -1666,6 +1717,11 @@ mod tests {
             secure_input: false,
             notice: None,
             cleanup: None,
+            tts: handy_tts_core::tray::tts_menu(
+                &[],
+                None,
+                handy_tts_core::lifecycle::State::Unloaded,
+            ),
             selected_cleanup_model: None,
             downloaded_cleanup_models: Vec::new(),
             model_loaded: true,
@@ -1682,6 +1738,39 @@ mod tests {
             state,
             model_name: "S1-mini".into(),
         }
+    }
+
+    #[test]
+    fn tts_menu_snapshot_changes_are_coalesced_and_status_uses_english_fallback() {
+        let downloaded = vec![("pocket-en".into(), "Pocket TTS (English)".into())];
+        let mut first = inputs(false);
+        first.tts = handy_tts_core::tray::tts_menu(
+            &downloaded,
+            Some("pocket-en"),
+            handy_tts_core::lifecycle::State::Unloaded,
+        );
+        let mut later = first.clone();
+        later.tts = handy_tts_core::tray::tts_menu(
+            &downloaded,
+            Some("pocket-en"),
+            handy_tts_core::lifecycle::State::Ready,
+        );
+        let state = TrayState::new();
+        let mut inner = state.lock();
+        inner.mark_menu_applied(first.clone(), 0);
+        assert!(!inner.menu_needs_rebuild(&first));
+        assert!(inner.menu_needs_rebuild(&later));
+        let english = get_tray_translations(Some("en".into()));
+        let mut missing = english.clone();
+        missing.tts_ready.clear();
+        assert_eq!(
+            tts_status_label("tts.status.ready", &missing, &english),
+            english.tts_ready
+        );
+        assert_eq!(
+            tts_status_label("tts.status.failed", &english, &english),
+            english.tts_failed
+        );
     }
 
     #[test]

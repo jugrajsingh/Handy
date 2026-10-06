@@ -18,7 +18,14 @@
     "secureInputWarning": "⚠ Shortcuts blocked by Secure Input",
     "language": "Language",
     "autoLanguage": "Auto",
-    "otherLanguages": "Other Languages"
+    "otherLanguages": "Other Languages",
+    "ttsModel": "Text-to-speech model",
+    "ttsUnload": "Unload text-to-speech model",
+    "ttsStarting": "Starting",
+    "ttsReady": "Loaded",
+    "ttsStopping": "Stopping",
+    "ttsFailed": "Failed",
+    "ttsUnloaded": "Unloaded"
   },
   "sidebar": {
     "general": "General",

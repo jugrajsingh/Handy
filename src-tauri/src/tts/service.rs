@@ -32,6 +32,7 @@ pub struct TtsService {
     pub fence: Arc<PasteFence>,
     pipeline: Mutex<handy_tts_core::handoff::PipelineFence>,
     pub downloader: Downloader,
+    tray: Mutex<handy_tts_core::tray::TtsMenu>,
     preview: Arc<handy_tts_core::preview::PreviewCoordinator>,
     pub cancellations:
         Mutex<std::collections::BTreeMap<String, Arc<std::sync::atomic::AtomicBool>>>,
@@ -85,6 +86,11 @@ impl TtsService {
             fence: Arc::new(PasteFence::default()),
             pipeline: Mutex::new(handy_tts_core::handoff::PipelineFence::default()),
             downloader: Downloader::default(),
+            tray: Mutex::new(handy_tts_core::tray::tts_menu(
+                &[],
+                None,
+                handy_tts_core::lifecycle::State::Unloaded,
+            )),
             preview: Arc::new(handy_tts_core::preview::PreviewCoordinator::default()),
             cancellations: Mutex::new(std::collections::BTreeMap::new()),
         });
@@ -92,6 +98,43 @@ impl TtsService {
         std::thread::spawn(move || {
             let result = started.boot();
             *started.ready.lock().unwrap_or_else(|p| p.into_inner()) = result;
+            let weak = Arc::downgrade(&started);
+            drop(started);
+            while let Some(service) = weak.upgrade() {
+                if let Ok(ready) = service.ready() {
+                    let settings = crate::settings::get_settings(&service.app);
+                    let downloaded = handy_tts_core::catalog::entries()
+                        .map(|entries| {
+                            entries
+                                .iter()
+                                .filter(|entry| {
+                                    handy_tts_core::download::is_downloaded(&ready.root, entry)
+                                })
+                                .map(|entry| (entry.id.to_owned(), entry.name.to_owned()))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    let desired = handy_tts_core::tray::tts_menu(
+                        &downloaded,
+                        Some(&settings.tts_model_id),
+                        ready.manager.status(),
+                    );
+                    let changed = {
+                        let mut cached = service.tray.lock().unwrap_or_else(|p| p.into_inner());
+                        if *cached == desired {
+                            false
+                        } else {
+                            *cached = desired;
+                            true
+                        }
+                    };
+                    if changed {
+                        crate::tray::update_tray_menu(&service.app);
+                    }
+                }
+                drop(service);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
         });
         service
     }
@@ -302,6 +345,10 @@ impl TtsService {
                 }
             });
         })
+    }
+    /// Returns the tray snapshot sampled on the service thread.
+    pub fn tray_snapshot(&self) -> handy_tts_core::tray::TtsMenu {
+        self.tray.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
     pub fn ready(&self) -> Result<Ready, String> {
         self.ready.lock().unwrap_or_else(|p| p.into_inner()).clone()

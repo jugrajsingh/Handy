@@ -333,6 +333,58 @@ fn initialize_core_logic(app_handle: &AppHandle) {
                     tray::unload_cleanup_on_worker(move || manager.unload());
                 }
             }
+            "unload_tts_model" => {
+                if let Some(service) = app.try_state::<Arc<tts::service::TtsService>>() {
+                    let service = service.inner().clone();
+                    handy_tts_core::tray::select_tts_on_worker(move || {
+                        if let Ok(ready) = service.ready() {
+                            let _ = ready.session.stop_and_wait();
+                            ready.manager.unload();
+                        }
+                    });
+                }
+            }
+            id if id.starts_with("tts_model:") => {
+                let Some(model_id) = id.strip_prefix("tts_model:") else {
+                    return;
+                };
+                let model_id = model_id.to_owned();
+                let app = app.clone();
+                handy_tts_core::tray::select_tts_on_worker(move || {
+                    let Some(service) = app.try_state::<Arc<tts::service::TtsService>>() else {
+                        return;
+                    };
+                    let menu = service.tray_snapshot();
+                    let downloaded = menu
+                        .choices
+                        .iter()
+                        .filter_map(|choice| {
+                            choice
+                                .id
+                                .strip_prefix("tts_model:")
+                                .map(|id| (id.to_owned(), choice.label.clone()))
+                        })
+                        .collect::<Vec<_>>();
+                    let result =
+                        handy_tts_core::tray::select_tts_with(&model_id, &downloaded, |model_id| {
+                            let entry = handy_tts_core::catalog::entry(&model_id)
+                                .map_err(|e| e.to_string())?;
+                            let settings = settings::get_settings(&app);
+                            let mut chosen = tts::service::selection(&settings);
+                            chosen.model_id = model_id;
+                            chosen.voice = settings
+                                .tts_voice
+                                .get(entry.id)
+                                .cloned()
+                                .unwrap_or_else(|| entry.default_voice.into());
+                            tts::commands::set_selection(&app, &service, chosen)
+                        });
+                    if let Err(error) = result {
+                        log::error!("Read-aloud tray selection failed: {error}");
+                    }
+                    tray::reconcile_model_checkmarks(&app);
+                });
+            }
             "cancel" => {
                 use crate::utils::cancel_current_operation;
 
