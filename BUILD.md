@@ -27,7 +27,7 @@ This guide covers how to set up the development environment and build Handy from
   winget install Kitware.CMake
   ```
 
-- [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) from LunarG — required to
+- [Vulkan SDK](https://vulkan.lunarg.com/sdk/home) from LunarG - required to
   build the Vulkan GPU backend (`vulkan-shaders-gen` needs the SDK's headers
   and `glslc`):
 
@@ -40,7 +40,7 @@ This guide covers how to set up the development environment and build Handy from
 > [!NOTE]
 > Windows' 260-character path limit used to break the native Vulkan build in
 > most checkouts. Since `transcribe-cpp` 0.1.3 the build works around it
-> automatically (it compiles through a short NTFS junction — no admin rights
+> automatically (it compiles through a short NTFS junction - no admin rights
 > or setup needed), so a normal checkout just builds. If you still hit
 > path-limit errors, see
 > [Windows build fails with path-limit errors](#windows-build-fails-with-path-limit-errors-msb3491--ftk1011--msb6003)
@@ -103,13 +103,13 @@ This compiles a release binary and generates platform-specific bundles (deb, rpm
 
 ## Linux Install (from source)
 
-The raw binary (`src-tauri/target/release/handy`) cannot run standalone — it needs Tauri resource files (tray icons, sounds, VAD model) to be co-located at the expected path.
+The raw binary (`target/release/handy`) cannot run standalone - it needs Tauri resource files (tray icons, sounds, VAD model) to be co-located at the expected path.
 
 **Install from the deb bundle** (works on any Linux distro):
 
 ```bash
 cd /tmp
-ar x /path/to/Handy/src-tauri/target/release/bundle/deb/Handy_*_amd64.deb data.tar.gz
+ar x /path/to/Handy/target/release/bundle/deb/Handy_*_amd64.deb data.tar.gz
 tar xzf data.tar.gz
 sudo cp usr/bin/handy /usr/bin/
 sudo cp -a usr/lib/. /usr/lib/
@@ -122,7 +122,7 @@ The runtime libraries live in the app-private `/usr/lib/Handy/` (on the binary's
 After subsequent rebuilds, copy the binary and any refreshed runtime libraries:
 
 ```bash
-sudo cp src-tauri/target/release/handy /usr/bin/
+sudo cp target/release/handy /usr/bin/
 sudo mkdir -p /usr/lib/Handy
 sudo cp -a src-tauri/transcribe-libs/. /usr/lib/Handy/
 ```
@@ -177,12 +177,12 @@ failed to bundle project `failed to run linuxdeploy`
 Tauri swallows the real linuxdeploy error. To see it, run linuxdeploy manually:
 
 ```bash
-cd src-tauri/target/release/bundle/appimage
+cd target/release/bundle/appimage
 ~/.cache/tauri/linuxdeploy-x86_64.AppImage --appimage-extract-and-run \
   --appdir Handy.AppDir --plugin gtk --output appimage
 ```
 
-**Workaround:** The binary, deb, and rpm bundles all build fine — only the AppImage step fails. To skip it:
+**Workaround:** The binary, deb, and rpm bundles all build fine - only the AppImage step fails. To skip it:
 
 ```bash
 bun run tauri build -- --bundles deb
@@ -211,7 +211,7 @@ error MSB6003: The specified task executable "CL.exe" could not be run.
 System.IO.DirectoryNotFoundException: Could not find a part of the path ...
 ```
 
-This is **not** a code or toolchain problem — it's Windows' legacy 260-character
+This is **not** a code or toolchain problem - it's Windows' legacy 260-character
 path limit (`MAX_PATH`), overflowed by the Vulkan shader generator's nested
 CMake build tree on top of Cargo's already-deep
 `target\release\build\<crate>-<hash>\out\build\...` directory.
@@ -219,13 +219,13 @@ CMake build tree on top of Cargo's already-deep
 Since `transcribe-cpp` 0.1.3 this is mitigated automatically: the native build
 compiles through a short NTFS junction under `%LOCALAPPDATA%\tcs` (created
 without admin rights), so a normal checkout builds with no setup. Enabling
-Windows long paths does **not** reliably help here — MSBuild's native
-`FileTracker` (`tracker.exe`) ignores the long-paths flag — which is why the
+Windows long paths does **not** reliably help here - MSBuild's native
+`FileTracker` (`tracker.exe`) ignores the long-paths flag - which is why the
 junction, not the registry flag, is the fix.
 
 If you still see the errors above, junction creation was likely blocked
-(filesystem or corporate policy) — the failing build's log then contains a
-`transcribe-cpp-sys: could not create short build junction ...` warning — or
+(filesystem or corporate policy) - the failing build's log then contains a
+`transcribe-cpp-sys: could not create short build junction ...` warning - or
 your checkout is deep enough to overflow even the shortened layout. Work
 around either case with a short Cargo target directory:
 
@@ -239,7 +239,7 @@ $env:CARGO_TARGET_DIR = "C:\h"
 ```
 
 Artifacts then land in `C:\h\release\...` instead of the repo's
-`src-tauri\target\`. Open a **new terminal** if you persisted the variable —
+`target\`. Open a **new terminal** if you persisted the variable -
 it is only picked up by freshly started processes. Then `bun run tauri dev`
 and `bun run tauri build` work normally.
 

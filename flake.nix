@@ -88,7 +88,7 @@
             inherit version;
             src = self;
 
-            cargoRoot = "src-tauri";
+            cargoRoot = ".";
             buildAndTestSubdir = "src-tauri";
             tauriBundleType = "deb";
 

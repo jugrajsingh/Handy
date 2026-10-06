@@ -114,7 +114,7 @@ jobs:
         if: ${{ !inputs.no-cache }}
         uses: swatinem/rust-cache@v2
         with:
-          workspaces: "./src-tauri -> target"
+          workspaces: ". -> target"
           key: ${{ inputs.platform }}-${{ inputs.target }}-no-bin-v2
           cache-bin: false
 
@@ -402,12 +402,12 @@ jobs:
           )
           # The install manifest sits next to libtranscribe in <crate-out>/lib.
           # Pick the newest match in case a stale build dir lingers in the cache.
-          LIBDIR="$(find "src-tauri/target/$PROFILE/build" \
+          LIBDIR="$(find "target/$PROFILE/build" \
             -type f -name transcribe-link.json -path '*transcribe-cpp-sys*/out/lib/*' \
             -printf '%T@ %h\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
           if [ -z "${LIBDIR:-}" ] || [ ! -d "$LIBDIR" ]; then
             echo "ERROR: could not locate transcribe-cpp-sys install lib dir" >&2
-            find src-tauri/target \( -name 'libtranscribe*' -o -name 'libggml*' \) 2>/dev/null >&2 || true
+            find target \( -name 'libtranscribe*' -o -name 'libggml*' \) 2>/dev/null >&2 || true
             exit 1
           fi
           LIBDIR="$(cd "$LIBDIR" && pwd)"
@@ -488,7 +488,7 @@ jobs:
         run: |
           set -euo pipefail
           PROFILE="${{ steps.build-profile.outputs.profile }}"
-          APPIMAGE_PATH="$(find "src-tauri/target/${PROFILE}/bundle/appimage" -name '*.AppImage' -print -quit 2>/dev/null || true)"
+          APPIMAGE_PATH="$(find "target/${PROFILE}/bundle/appimage" -name '*.AppImage' -print -quit 2>/dev/null || true)"
           if [ -z "$APPIMAGE_PATH" ]; then
             echo "No AppImage produced by this Linux build; skipping metadata verification"
             exit 0
@@ -519,8 +519,8 @@ jobs:
         with:
           name: ${{ inputs.asset-prefix }}-${{ inputs.target }}
           path: |
-            src-tauri/target/${{ inputs.target }}/${{ steps.build-profile.outputs.profile }}/bundle/dmg/*.dmg
-            src-tauri/target/${{ inputs.target }}/${{ steps.build-profile.outputs.profile }}/bundle/macos/*.app
+            target/${{ inputs.target }}/${{ steps.build-profile.outputs.profile }}/bundle/dmg/*.dmg
+            target/${{ inputs.target }}/${{ steps.build-profile.outputs.profile }}/bundle/macos/*.app
           retention-days: 30
 
       - name: Audit Linux package runtime contents
@@ -539,7 +539,7 @@ jobs:
           fi
 
           PROFILE="${{ steps.build-profile.outputs.profile }}"
-          BUNDLE_DIR="src-tauri/target/${PROFILE}/bundle"
+          BUNDLE_DIR="target/${PROFILE}/bundle"
 
           require_pattern() {
             local listing="$1"
@@ -701,9 +701,9 @@ jobs:
         with:
           name: ${{ inputs.asset-prefix }}-${{ inputs.platform }}-${{ inputs.target }}
           path: |
-            src-tauri/target/${{ steps.build-profile.outputs.profile }}/bundle/deb/*.deb
-            src-tauri/target/${{ steps.build-profile.outputs.profile }}/bundle/appimage/*.AppImage
-            src-tauri/target/${{ steps.build-profile.outputs.profile }}/bundle/rpm/*.rpm
+            target/${{ steps.build-profile.outputs.profile }}/bundle/deb/*.deb
+            target/${{ steps.build-profile.outputs.profile }}/bundle/appimage/*.AppImage
+            target/${{ steps.build-profile.outputs.profile }}/bundle/rpm/*.rpm
           retention-days: 30
 
       # Run on Windows releases too; upload-artifacts only controls retention.
@@ -713,7 +713,7 @@ jobs:
         run: |
           $profile = "${{ steps.build-profile.outputs.profile }}"
           $target = "${{ inputs.target }}"
-          $base = "src-tauri/target"
+          $base = "target"
           if ($target -and $target -ne "x86_64-pc-windows-msvc") {
             $bundleBase = Join-Path $base (Join-Path $target (Join-Path $profile "bundle"))
           } else {
@@ -815,6 +815,6 @@ jobs:
         with:
           name: ${{ inputs.asset-prefix }}-${{ inputs.target }}
           path: |
-            src-tauri/target/${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('{0}/{1}', inputs.target, steps.build-profile.outputs.profile) || steps.build-profile.outputs.profile }}/bundle/msi/*.msi
-            src-tauri/target/${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('{0}/{1}', inputs.target, steps.build-profile.outputs.profile) || steps.build-profile.outputs.profile }}/bundle/nsis/*.exe
+            target/${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('{0}/{1}', inputs.target, steps.build-profile.outputs.profile) || steps.build-profile.outputs.profile }}/bundle/msi/*.msi
+            target/${{ inputs.target != '' && inputs.target != 'x86_64-pc-windows-msvc' && format('{0}/{1}', inputs.target, steps.build-profile.outputs.profile) || steps.build-profile.outputs.profile }}/bundle/nsis/*.exe
           retention-days: 30

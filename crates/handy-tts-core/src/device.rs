@@ -93,6 +93,16 @@ impl Ratings {
             if recommended != 1 {
                 return Err(DeviceError::InvalidRatings);
             }
+            let ordered = candidates(
+                RunOn::Auto,
+                &[Device::Cpu, Device::Gpu, Device::Npu],
+                m,
+                &[],
+            )?;
+            let winner = ordered.first().ok_or(DeviceError::InvalidRatings)?;
+            if !m.devices.get(winner).is_some_and(|d| d.recommended) {
+                return Err(DeviceError::InvalidRatings);
+            }
         }
         Ok(())
     }
@@ -291,10 +301,47 @@ mod tests {
         );
     }
     #[test]
+    fn ratings_recommend_highest_supported_score_with_power_tie_order() {
+        for (scores, supported, expected) in [
+            ([2.0, 9.0, 5.0], [true, true, true], Device::Gpu),
+            ([8.0, 8.0, 8.0], [true, true, true], Device::Cpu),
+            ([2.0, 8.0, 8.0], [true, true, true], Device::Npu),
+            ([2.0, 9.0, 5.0], [true, false, true], Device::Npu),
+        ] {
+            for recommended in [Device::Cpu, Device::Gpu, Device::Npu] {
+                let mut model = rating();
+                for (index, device) in [Device::Cpu, Device::Gpu, Device::Npu]
+                    .into_iter()
+                    .enumerate()
+                {
+                    let row = model.devices.get_mut(&device).unwrap();
+                    row.speed_score = Some(scores[index]);
+                    row.supported = supported[index];
+                    row.recommended = device == recommended;
+                }
+                let ratings = Ratings {
+                    schema_version: 1,
+                    metadata: BTreeMap::new(),
+                    models: BTreeMap::from([("fixture".into(), model)]),
+                };
+                assert_eq!(
+                    ratings.validate(&["fixture"]),
+                    if recommended == expected {
+                        Ok(())
+                    } else {
+                        Err(DeviceError::InvalidRatings)
+                    },
+                    "scores={scores:?}, supported={supported:?}, recommended={recommended:?}"
+                );
+            }
+        }
+    }
+    #[test]
     fn tie_order_and_ratings_schema_are_deterministic() {
         let mut r = rating();
-        for d in r.devices.values_mut() {
+        for (device, d) in &mut r.devices {
             d.speed_score = Some(8.0);
+            d.recommended = *device == Device::Cpu;
         }
         assert_eq!(
             candidates(

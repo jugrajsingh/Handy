@@ -199,6 +199,20 @@ mod tests {
                 },
                 "PCM bounds",
             ),
+            (
+                Header {
+                    sample_rate: Some(7999),
+                    ..valid.clone()
+                },
+                "PCM bounds",
+            ),
+            (
+                Header {
+                    sample_rate: Some(48001),
+                    ..valid.clone()
+                },
+                "PCM bounds",
+            ),
         ] {
             let result = read_pcm_after_header(&mut Cursor::new([0u8; 4]), header, 7);
             match result {
