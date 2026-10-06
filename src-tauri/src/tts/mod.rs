@@ -68,3 +68,5 @@ pub fn unload_after(
     }
 }
 pub mod session;
+
+pub mod clipboard;
