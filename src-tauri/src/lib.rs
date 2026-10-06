@@ -226,6 +226,7 @@ fn initialize_core_logic(app_handle: &AppHandle) {
     app_handle.manage(local_llm_manager);
     app_handle.manage(tray::TrayState::new());
     app_handle.manage(TranscriptionJobManager::new(app_handle));
+    app_handle.manage(tts::service::TtsService::initialize(app_handle));
 
     // Note: Shortcuts are NOT initialized here.
     // The frontend is responsible for calling the `initialize_shortcuts` command
@@ -744,6 +745,24 @@ pub fn run(cli_args: CliArgs) {
 
     let specta_builder = Builder::<tauri::Wry>::new()
         .commands(collect_commands![
+            tts::commands::get_tts_models,
+            tts::commands::get_tts_status,
+            tts::commands::get_tts_devices,
+            tts::commands::get_read_aloud_state,
+            tts::commands::read_aloud_replace_text,
+            tts::commands::read_aloud_play,
+            tts::commands::read_aloud_pause,
+            tts::commands::read_aloud_stop,
+            tts::commands::read_aloud_close,
+            tts::commands::set_tts_selection,
+            tts::commands::set_tts_model,
+            tts::commands::set_tts_run_on,
+            tts::commands::unload_tts_model,
+            tts::commands::download_tts_model,
+            tts::commands::cancel_tts_download,
+            tts::commands::delete_tts_model,
+            tts::commands::set_tts_hf_token,
+            tts::commands::preview_tts_voice,
             shortcut::change_binding,
             shortcut::clear_binding,
             shortcut::reset_binding,
@@ -1264,6 +1283,10 @@ pub fn run(cli_args: CliArgs) {
             show_main_window(app);
         }
         tauri::RunEvent::Exit => {
+            if let Some(service) = app.try_state::<Arc<tts::service::TtsService>>() {
+                let service = service.inner().clone();
+                std::thread::spawn(move || service.shutdown());
+            }
             if let Some(llm) = app.try_state::<Arc<local_llm::LocalLlmManager>>() { llm.shutdown(); }
         }
         _ => {}

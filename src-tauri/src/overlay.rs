@@ -120,7 +120,7 @@ fn configure_layer_shell_position(gtk_window: &gtk::ApplicationWindow, position:
 /// derive their dimensions from GTK's size request. gtk-layer-shell documents
 /// the `set_size_request` + `resize(1, 1)` sequence for forcing a new size.
 #[cfg(target_os = "linux")]
-fn configure_layer_shell_surface(
+pub(crate) fn configure_layer_shell_surface(
     gtk_window: &gtk::ApplicationWindow,
     position: OverlayPosition,
     width: f64,

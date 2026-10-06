@@ -229,6 +229,11 @@ mod tests {
             .contains("transcribe"));
             assert!(reject_duplicate(&settings, "cancel", "alt+ctrl+d").is_err());
             assert!(reject_duplicate(&settings, "transcribe", "ctrl+alt+d").is_ok());
+            assert!(reject_duplicate(&settings, "read_aloud", "alt+ctrl+d").is_err());
+            let read_aloud = settings.bindings["read_aloud"].current_binding.clone();
+            assert!(reject_duplicate(&settings, "transcribe", &read_aloud)
+                .unwrap_err()
+                .contains("read_aloud"));
         }
     }
     #[test]

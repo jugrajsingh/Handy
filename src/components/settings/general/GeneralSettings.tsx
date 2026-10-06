@@ -33,6 +33,7 @@ export const GeneralSettings: React.FC = () => {
             <ShortcutInput key={id} shortcutId={id} grouped={true} />
           ),
         )}
+        <ShortcutInput shortcutId="read_aloud" grouped={true} />
         <ShortcutActivationSetting descriptionMode="tooltip" grouped={true} />
         {/* Cancel shortcut remains hidden on Linux because of dynamic shortcut instability. */}
         {!isLinux && <ShortcutInput shortcutId="cancel" grouped={true} />}

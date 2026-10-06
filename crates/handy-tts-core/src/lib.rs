@@ -9,6 +9,7 @@ pub mod memory;
 pub mod performance;
 pub mod playback;
 pub mod preparation;
+pub mod preview;
 pub mod protocol;
 pub mod referee;
 pub mod scheduler;

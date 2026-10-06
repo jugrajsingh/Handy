@@ -85,13 +85,23 @@ static RECORDING_SESSION: AtomicU64 = AtomicU64::new(0);
 
 /// Drop guard that finishes the transcription pipeline, including immediate
 /// model unloading on early exits.
-struct FinishGuard(AppHandle, Arc<TranscriptionManager>);
+struct FinishGuard(AppHandle, Arc<TranscriptionManager>, Option<u64>);
 impl Drop for FinishGuard {
     fn drop(&mut self) {
         self.1.maybe_unload_immediately("transcription session");
-        if let Some(c) = self.0.try_state::<TranscriptionCoordinator>() {
-            c.notify_processing_finished();
+        let finished = self
+            .0
+            .try_state::<Arc<crate::tts::service::TtsService>>()
+            .is_none_or(|service| {
+                self.2
+                    .is_none_or(|generation| service.pipeline_finished(generation))
+            });
+        if finished {
+            if let Some(c) = self.0.try_state::<TranscriptionCoordinator>() {
+                c.notify_processing_finished();
+            }
         }
+
         // The pipeline just freed its large transient buffers (captured PCM,
         // WAV copy, engine scratch); hand the cached pages back to the OS so
         // they don't sit in malloc arenas until they get swapped out (#1792).
@@ -552,6 +562,12 @@ where
 
 impl ShortcutAction for TranscribeAction {
     fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+        if let Some(service) = app.try_state::<Arc<crate::tts::service::TtsService>>() {
+            if let Err(error) = service.dictation_start(binding_id) {
+                log::error!("Read-aloud stop acknowledgment failed: {error}");
+                return;
+            }
+        }
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
@@ -730,6 +746,9 @@ impl ShortcutAction for TranscribeAction {
     }
 
     fn stop(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+        if let Some(service) = app.try_state::<Arc<crate::tts::service::TtsService>>() {
+            service.dictation_processing();
+        }
         // Prevent a slow microphone from emitting a ready event or start chime
         // after the user has already requested stop.
         app.state::<Arc<AudioRecordingManager>>()
@@ -772,7 +791,10 @@ impl ShortcutAction for TranscribeAction {
         let cancel_generation = rm.cancel_generation();
 
         tauri::async_runtime::spawn(async move {
-            let _guard = FinishGuard(ah.clone(), Arc::clone(&tm));
+            let generation = ah
+                .try_state::<Arc<crate::tts::service::TtsService>>()
+                .map(|s| s.generation());
+            let _guard = FinishGuard(ah.clone(), Arc::clone(&tm), generation);
             debug!(
                 "Starting async transcription task for binding: {}",
                 binding_id

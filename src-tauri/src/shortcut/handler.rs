@@ -52,6 +52,23 @@ pub fn handle_shortcut_event(
     hotkey_string: &str,
     is_pressed: bool,
 ) {
+    if binding_id == "read_aloud" {
+        if is_pressed {
+            if let Some(service) = app.try_state::<Arc<crate::tts::service::TtsService>>() {
+                service.read_shortcut();
+            }
+        }
+        return;
+    }
+    if binding_id == "cancel" && is_pressed {
+        if let Some(service) = app.try_state::<Arc<crate::tts::service::TtsService>>() {
+            if service.is_reading() {
+                let service = service.inner().clone();
+                std::thread::spawn(move || service.close());
+                return;
+            }
+        }
+    }
     // Transcribe bindings are handled by the coordinator.
     if is_transcribe_binding(binding_id) {
         let settings = get_settings(app);
