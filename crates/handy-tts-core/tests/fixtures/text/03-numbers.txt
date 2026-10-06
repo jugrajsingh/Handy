@@ -1,0 +1,1 @@
+On 2026-10-01 at 09:35 AM, Handy v0.9.7 processed 1,024 API requests at 120 RPM, using 3.5 GB of RAM and 45% CPU. The invoice was $1,234.56, or EUR 1,100.00, with a 7.5% discount. Compare version 2.0.0-rc.12 with release 1.8.3; the deadline is October 12, 2026, at 18:45 UTC. HTTPS, JSON, USB, and ONNX appear in the report.

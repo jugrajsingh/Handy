@@ -1,0 +1,1 @@
+When a reader opens a long document after a busy morning, the application should begin speaking promptly in a calm and consistent voice, preserve the meaning of every paragraph, pronounce unfamiliar names carefully, and let the listener pause or change the pace without losing their place or waiting for the whole document to finish processing before the first useful words arrive.

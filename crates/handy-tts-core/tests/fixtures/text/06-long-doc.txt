@@ -1,0 +1,95 @@
+Every dictation made with the owner's Super+Alt+D toggle is cleaned by a small local CPU model (S1-mini by Superwhisper) before it lands in the clipboard, with no server or service the owner has to install, start or maintain. The model is loaded only when a dictation needs it and is unloaded after Handy's existing idle timeout, so it holds no memory when unused.
+
+Quill or any second model entry; per-shortcut presets; streaming output; GPU/Vulkan inference; linking llama.cpp into the Handy process; changes to speech transcription; upstream PR.
+
+Binary location: `/usr/lib/Handy/llm/llama-server` (not `/usr/bin`, to avoid clashing with Fedora's `llama-cpp` package). Resolution order: env `HANDY_LLAMA_SERVER` (dev only), then `/usr/lib/Handy/llm/llama-server`. A missing binary is a `LocalLlmError::BinaryMissing`, never a panic. It is built statically (`-DBUILD_SHARED_LIBS=OFF`, CPU backend only) so it shares no libraries with Handy's bundled ggml.
+
+`ModelEntry { id, display_name, attribution, card_url, backend: BackendKind::LlamaServer, file_name, url (Hugging Face resolve URL at a pinned commit revision), sha256, size_bytes, prompt_style: PromptStyle, default_ctx: u32 }`.
+
+v1 entry: `s1-mini-q4km`, "S1-mini by Superwhisper", file `s1-mini-q4_k_m.gguf` from `superwhisper/s1-mini-GGUF` at a pinned revision, size 484,219,808 bytes, sha256 from the Hugging Face LFS oid (the planner records the exact revision and hash after re-verifying them), `PromptStyle::S1ControlLine`, context 4096.
+
+Request: `POST /v1/chat/completions` with `messages`, `temperature: 0`, `stream: false`, `max_tokens = min(2 * est_tokens(input) + 64, ctx / 2)`, `chat_template_kwargs: {"enable_thinking": false}`, bearer API key. A dedicated `reqwest` client with timeout `10 s + 50 ms * input_words`.
+
+Chunking: if the estimated prompt exceeds 1000 tokens (card limit per pass), split the transcript at sentence boundaries into chunks under the limit, process them in order, join with a single space.
+
+Output guards, in order (any failure returns an error, so the raw transcript is used): strip think blocks and invisible characters (existing helpers); empty output is accepted only when the input has at most 3 words; output with fewer than 50% of the input's words is rejected with a warning.
+
+Shown in post-processing settings when provider is "Local (in-app)": model dropdown (registry), Download / Delete button with progress, status label (Not loaded / Loading / Ready / Error with reason), the three S1 dropdowns (only for `S1ControlLine`), attribution link. English strings only.
+
+`LocalLlmError { BinaryMissing, ModelMissing, ModelCorrupt, StartTimeout, StartFailed, RequestTimeout, Http(status), BadOutput(reason), Failed }`. Every variant is logged at warn with its reason and maps to the raw transcript. No new work on the main thread. No `unwrap`/`expect` in non-test code.
+
+Each guard in 4 and each lifecycle rule in 6 gets a counterfactual: disable only that guard, show the test failing, restore.
+
+Integration test (ignored by default, enabled with `HANDY_LOCAL_LLM_IT=1`, needs the model file and `llama-server`): spawns the real server, runs 3 synthetic transcripts, asserts outputs equal golden files (greedy decoding is deterministic), asserts the child is gone after `unload()`.
+
+Acceptance on the installed RPM (added to `build/gate.sh` as check 6, owner runs it): after one Super+Alt+D dictation the Handy log shows a local-LLM success line and the clipboard holds the cleaned text; with `model_unload_timeout` set to 2 minutes, no `llama-server` process exists 2 minutes after the last dictation; with the model file removed, a dictation still yields the raw transcript.
+
+Make post-processing a first-class, visible part of daily use: both shortcuts in one place, the local cleanup model managed and switched like the transcription model, and every history entry showing whether it was cleaned and what changed.
+
+Transcription models were checked for per-model settings: none exist. Language, translation, custom words, accelerator, GPU device and unload timeout are app-wide (`src-tauri/src/settings.rs:434-535`), so no transcription-model settings page is needed.
+
+Tabs on the Models page; moving the enable switch; Quill or other models; release pipeline, updater endpoint or signing; translations beyond English for new strings (other locales fall back or keep existing labels); upstream PRs.
+
+Current state: General's first group renders the transcribe shortcut, `ShortcutActivationSetting`, then cancel (hidden on Linux) (`src/components/settings/general/GeneralSettings.tsx:16-42`). The post-process shortcut sits on the post-processing page (`src/components/settings/post-processing/PostProcessingSettings.tsx:449-453`). Bindings cannot be cleared: the inputs commit only non-empty captures and offer Reset, not Clear (`src/components/settings/GlobalShortcutInput.tsx:80,294`, `src/components/settings/HandyKeysShortcutInput.tsx:153,342`); `change_binding` rejects empty strings (`src-tauri/src/shortcut/mod.rs:118`) and so do both validators (`shortcut/tauri_impl.rs:45`, `shortcut/handy_keys.rs:414`). Duplicate detection is registration-based only, and because capture suspends other registrations a duplicate can be saved; on resume one of the two silently stays inactive in HashMap order (`shortcut/mod.rs:187,252`).
+
+Current state: groups Hotkey, API, Prompts; the local LLM UI is nested inside API after provider selection (`PostProcessingSettings.tsx:30-149,435-470`); the group title is `API (OpenAI compatible)` even for the local provider.
+
+Design: a new `LocalLlmModelSelector` next to it, rendered only when `post_process_enabled` and the provider is `local_llm`. Button: status dot plus selected model's `display_name` (truncated like the existing button). Dropdown: downloaded local models, the selected one marked Active; choosing one calls `setLocalLlmModel(id)` then `refreshSettings()` (pattern at `LocalLlmSettings.tsx:98`). Status from `getLocalLlmStatus()` plus `local-llm-state-changed` (`LocalLlmSettings.tsx:75`). If no local model is downloaded, the button reads `No cleanup model` and opens the post-processing page. Selecting does not load the model (existing lazy behaviour).
+
+Current state: `build_menu` from a `MenuInputs` snapshot, single native writer, rebuild on snapshot change (`src-tauri/src/tray.rs:57,230-370,458-565`); Unload Model handled in `lib.rs:308`; tray labels come from locale JSON with empty strings for missing keys (`src-tauri/build.rs:316,344`).
+
+Current state: entries render `transcription_text` only and copy it (`src/components/settings/history/HistorySettings.tsx:254,435-439`); `HistoryEntry` already carries `post_processed_text`, `post_process_prompt`, `post_process_requested` (`src/bindings.ts:1082`); no provider/model provenance is stored (`src-tauri/src/managers/history.rs:20-66`); only single-entry delete exists (`commands/history.rs:51`), with a private multi-delete helper for retention (`managers/history.rs:350`).
+
+Every new command returns `Result<_, String>` shown through the page's existing error line; no `unwrap`/`expect` outside tests; no new main-thread blocking (tray unload and manager calls run on std threads or `spawn_blocking`); clearing the last transcribe binding and duplicate keys are refused, never half-applied.
+
+Rust unit tests: duplicate detection across all bindings including a suspended one; `clear_binding` refusals and success; empty binding skipped at registration; `clear_history(keep_saved)` keeps starred rows and removes others plus files; provenance columns written and read, old rows null; `history_compare_view` default and old-store deserialization; tray `MenuInputs` includes local status and the unload item's enabled state per state. Each guard gets a counterfactual.
+
+Manual acceptance on the installed RPM: General shows both shortcuts when post-processing is enabled; a duplicate key is refused; Raw can be cleared and Clean still works; post-processing page shows Provider then Local model with the model list; footer picker switches the model; tray shows cleanup status and unloads it; a cleaned dictation shows Diff/Side by side/Stacked and the choice persists; Clear History keeps starred entries; gate.sh passes with the env var absent.
+
+Same as the local LLM series: implement on `local/llm-postprocess`, export with `build/rebase-patches.sh`, build with `build/build.sh`, install with `build/install.sh`, check with `build/gate.sh`.
+
+Make the v2 UI read cleanly and consistently: one term for the second stage everywhere, nothing truncated, symmetric controls for the transcription model and the post-processing model (sidebar, footer, tray), history actions in one row, and a real choice of local post-processing models.
+
+Acceptance check: `rg -i '\bclean(ed|up)?\b'` over the values of `src/i18n/locales/en/translation.json` that this branch added or changed returns nothing (upstream's own strings are left alone).
+
+Labels are truncated ("Transcriptio...", "Post-proces..."). Widen the sidebar so the longest English label ("Transcription Models", "Post-processing Models") fits at the default font size, and allow a label to wrap to a second line rather than truncate if it still does not fit (other locales, larger fonts). No drag-to-resize. Verify at Handy's minimum window size.
+
+The planner verifies exact repo ids, file names, revisions, hashes, sizes and licences from the Hugging Face API and records them; any entry whose licence is not Apache-2.0-compatible is flagged to the owner instead of added.
+
+Every dictation made with the owner's Super+Alt+D toggle is cleaned by a small local CPU model (S1-mini by Superwhisper) before it lands in the clipboard, with no server or service the owner has to install, start or maintain. The model is loaded only when a dictation needs it and is unloaded after Handy's existing idle timeout, so it holds no memory when unused.
+
+Quill or any second model entry; per-shortcut presets; streaming output; GPU/Vulkan inference; linking llama.cpp into the Handy process; changes to speech transcription; upstream PR.
+
+Binary location: `/usr/lib/Handy/llm/llama-server` (not `/usr/bin`, to avoid clashing with Fedora's `llama-cpp` package). Resolution order: env `HANDY_LLAMA_SERVER` (dev only), then `/usr/lib/Handy/llm/llama-server`. A missing binary is a `LocalLlmError::BinaryMissing`, never a panic. It is built statically (`-DBUILD_SHARED_LIBS=OFF`, CPU backend only) so it shares no libraries with Handy's bundled ggml.
+
+`ModelEntry { id, display_name, attribution, card_url, backend: BackendKind::LlamaServer, file_name, url (Hugging Face resolve URL at a pinned commit revision), sha256, size_bytes, prompt_style: PromptStyle, default_ctx: u32 }`.
+
+v1 entry: `s1-mini-q4km`, "S1-mini by Superwhisper", file `s1-mini-q4_k_m.gguf` from `superwhisper/s1-mini-GGUF` at a pinned revision, size 484,219,808 bytes, sha256 from the Hugging Face LFS oid (the planner records the exact revision and hash after re-verifying them), `PromptStyle::S1ControlLine`, context 4096.
+
+Request: `POST /v1/chat/completions` with `messages`, `temperature: 0`, `stream: false`, `max_tokens = min(2 * est_tokens(input) + 64, ctx / 2)`, `chat_template_kwargs: {"enable_thinking": false}`, bearer API key. A dedicated `reqwest` client with timeout `10 s + 50 ms * input_words`.
+
+Chunking: if the estimated prompt exceeds 1000 tokens (card limit per pass), split the transcript at sentence boundaries into chunks under the limit, process them in order, join with a single space.
+
+Output guards, in order (any failure returns an error, so the raw transcript is used): strip think blocks and invisible characters (existing helpers); empty output is accepted only when the input has at most 3 words; output with fewer than 50% of the input's words is rejected with a warning.
+
+Shown in post-processing settings when provider is "Local (in-app)": model dropdown (registry), Download / Delete button with progress, status label (Not loaded / Loading / Ready / Error with reason), the three S1 dropdowns (only for `S1ControlLine`), attribution link. English strings only.
+
+`LocalLlmError { BinaryMissing, ModelMissing, ModelCorrupt, StartTimeout, StartFailed, RequestTimeout, Http(status), BadOutput(reason), Failed }`. Every variant is logged at warn with its reason and maps to the raw transcript. No new work on the main thread. No `unwrap`/`expect` in non-test code.
+
+Each guard in 4 and each lifecycle rule in 6 gets a counterfactual: disable only that guard, show the test failing, restore.
+
+Integration test (ignored by default, enabled with `HANDY_LOCAL_LLM_IT=1`, needs the model file and `llama-server`): spawns the real server, runs 3 synthetic transcripts, asserts outputs equal golden files (greedy decoding is deterministic), asserts the child is gone after `unload()`.
+
+Acceptance on the installed RPM (added to `build/gate.sh` as check 6, owner runs it): after one Super+Alt+D dictation the Handy log shows a local-LLM success line and the clipboard holds the cleaned text; with `model_unload_timeout` set to 2 minutes, no `llama-server` process exists 2 minutes after the last dictation; with the model file removed, a dictation still yields the raw transcript.
+
+Make post-processing a first-class, visible part of daily use: both shortcuts in one place, the local cleanup model managed and switched like the transcription model, and every history entry showing whether it was cleaned and what changed.
+
+Transcription models were checked for per-model settings: none exist. Language, translation, custom words, accelerator, GPU device and unload timeout are app-wide (`src-tauri/src/settings.rs:434-535`), so no transcription-model settings page is needed.
+
+Tabs on the Models page; moving the enable switch; Quill or other models; release pipeline, updater endpoint or signing; translations beyond English for new strings (other locales fall back or keep existing labels); upstream PRs.
+
+Current state: General's first group renders the transcribe shortcut, `ShortcutActivationSetting`, then cancel (hidden on Linux) (`src/components/settings/general/GeneralSettings.tsx:16-42`). The post-process shortcut sits on the post-processing page (`src/components/settings/post-processing/PostProcessingSettings.tsx:449-453`). Bindings cannot be cleared: the inputs commit only non-empty captures and offer Reset, not Clear (`src/components/settings/GlobalShortcutInput.tsx:80,294`, `src/components/settings/HandyKeysShortcutInput.tsx:153,342`); `change_binding` rejects empty strings (`src-tauri/src/shortcut/mod.rs:118`) and so do both validators (`shortcut/tauri_impl.rs:45`, `shortcut/handy_keys.rs:414`). Duplicate detection is registration-based only, and because capture suspends other registrations a duplicate can be saved; on resume one of the two silently stays inactive in HashMap order (`shortcut/mod.rs:187,252`).
+
+Current state: groups Hotkey, API, Prompts; the local LLM UI is nested inside API after provider selection (`PostProcessingSettings.tsx:30-149,435-470`); the group title is `API (OpenAI compatible)` even for the local provider.
+
+Design: a new `LocalLlmModelSelector` next to it, rendered only when `post_process_enabled` and the provider is `local_llm`. Button: status dot plus selected model's `display_name` (truncated like the existing button). Dropdown: downloaded local models, the selected one marked Active; choosing one calls `setLocalLlmModel(id)` then `refreshSettings()` (pattern at `LocalLlmSettings.tsx:98`). Status from `getLocalLlmStatus()` plus `local-llm-state-changed` (`LocalLlmSettings.tsx:75`). If no local model is downloaded, the button reads `No cleanup model` and opens the post-processing page. Selecting does not load the model (existing lazy behaviour).

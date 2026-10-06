@@ -4,3 +4,4 @@ pub mod download;
 pub mod memory;
 pub mod protocol;
 pub mod selection_options;
+pub mod text;

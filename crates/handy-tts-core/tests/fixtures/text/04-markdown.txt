@@ -1,0 +1,72 @@
+## 3. Changes
+
+### 3.1 Terminology (English strings only; code identifiers unchanged)
+
+Every user-facing English string added or changed on this branch that says clean/cleaned/cleanup is renamed. Mapping:
+
+| Where | Now | Becomes |
+|---|---|---|
+| General shortcut (transcribe_with_post_process) | Clean Transcript Shortcut | Post-processing Shortcut |
+| General shortcut (transcribe, when post-processing enabled) | Raw Transcript Shortcut | Raw Shortcut |
+| History badge | Cleaned with s1-mini-q4km | Post-processed with S1-mini by Superwhisper (display name, see 3.3) |
+| History compare labels | Raw / Cleaned | Raw / Post-processed |
+| Copy actions | Copy raw / copy | Copy raw text / Copy post-processed text (tooltips) |
+| Footer empty state | No cleanup model | No post-processing model |
+| Tray | Cleanup: S1-mini (ready) / Unload Post-processing Model | see 3.5 |
+
+Acceptance check: `rg -i '\bclean(ed|up)?\b'` over the values of `src/i18n/locales/en/translation.json` that this branch added or changed returns nothing (upstream's own strings are left alone).
+
+### 3.2 Sidebar
+
+Labels are truncated ("Transcriptio...", "Post-proces..."). Widen the sidebar so the longest English label ("Transcription Models", "Post-processing Models") fits at the default font size, and allow a label to wrap to a second line rather than truncate if it still does not fit (other locales, larger fonts). No drag-to-resize. Verify at Handy's minimum window size.
+
+### 3.3 History
+
+- Copy raw moves from its own row into the entry's top action row as an icon button (same size and style as the existing copy, star, retranscribe and delete icons), placed next to the main copy icon, with tooltips "Copy post-processed text" (main copy, post-processed entries) and "Copy raw text".
+- The provenance badge shows the model's display name from the local registry (e.g. "S1-mini by Superwhisper") when the stored model id is a known local model; for remote providers it shows the stored model name; unknown ids show the id.
+- The compare dropdown in the History header gets a visible label "Compare view" (options Diff, Side by side, Stacked unchanged).
+- Deferred v2 item D1 fixed: an `added`/`updated` history event no longer resets a scrolled list to page 1; the new or updated entry is merged into the loaded pages (new entries at the top), and the scroll position is kept.
+
+### 3.4 Local post-processing models
+
+- Reinstate `PromptStyle::PlainSystemPrompt` (dropped from v1): system message = the selected Handy prompt with `${output}` removed; user message = the transcript. For these models the S1 knobs are hidden and the Prompts group is shown (it is hidden only for `S1ControlLine` models, as today).
+- Registry gains three entries, each with a pinned Hugging Face revision, sha256, size, display name, attribution, card URL, `prompt_style = PlainSystemPrompt` and context 4096:
+  - Quill 0.8B (`Quobi/Quill`, Q4_K_M, about 505 MB)
+  - Quill 2B (`Quobi/Quill`, Q4_K_M, about 1.2 GB)
+  - Qwen3-4B-Instruct-2507 (`unsloth/Qwen3-4B-Instruct-2507-GGUF` or the official GGUF repo, Q4_K_M, about 2.5 GB)
+  The planner verifies exact repo ids, file names, revisions, hashes, sizes and licences from the Hugging Face API and records them; any entry whose licence is not Apache-2.0-compatible is flagged to the owner instead of added.
+- llama-server flags are unchanged (thinking disabled through the chat template kwargs is harmless for non-thinking models); chunking budget and output guards apply to every model.
+- Each model is downloaded only on demand; the model list shows sizes so the owner sees the disk cost before downloading.
+
+### 3.5 Tray
+
+Make the two models symmetric. Idle layout:
+
+```
+Handy v0.9.7
+Copy Last Transcript
+---
+Transcription model: Parakeet Unified EN 0.6B  >   (existing submenu of downloaded transcription models)
+Unload transcription model
+---
+Post-processing model: S1-mini by Superwhisper (ready)  >   (submenu of downloaded local post-processing models, selected one checked)
+Unload post-processing model
+---
+Settings...
+Quit
+```
+
+- The post-processing group appears only when post-processing is enabled and the provider is `local_llm`.
+- Its submenu selects a model with the same effect as the footer picker (persist, refresh, no immediate load); the selection call runs off the main thread.
+- Unload post-processing model is enabled only in Ready; unload transcription model keeps its existing rule.
+- Busy layout unchanged.
+- Labels via tray locale keys with the existing English fallback.
+
+### 3.6 Footer
+
+- Each picker shows the same icon as its sidebar page (transcription models icon; post-processing icon) before the status dot and name, so the two are distinguishable at a glance.
+- The post-processing dropdown uses the same row layout as the transcription dropdown: name, short description, size, and the Active badge; empty and missing states unchanged.
+- Give each button enough width that common names are not truncated at the default window size (truncate with a tooltip showing the full name only when still too long).
+
+
+[Handy documentation](https://handy.computer/docs).
