@@ -52,6 +52,7 @@ pub struct Playback<B: Output> {
     pending_fallback: bool,
     paused: bool,
     replay_pending: bool,
+    opened: bool,
 }
 impl<B: Output> Playback<B> {
     pub fn new(
@@ -76,7 +77,32 @@ impl<B: Output> Playback<B> {
             pending_fallback: fell_back,
             paused: false,
             replay_pending: false,
+            opened: true,
         })
+    }
+    /// Keeps output unopened until playback is requested.
+    pub fn idle(output: B) -> Self {
+        Self {
+            output,
+            fallback_reported: false,
+            current: None,
+            pending_fallback: false,
+            paused: false,
+            replay_pending: false,
+            opened: false,
+        }
+    }
+    /// Opens idle output and allows a later retry after device failure.
+    pub fn ensure_open(
+        &mut self,
+        tts: Option<&str>,
+        handy: Option<&str>,
+    ) -> Result<(), PlaybackError> {
+        if !self.opened {
+            let prepared = self.prepare(tts, handy)?;
+            self.commit(prepared);
+        }
+        Ok(())
     }
     /// Prepares a device change without changing playback or fallback reporting.
     pub fn prepare(
@@ -98,6 +124,7 @@ impl<B: Output> Playback<B> {
     /// Commits a prepared device change and retains the current sentence for replay.
     pub fn commit(&mut self, prepared: PreparedOutput<B::Prepared>) {
         self.output.commit(prepared.stream);
+        self.opened = true;
         self.replay_pending = self.current.is_some();
         self.pending_fallback |= prepared.fell_back;
         if self.paused {
@@ -116,6 +143,7 @@ impl<B: Output> Playback<B> {
             true
         };
         self.output.stop();
+        self.opened = true;
         self.replay_pending = self.current.is_some();
         self.pending_fallback |= fell_back;
         if self.paused {

@@ -50,6 +50,23 @@ pub(crate) fn selection(settings: &crate::settings::AppSettings) -> Selection {
         read_code: settings.tts_read_code_blocks,
     }
 }
+pub(crate) fn reading_cancel_with(effect: &Effect, set_owner: impl FnOnce(bool)) {
+    match effect {
+        Effect::OpenPopup { .. } => set_owner(true),
+        Effect::ClosePopup => set_owner(false),
+        _ => {}
+    }
+}
+pub(crate) fn preview_with(
+    reading: &impl handy_tts_core::preview::ReadingControl,
+    coordinator: &handy_tts_core::preview::PreviewCoordinator,
+    stop: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
+    launch: impl FnOnce(Arc<std::sync::atomic::AtomicBool>),
+) -> Result<(), String> {
+    let cancel = coordinator.begin(reading, stop)?;
+    launch(cancel);
+    Ok(())
+}
 struct PreviewCompletion(Arc<(Mutex<bool>, std::sync::Condvar)>);
 impl Drop for PreviewCompletion {
     fn drop(&mut self) {
@@ -236,55 +253,55 @@ impl TtsService {
                 }
             }) as Arc<dyn Fn() -> Result<(), String> + Send + Sync>
         };
-        let cancel = self.preview.begin(ready.session.as_ref(), stop)?;
         let coordinator = self.preview.clone();
         let app = self.app.clone();
-        std::thread::spawn(move || {
-            let _completed = PreviewCompletion(completed);
-            use handy_tts_core::playback::{Playback, Poll};
-            let result = (|| -> Result<(), String> {
-                if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                    return Ok(());
-                }
-                let raw = preview
-                    .synthesize(&chosen, 1, &text)
-                    .map_err(|e| e.to_string())?;
-                if cancel.load(std::sync::atomic::Ordering::Acquire) {
-                    return Ok(());
-                }
-                let pcm = handy_tts_core::dsp::transform(
-                    raw,
-                    chosen.speed,
-                    chosen.pitch,
-                    chosen.model_id != "pocket-en",
-                )
-                .map_err(|e| e.to_string())?;
-                let handy = crate::settings::get_settings(&app).selected_output_device;
-                let mut output = Playback::new(
-                    super::playback::RodioOutput::default(),
-                    chosen.output_device.as_deref(),
-                    handy.as_deref(),
-                )
-                .map_err(|e| e.to_string())?;
-                output.play(0, pcm, 0).map_err(|e| e.to_string())?;
-                while !cancel.load(std::sync::atomic::Ordering::Acquire) {
-                    if output.poll().map_err(|e| e.to_string())? == Poll::Finished {
-                        break;
+        preview_with(ready.session.as_ref(), &self.preview, stop, |cancel| {
+            std::thread::spawn(move || {
+                let _completed = PreviewCompletion(completed);
+                use handy_tts_core::playback::{Playback, Poll};
+                let result = (|| -> Result<(), String> {
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(());
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let raw = preview
+                        .synthesize(&chosen, 1, &text)
+                        .map_err(|e| e.to_string())?;
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let pcm = handy_tts_core::dsp::transform(
+                        raw,
+                        chosen.speed,
+                        chosen.pitch,
+                        chosen.model_id != "pocket-en",
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let handy = crate::settings::get_settings(&app).selected_output_device;
+                    let mut output = Playback::new(
+                        super::playback::RodioOutput::default(),
+                        chosen.output_device.as_deref(),
+                        handy.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    output.play(0, pcm, 0).map_err(|e| e.to_string())?;
+                    while !cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        if output.poll().map_err(|e| e.to_string())? == Poll::Finished {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                    }
+                    output.stop();
+                    Ok(())
+                })();
+                preview.unload();
+                coordinator.finish(&cancel);
+                if let Err(error) = result {
+                    if !cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        let _ = app.emit("tts-preview-error", error);
+                    }
                 }
-                output.stop();
-                Ok(())
-            })();
-            preview.unload();
-            coordinator.finish(&cancel);
-            if let Err(error) = result {
-                if !cancel.load(std::sync::atomic::Ordering::Acquire) {
-                    let _ = app.emit("tts-preview-error", error);
-                }
-            }
-        });
-        Ok(())
+            });
+        })
     }
     pub fn ready(&self) -> Result<Ready, String> {
         self.ready.lock().unwrap_or_else(|p| p.into_inner()).clone()
@@ -303,7 +320,17 @@ impl TtsService {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .apply(event);
+        self.dispatch_effects(effects);
+    }
+    fn dispatch_effects(&self, effects: Vec<Effect>) {
         for effect in effects {
+            reading_cancel_with(&effect, |active| {
+                crate::shortcut::cancel::set(
+                    &self.app,
+                    crate::shortcut::cancel::Owner::Reading,
+                    active,
+                )
+            });
             match effect {
                 Effect::StopReading => {
                     if let Ok(ready) = self.ready() {
@@ -333,7 +360,7 @@ impl TtsService {
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .clone();
-                        coordinator.send_external_input(&binding, "read_aloud");
+                        coordinator.stop_recording(&binding, "read_aloud");
                     }
                 }
                 Effect::StartDictation | Effect::Capture { .. } => {}
@@ -395,16 +422,7 @@ impl TtsService {
                     let _ = service.app.emit("tts-preview-error", error);
                     return;
                 }
-                for effect in effects {
-                    if effect == Effect::StopReading {
-                        if let Ok(ready) = service.ready() {
-                            let _ = ready.session.send(SessionCommand::Close);
-                        }
-                    } else if effect == Effect::ClosePopup {
-                        let app = service.app.clone();
-                        let _ = service.app.run_on_main_thread(move || window::hide(&app));
-                    }
-                }
+                service.dispatch_effects(effects);
             });
         }
     }
@@ -454,6 +472,9 @@ impl TtsService {
                 c.notify_processing_finished();
             }
         }
+    }
+    pub fn dictation_aborted(&self) {
+        self.apply(Event::Cancel);
     }
     pub fn dictation_processing(&self) {
         self.apply(Event::DictationProcessing);

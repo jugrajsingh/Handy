@@ -560,12 +560,12 @@ where
     }
 }
 
-impl ShortcutAction for TranscribeAction {
-    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+impl TranscribeAction {
+    fn start_recording(&self, app: &AppHandle, binding_id: &str) -> bool {
         if let Some(service) = app.try_state::<Arc<crate::tts::service::TtsService>>() {
             if let Err(error) = service.dictation_start(binding_id) {
                 log::error!("Read-aloud stop acknowledgment failed: {error}");
-                return;
+                return false;
             }
         }
         let start_time = Instant::now();
@@ -599,7 +599,7 @@ impl ShortcutAction for TranscribeAction {
                 if !load_started {
                     tm.raise_model_load_failed(&selected_model, &e);
                 }
-                return;
+                return false;
             }
         }
 
@@ -722,7 +722,8 @@ impl ShortcutAction for TranscribeAction {
             }
         }
 
-        if recording_error.is_none() {
+        let started = recording_error.is_none();
+        if started {
             // Dynamically register the cancel shortcut in a separate task to avoid deadlock
             shortcut::register_cancel_shortcut(app);
         } else {
@@ -742,6 +743,20 @@ impl ShortcutAction for TranscribeAction {
         debug!(
             "TranscribeAction::start completed in {:?}",
             start_time.elapsed()
+        );
+        started
+    }
+}
+
+impl ShortcutAction for TranscribeAction {
+    fn start(&self, app: &AppHandle, binding_id: &str, _shortcut_str: &str) {
+        crate::transcription_coordinator::recording_start_with(
+            || self.start_recording(app, binding_id),
+            || {
+                if let Some(service) = app.try_state::<Arc<crate::tts::service::TtsService>>() {
+                    service.dictation_aborted();
+                }
+            },
         );
     }
 
@@ -956,20 +971,39 @@ impl ShortcutAction for TranscribeAction {
                                 let paste_time = Instant::now();
                                 let post_process_failed = processed.post_process_failed;
                                 let rm_for_paste = Arc::clone(&rm);
-                                // Taken before the paste thread exists, and so
-                                // before the next session can start.
+                                let service = ah
+                                    .try_state::<Arc<crate::tts::service::TtsService>>()
+                                    .map(|s| s.inner().clone());
+                                let fence = service
+                                    .as_ref()
+                                    .map(|s| s.fence.clone())
+                                    .unwrap_or_default();
+                                if let (Some(service), Some(generation)) = (&service, generation) {
+                                    service.paste_queued(generation);
+                                }
+                                let failure_app = ah.clone();
+                                let completion =
+                                    handy_tts_core::handoff::PasteCompletion::new(move || {
+                                        if let (Some(service), Some(generation)) =
+                                            (service, generation)
+                                        {
+                                            service.paste_completed(generation);
+                                        }
+                                    });
+                                let failed_completion = completion.clone();
                                 let session = RECORDING_SESSION.load(Ordering::SeqCst);
-                                // Off the main thread: paste sleeps between steps, and a
-                                // paste into Handy's own windows needs the main thread free.
-                                std::thread::Builder::new()
-                                    .name("paste".into())
-                                    .spawn(move || {
+                                fence.queue_native(
+                                    Arc::new(move |job| {
+                                        std::thread::Builder::new().name("paste".into()).spawn(job).map(|_| ()).map_err(|error| error.to_string())
+                                    }),
+                                    Box::new(move || {
                                         if rm_for_paste.was_cancelled_since(cancel_generation) {
                                             debug!(
                                                 "Transcription operation cancelled before paste"
                                             );
                                             utils::hide_recording_overlay(&ah_clone);
                                             set_tray_state(&ah_clone, TrayIconState::Idle);
+                                            completion.settle_with(|| {});
                                             return;
                                         }
 
@@ -978,7 +1012,7 @@ impl ShortcutAction for TranscribeAction {
                                         let owns_ui =
                                             || RECORDING_SESSION.load(Ordering::SeqCst) == session;
                                         let (outcome, notice) =
-                                            match utils::paste(final_text, ah_clone.clone()) {
+                                            match utils::paste(final_text, ah_clone.clone(), completion) {
                                                 Ok(()) => {
                                                     debug!(
                                                         "Text pasted successfully in {:?}",
@@ -1031,19 +1065,15 @@ impl ShortcutAction for TranscribeAction {
                                             sample_count,
                                             stop_time,
                                         );
-                                    })
-                                    .map(|_| ())
-                                    .unwrap_or_else(|e| {
-                                        error!("Failed to start the paste thread: {:?}", e);
-                                        utils::hide_recording_overlay(&ah);
-                                        set_tray_state(&ah, TrayIconState::Idle);
-                                        emit_transcription_complete(
-                                            &ah,
-                                            TranscriptionOutcome::Failed,
-                                            sample_count,
-                                            stop_time,
-                                        );
-                                    });
+                                    }),
+                                    Arc::new(move |error| {
+                                        error!("Failed to queue transcription paste: {error}");
+                                        utils::hide_recording_overlay(&failure_app);
+                                        set_tray_state(&failure_app, TrayIconState::Idle);
+                                        emit_transcription_complete(&failure_app, TranscriptionOutcome::Failed, sample_count, stop_time);
+                                        failed_completion.settle_with(|| {});
+                                    }),
+                                );
                             }
                         }
                         Err(err) => {

@@ -44,6 +44,7 @@ impl CommandContext for tauri::AppHandle {
 
     fn reconcile_fallback(&self) {
         crate::secure_input::reconcile_fallback(self);
+        super::cancel::reconcile(self);
     }
 }
 

@@ -6,6 +6,7 @@ use std::sync::{
 pub trait ReadingControl {
     fn pause_for_preview(&self) -> Result<(), String>;
 }
+#[derive(Clone)]
 struct Lease {
     cancelled: Arc<AtomicBool>,
     stop: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
@@ -13,6 +14,7 @@ struct Lease {
 #[derive(Default)]
 pub struct PreviewCoordinator {
     current: Mutex<Option<Lease>>,
+    transitions: Mutex<()>,
 }
 impl PreviewCoordinator {
     pub fn begin(
@@ -20,8 +22,9 @@ impl PreviewCoordinator {
         reading: &impl ReadingControl,
         stop: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     ) -> Result<Arc<AtomicBool>, String> {
+        let _transition = self.transitions.lock().unwrap_or_else(|p| p.into_inner());
         reading.pause_for_preview()?;
-        self.cancel()?;
+        self.cancel_current()?;
         let cancelled = Arc::new(AtomicBool::new(false));
         *self.current.lock().unwrap_or_else(|p| p.into_inner()) = Some(Lease {
             cancelled: cancelled.clone(),
@@ -30,14 +33,19 @@ impl PreviewCoordinator {
         Ok(cancelled)
     }
     pub fn cancel(&self) -> Result<(), String> {
+        let _transition = self.transitions.lock().unwrap_or_else(|p| p.into_inner());
+        self.cancel_current()
+    }
+    fn cancel_current(&self) -> Result<(), String> {
         let lease = self
             .current
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .take();
+            .clone();
         if let Some(lease) = lease {
             lease.cancelled.store(true, Ordering::Release);
             (lease.stop)()?;
+            self.finish(&lease.cancelled);
         }
         Ok(())
     }
@@ -54,7 +62,8 @@ impl PreviewCoordinator {
         &self,
         command: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
-        self.cancel()?;
+        let _transition = self.transitions.lock().unwrap_or_else(|p| p.into_inner());
+        self.cancel_current()?;
         command()
     }
 }
@@ -152,5 +161,148 @@ mod tests {
         preview.finish(&flag);
         assert!(preview.current.lock().unwrap().is_none());
         assert!(!flag.load(Ordering::Acquire));
+    }
+    #[test]
+    fn fix1_failed_stop_retains_lease_for_every_competing_command() {
+        let reading = Reading {
+            document: "Retain the document".into(),
+            paused: AtomicBool::new(false),
+            fail_pause: false,
+        };
+        let coordinator = PreviewCoordinator::default();
+        let stops = Arc::new(AtomicUsize::new(0));
+        let trace = stops.clone();
+        coordinator
+            .begin(
+                &reading,
+                Arc::new(move || {
+                    trace.fetch_add(1, Ordering::AcqRel);
+                    Err("stop pending".into())
+                }),
+            )
+            .unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                coordinator.reading_command(|| panic!("reading overlapped preview")),
+                Err("stop pending".into())
+            );
+        }
+        assert_eq!(stops.load(Ordering::Acquire), 2);
+    }
+    #[test]
+    fn fix1_play_and_close_wait_for_stop_without_blocking_completion() {
+        let reading = Reading {
+            document: "Keep the original".into(),
+            paused: AtomicBool::new(false),
+            fail_pause: false,
+        };
+        let coordinator = Arc::new(PreviewCoordinator::default());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let first = entered.clone();
+        let second = release.clone();
+        let stopping = AtomicBool::new(false);
+        let flag = coordinator
+            .begin(
+                &reading,
+                Arc::new(move || {
+                    if stopping.swap(true, Ordering::AcqRel) {
+                        return Err("concurrent stop before acknowledgement".into());
+                    }
+                    first.wait();
+                    second.wait();
+                    Ok(())
+                }),
+            )
+            .unwrap();
+        let closing = coordinator.clone();
+        let close = std::thread::spawn(move || closing.cancel());
+        entered.wait();
+        let playing = coordinator.clone();
+        let (done, wait) = std::sync::mpsc::channel();
+        let play = std::thread::spawn(move || {
+            playing.reading_command(|| {
+                done.send(()).unwrap();
+                Ok(())
+            })
+        });
+        let premature = wait
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok();
+        coordinator.finish(&flag);
+        release.wait();
+        close.join().unwrap().unwrap();
+        play.join().unwrap().unwrap();
+        assert!(!premature, "Play must wait for acknowledged stop");
+        wait.recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+    }
+    #[test]
+    fn fix1_overlapping_begins_keep_one_owned_preview() {
+        let coordinator = Arc::new(PreviewCoordinator::default());
+        let pauses = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        struct Pausing {
+            calls: Arc<AtomicUsize>,
+            entered: Arc<std::sync::Barrier>,
+            release: Arc<std::sync::Barrier>,
+        }
+        impl ReadingControl for Pausing {
+            fn pause_for_preview(&self) -> Result<(), String> {
+                if self.calls.fetch_add(1, Ordering::AcqRel) == 0 {
+                    self.entered.wait();
+                    self.release.wait();
+                }
+                Ok(())
+            }
+        }
+        let first = coordinator.clone();
+        let calls = pauses.clone();
+        let gate = entered.clone();
+        let go = release.clone();
+        let a = std::thread::spawn(move || {
+            first
+                .begin(
+                    &Pausing {
+                        calls,
+                        entered: gate,
+                        release: go,
+                    },
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap()
+        });
+        entered.wait();
+        let second = coordinator.clone();
+        let calls = pauses.clone();
+        let gate = entered.clone();
+        let go = release.clone();
+        let (done, wait) = std::sync::mpsc::channel();
+        let b = std::thread::spawn(move || {
+            let flag = second
+                .begin(
+                    &Pausing {
+                        calls,
+                        entered: gate,
+                        release: go,
+                    },
+                    Arc::new(|| Ok(())),
+                )
+                .unwrap();
+            done.send(()).unwrap();
+            flag
+        });
+        let premature = wait
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok();
+        release.wait();
+        let a = a.join().unwrap();
+        let b = b.join().unwrap();
+        assert!(!premature, "begin transitions must be serialized");
+        assert!(a.load(Ordering::Acquire));
+        assert!(!b.load(Ordering::Acquire));
+        coordinator.cancel().unwrap();
+        assert!(b.load(Ordering::Acquire));
     }
 }

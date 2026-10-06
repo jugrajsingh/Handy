@@ -9,6 +9,7 @@
 //! The active implementation is determined by the `keyboard_implementation`
 //! setting and can be changed at runtime.
 
+pub(crate) mod cancel;
 mod handler;
 pub mod handy_keys;
 pub(crate) mod policy;
@@ -17,7 +18,6 @@ pub mod tauri_impl;
 use log::{debug, error, info, warn};
 use serde::Serialize;
 use specta::Type;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::{AppHandle, Emitter, Manager};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -61,77 +61,14 @@ pub fn init_shortcuts(app: &AppHandle) {
     }
 }
 
-/// Whether the recording lifecycle currently wants the cancel shortcut.
-/// Written synchronously by start/stop, so it always holds the latest request.
-static CANCEL_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-/// Whether the cancel shortcut is actually registered with the backend.
-/// The lock also serializes reconciliation passes.
-#[cfg(not(target_os = "linux"))]
-static CANCEL_REGISTERED: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
-
 /// Register the cancel shortcut (called when recording starts)
 pub fn register_cancel_shortcut(app: &AppHandle) {
-    // Track recording lifecycle independently of the current implementation so
-    // switching implementations mid-recording cannot leave stale fallback state.
-    crate::secure_input::register_cancel_fallback(app);
-
-    CANCEL_REQUESTED.store(true, Ordering::SeqCst);
-    schedule_cancel_reconcile(app);
+    cancel::set(app, cancel::Owner::Dictation, true);
 }
 
 /// Unregister the cancel shortcut (called when recording stops)
 pub fn unregister_cancel_shortcut(app: &AppHandle) {
-    crate::secure_input::unregister_cancel_fallback(app);
-
-    CANCEL_REQUESTED.store(false, Ordering::SeqCst);
-    schedule_cancel_reconcile(app);
-}
-
-/// Apply the requested cancel state off the calling thread. Start and stop run
-/// on the shortcut handler thread, which must not block on registration, so the
-/// work is spawned. Spawned tasks may run in any order (a very short recording
-/// can see its unregister task run before its register task), so each pass
-/// applies the latest request instead of the action that scheduled it.
-fn schedule_cancel_reconcile(app: &AppHandle) {
-    let app = app.clone();
-    tauri::async_runtime::spawn(async move {
-        reconcile_cancel_shortcut(&app);
-    });
-}
-
-fn reconcile_cancel_shortcut(app: &AppHandle) {
-    // Cancel shortcut is disabled on Linux due to instability with dynamic shortcut registration
-    #[cfg(target_os = "linux")]
-    {
-        let _ = app;
-        return;
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    {
-        let mut registered = CANCEL_REGISTERED.lock().unwrap_or_else(|e| e.into_inner());
-        let requested = CANCEL_REQUESTED.load(Ordering::SeqCst);
-        if requested == *registered {
-            return;
-        }
-
-        let Some(cancel_binding) = get_settings(app).bindings.get("cancel").cloned() else {
-            return;
-        };
-
-        if requested {
-            match register_shortcut(app, cancel_binding) {
-                Ok(()) => *registered = true,
-                Err(e) => error!("Failed to register cancel shortcut: {}", e),
-            }
-        } else {
-            match unregister_shortcut(app, cancel_binding) {
-                Ok(()) => *registered = false,
-                Err(e) => error!("Failed to unregister cancel shortcut: {}", e),
-            }
-        }
-    }
+    cancel::set(app, cancel::Owner::Dictation, false);
 }
 
 /// Register a shortcut using the appropriate implementation
@@ -429,6 +366,7 @@ pub fn change_keyboard_implementation_setting(
     if new_impl == KeyboardImplementation::HandyKeys && initialize_handy_keys_with_rollback(&app)? {
         // Shortcuts already registered during init.
         crate::secure_input::reconcile_fallback(&app);
+        cancel::reconcile(&app);
         return Ok(ImplementationChangeResult {
             success: true,
             reset_bindings: vec![],
@@ -438,6 +376,7 @@ pub fn change_keyboard_implementation_setting(
     // Register all shortcuts with new implementation, resetting invalid ones
     let reset_bindings = register_all_shortcuts_for_implementation(&app, new_impl);
     crate::secure_input::reconcile_fallback(&app);
+    cancel::reconcile(&app);
 
     // Emit event to notify frontend of the change
     let _ = app.emit(

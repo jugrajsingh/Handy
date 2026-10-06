@@ -140,7 +140,7 @@ pub struct Session<'a, W: Worker, O: Output> {
     output_fallback: bool,
 }
 impl<'a, W: Worker, O: Output> Session<'a, W, O> {
-    /// Creates an idle session and opens the selected output.
+    /// Creates an idle session without opening an output device.
     pub fn new(
         source: &'a str,
         selection: Selection,
@@ -150,8 +150,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
     ) -> Result<Self, String> {
         let cursor = TextCursor::new(source, selection.read_code)
             .map_err(|_| "tts.errors.text".to_string())?;
-        let playback = Playback::new(output, selection.output_device.as_deref(), handy_output)
-            .map_err(|_| "tts.errors.audio".to_string())?;
+        let playback = Playback::idle(output);
         Ok(Self {
             source,
             source_utf16: source.encode_utf16().count(),
@@ -217,6 +216,12 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         if self.source.trim().is_empty() {
             return Ok(());
         }
+        self.playback
+            .ensure_open(
+                self.selection.output_device.as_deref(),
+                self.handy_output.as_deref(),
+            )
+            .map_err(|_| "tts.errors.audio".to_string())?;
         let old = self.queue.state;
         self.queue.play();
         if old == PlaybackState::Paused {
@@ -764,6 +769,28 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+    #[test]
+    fn fix1_idle_output_failure_does_not_block_stop_and_recovers_on_play() {
+        let mut s = Session::new(
+            "The reading document stays available when audio returns.",
+            selection(),
+            FakeWorker::default(),
+            FakeOutput {
+                fail_open: true,
+                ..FakeOutput::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(s.playback.output.opens, 0);
+        s.stop();
+        assert_eq!(s.play().unwrap_err(), "tts.errors.audio");
+        s.stop();
+        s.playback.output.fail_open = false;
+        s.play().unwrap();
+        assert_eq!(s.playback.output.opens, 1);
+        assert_eq!(s.queue.state, PlaybackState::Buffering);
     }
     fn step(s: &mut Session<'_, FakeWorker, FakeOutput>, now: f64) {
         s.worker.now = now;
@@ -1423,6 +1450,8 @@ mod tests {
             Some("Handy headphones"),
         )
         .unwrap();
+        assert_eq!(s.playback.output.last_open, None);
+        s.play().unwrap();
         assert_eq!(s.playback.output.last_open.as_deref(), Some("Alternate"));
         s.select(selection(), true, |_| Ok(())).unwrap();
         assert_eq!(

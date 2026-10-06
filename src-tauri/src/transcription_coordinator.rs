@@ -201,6 +201,7 @@ enum Command {
     Input(InputEvent),
     Cancel { recording_was_active: bool },
     ProcessingFinished,
+    StopRecording { binding_id: String, source: String },
 }
 
 /// Decide whether a key-up should be deferred (so auto-repeat can cancel it)
@@ -549,6 +550,13 @@ impl CoordinatorState {
         }
     }
 
+    fn stop_recording(&mut self, binding_id: String, source: String) -> Option<Effect> {
+        if matches!(&self.stage, Stage::Recording(id) if id == &binding_id) {
+            Some(self.begin_processing(binding_id, source))
+        } else {
+            None
+        }
+    }
     fn begin_processing(&mut self, binding_id: String, hotkey_string: String) -> Effect {
         self.stage = Stage::Processing;
         self.hold = None;
@@ -621,6 +629,11 @@ impl TranscriptionCoordinator {
                                 emit_recording_phase(&app, RecordingPhase::Cancelled);
                             }
                         }
+                        Command::StopRecording { binding_id, source } => {
+                            if let Some(effect) = state.stop_recording(binding_id, source) {
+                                run_effect(&app, &mut state, effect);
+                            }
+                        }
                         Command::ProcessingFinished => {
                             if let Some(effect) = state.on_processing_finished() {
                                 run_effect(&app, &mut state, effect);
@@ -674,6 +687,18 @@ impl TranscriptionCoordinator {
         );
     }
 
+    pub fn stop_recording(&self, binding_id: &str, source: &str) {
+        if self
+            .tx
+            .send(Command::StopRecording {
+                binding_id: binding_id.into(),
+                source: source.into(),
+            })
+            .is_err()
+        {
+            warn!("Transcription coordinator channel closed");
+        }
+    }
     fn send(
         &self,
         binding_id: &str,
@@ -742,10 +767,25 @@ fn run_effect(app: &AppHandle, state: &mut CoordinatorState, effect: Effect) {
 
 /// Execute a start effect; returns whether recording actually began, so the
 /// state machine can roll back its optimistic transition on failure.
+pub(crate) fn recording_start_with(start: impl FnOnce() -> bool, abort: impl FnOnce()) -> bool {
+    let started = start();
+    if !started {
+        abort();
+    }
+    started
+}
+
 fn start(app: &AppHandle, binding_id: &str, hotkey_string: &str) -> bool {
     let Some(action) = ACTION_MAP.get(binding_id) else {
         warn!("No action in ACTION_MAP for '{binding_id}'");
-        return false;
+        return recording_start_with(
+            || false,
+            || {
+                if let Some(service) = app.try_state::<Arc<crate::tts::service::TtsService>>() {
+                    service.dictation_aborted();
+                }
+            },
+        );
     };
     action.start(app, binding_id, hotkey_string);
     let recording = app
@@ -768,6 +808,45 @@ fn stop(app: &AppHandle, binding_id: &str, hotkey_string: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn fix1_failed_start_adapter_allows_read_and_stop_never_starts_recording() {
+        use handy_tts_core::referee::{Activity, Effect as ReadEffect, Event, Referee};
+        let referee = std::cell::RefCell::new(Referee::default());
+        referee.borrow_mut().apply(Event::DictationStart);
+        assert!(!recording_start_with(
+            || false,
+            || {
+                referee.borrow_mut().apply(Event::Cancel);
+            }
+        ));
+        assert_eq!(referee.borrow().activity, Activity::Idle);
+        let ReadEffect::Capture { ticket } = referee.borrow_mut().apply(Event::ReadShortcut)[0]
+        else {
+            panic!()
+        };
+        assert_eq!(
+            referee.borrow_mut().apply(Event::Clipboard {
+                ticket,
+                text: "fresh".into()
+            }),
+            vec![ReadEffect::OpenPopup {
+                text: "fresh".into()
+            }]
+        );
+        let mut state = CoordinatorState::new();
+        assert!(state
+            .stop_recording("transcribe".into(), "read_aloud".into())
+            .is_none());
+        assert_eq!(state.stage, Stage::Idle);
+        state.stage = Stage::Recording("transcribe".into());
+        assert!(matches!(
+            state.stop_recording("transcribe".into(), "read_aloud".into()),
+            Some(Effect::Stop { .. })
+        ));
+        assert!(state
+            .stop_recording("transcribe".into(), "read_aloud".into())
+            .is_none());
+    }
 
     #[test]
     fn push_to_talk_release_while_recording_defers_release() {

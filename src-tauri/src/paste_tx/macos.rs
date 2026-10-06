@@ -108,6 +108,7 @@ struct MacPending {
     /// The transcript, for the `preserve_transcript` re-write at settle time.
     transcript: String,
     settled: bool,
+    completion: handy_tts_core::handoff::PasteCompletion,
 }
 
 /// The transaction currently holding the clipboard, if any. A new paste
@@ -119,6 +120,18 @@ static PENDING: Mutex<Option<Arc<Mutex<MacPending>>>> = Mutex::new(None);
 /// Must run on the main thread. Uses the already-locked enigo when called
 /// from within `paste` (which holds the lock), otherwise locks it itself.
 fn settle(
+    pending: &Arc<Mutex<MacPending>>,
+    app_handle: &AppHandle,
+    enigo: Option<&mut enigo::Enigo>,
+) {
+    let completion = pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .completion
+        .clone();
+    completion.settle_with(|| settle_contents(pending, app_handle, enigo));
+}
+fn settle_contents(
     pending: &Arc<Mutex<MacPending>>,
     app_handle: &AppHandle,
     enigo: Option<&mut enigo::Enigo>,
@@ -258,10 +271,14 @@ pub(super) fn run(
     app_handle: &AppHandle,
     paste_method: &PasteMethod,
     enigo: &mut enigo::Enigo,
-    auto_submit: bool,
-    auto_submit_key: AutoSubmitKey,
-    clipboard_handling: ClipboardHandling,
+    options: super::TransactionOptions,
 ) -> Result<(), String> {
+    let super::TransactionOptions {
+        auto_submit,
+        auto_submit_key,
+        clipboard_handling,
+        completion,
+    } = options;
     // Settle any previous transaction first so the snapshot below captures the
     // user's original clipboard, not the previous transcript.
     flush_pending(app_handle, enigo);
@@ -326,6 +343,7 @@ pub(super) fn run(
         preserve_transcript: clipboard_handling == ClipboardHandling::CopyToClipboard,
         transcript: text.to_string(),
         settled: false,
+        completion,
     }));
     if let Ok(mut slot) = PENDING.lock() {
         *slot = Some(pending.clone());

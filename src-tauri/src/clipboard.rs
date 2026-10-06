@@ -817,10 +817,29 @@ fn should_send_auto_submit(auto_submit: bool, paste_method: PasteMethod) -> bool
     auto_submit && paste_method != PasteMethod::None
 }
 
-/// Pastes `text` into the focused app. Call from a worker thread, never the main
-/// thread: it sleeps between steps (input injection hops via `with_enigo`).
-pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
+pub fn paste(
+    text: String,
+    app_handle: AppHandle,
+    completion: handy_tts_core::handoff::PasteCompletion,
+) -> Result<(), String> {
     let _paste = PASTE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+    let result = paste_inner(text, app_handle, &completion);
+    acknowledge_paste(result, &completion)
+}
+fn acknowledge_paste(
+    result: Result<bool, String>,
+    completion: &handy_tts_core::handoff::PasteCompletion,
+) -> Result<(), String> {
+    if !matches!(result, Ok(true)) {
+        completion.settle_with(|| {});
+    }
+    result.map(|_| ())
+}
+fn paste_inner(
+    text: String,
+    app_handle: AppHandle,
+    _completion: &handy_tts_core::handoff::PasteCompletion,
+) -> Result<bool, String> {
     let settings = get_settings(&app_handle);
     let paste_method = settings.paste_method;
     let paste_delay_ms = settings.paste_delay_ms;
@@ -866,19 +885,23 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
                     settings.auto_submit_key,
                     settings.clipboard_handling,
                 );
+                let completion = _completion.clone();
                 let reliable_result = with_enigo(&app_handle, move |enigo| {
                     crate::paste_tx::try_reliable_paste(
                         &text,
                         &app,
                         &paste_method,
                         enigo,
-                        auto_submit,
-                        auto_submit_key,
-                        clipboard_handling,
+                        crate::paste_tx::TransactionOptions {
+                            auto_submit,
+                            auto_submit_key,
+                            clipboard_handling,
+                            completion,
+                        },
                     )
                 });
                 match reliable_result {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => return Ok(true),
                     Err(e) => {
                         log::warn!("Reliable paste unavailable ({e}); falling back to legacy paste")
                     }
@@ -917,11 +940,61 @@ pub fn paste(text: String, app_handle: AppHandle) -> Result<(), String> {
         write_text_to_clipboard(&app_handle, &text)?;
     }
 
-    Ok(())
+    Ok(false)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fix1_paste_adapter_acknowledges_only_synchronous_success_or_failure() {
+        use handy_tts_core::handoff::{PasteCompletion, PipelineFence};
+        use handy_tts_core::referee::{Effect, Event, Referee};
+        let pipeline = std::sync::Arc::new(std::sync::Mutex::new(PipelineFence::default()));
+        let referee = std::sync::Arc::new(std::sync::Mutex::new(Referee::default()));
+        let generation = pipeline.lock().unwrap().begin();
+        pipeline.lock().unwrap().queued(generation);
+        referee.lock().unwrap().apply(Event::DictationStart);
+        referee.lock().unwrap().apply(Event::DictationProcessing);
+        let Effect::Capture { ticket } = referee.lock().unwrap().apply(Event::ReadShortcut)[0]
+        else {
+            panic!()
+        };
+        referee.lock().unwrap().apply(Event::Clipboard {
+            ticket,
+            text: "captured original".into(),
+        });
+        let native_settled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let settled = native_settled.clone();
+        let pending = pipeline.clone();
+        let popup = referee.clone();
+        let completion = PasteCompletion::new(move || {
+            assert!(settled.load(std::sync::atomic::Ordering::Acquire));
+            let mut pending = pending.lock().unwrap();
+            pending.pasted(generation);
+            assert!(pending.finish(generation));
+            assert_eq!(
+                popup.lock().unwrap().apply(Event::DictationFinished),
+                [Effect::OpenPopup {
+                    text: "captured original".into()
+                }]
+            );
+        });
+        super::acknowledge_paste(Ok(true), &completion).unwrap();
+        assert!(!pipeline.lock().unwrap().finish(generation));
+        assert!(!referee.lock().unwrap().popup_open);
+        completion.settle_with(|| native_settled.store(true, std::sync::atomic::Ordering::Release));
+        completion.settle_with(|| panic!("native settlement runs exactly once"));
+        assert!(referee.lock().unwrap().popup_open);
+        for result in [Ok(false), Err("synchronous failure".to_string())] {
+            let acknowledged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let done = acknowledged.clone();
+            let completion = PasteCompletion::new(move || {
+                done.store(true, std::sync::atomic::Ordering::Release)
+            });
+            let _ = super::acknowledge_paste(result, &completion);
+            assert!(acknowledged.load(std::sync::atomic::Ordering::Acquire));
+        }
+    }
     use super::*;
     use std::cell::Cell;
 

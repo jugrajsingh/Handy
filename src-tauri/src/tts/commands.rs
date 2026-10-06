@@ -168,14 +168,15 @@ pub fn set_selection(
     settings.tts_pitch_semitones = chosen.pitch;
     settings.tts_output_device = chosen.output_device.clone();
     settings.tts_read_code_blocks = chosen.read_code;
-    crate::settings::write_settings_checked(app, settings)?;
-    ready
-        .session
-        .send(SessionCommand::Select {
-            selection: chosen,
-            downloaded: download::is_downloaded(&ready.root, entry),
-        })
-        .map_err(|e| e.to_string())
+    let app = app.clone();
+    ready.session.select_and_wait(
+        chosen,
+        download::is_downloaded(&ready.root, entry),
+        Box::new(move |_| {
+            crate::settings::write_settings_checked(&app, settings)
+                .map_err(|_| handy_tts_core::selection::SelectionError::Persist)
+        }),
+    )
 }
 #[tauri::command]
 #[specta::specta]
@@ -228,13 +229,11 @@ pub async fn set_tts_run_on(
             .set_run_on(&model_id, choice)
             .map_err(|e| e.to_string())?;
         if settings.tts_model_id == model_id {
-            ready
-                .session
-                .send(SessionCommand::Select {
-                    selection: selection(&settings),
-                    downloaded: ready.manager.downloaded(&model_id),
-                })
-                .map_err(|e| e.to_string())?;
+            ready.session.select_and_wait(
+                selection(&settings),
+                ready.manager.downloaded(&model_id),
+                Box::new(|_| Ok(())),
+            )?;
         }
         super::preparation::prepare(&ready, &model_id, choice)?;
         Ok(())

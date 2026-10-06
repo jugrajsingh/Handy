@@ -100,6 +100,20 @@ fn native_windows_machine() -> Option<u16> {
 /// Centralized cancellation function that can be called from anywhere in the app.
 /// Handles cancelling both recording and transcription operations and updates UI state.
 pub fn cancel_current_operation(app: &AppHandle) {
+    cancel_operation_with(
+        || {
+            if let Some(service) = app.try_state::<Arc<crate::tts::service::TtsService>>() {
+                service.dictation_aborted();
+            }
+        },
+        || cancel_native_operation(app),
+    );
+}
+fn cancel_operation_with(notify_tts: impl FnOnce(), cancel_native: impl FnOnce()) {
+    notify_tts();
+    cancel_native();
+}
+fn cancel_native_operation(app: &AppHandle) {
     info!("Initiating operation cancellation...");
 
     // Unregister the cancel shortcut asynchronously
@@ -187,6 +201,32 @@ pub fn env_flag_enabled(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fix1_cancel_adapter_leaves_dictating_before_the_next_read() {
+        use handy_tts_core::referee::{Activity, Effect, Event, Referee};
+        let referee = std::cell::RefCell::new(Referee::default());
+        referee.borrow_mut().apply(Event::DictationStart);
+        super::cancel_operation_with(
+            || {
+                referee.borrow_mut().apply(Event::Cancel);
+            },
+            || {
+                assert_eq!(referee.borrow().activity, Activity::Idle);
+            },
+        );
+        let Effect::Capture { ticket } = referee.borrow_mut().apply(Event::ReadShortcut)[0] else {
+            panic!()
+        };
+        assert_eq!(
+            referee.borrow_mut().apply(Event::Clipboard {
+                ticket,
+                text: "fresh".into()
+            }),
+            vec![Effect::OpenPopup {
+                text: "fresh".into()
+            }]
+        );
+    }
     use super::*;
 
     #[test]

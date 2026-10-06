@@ -185,6 +185,14 @@ pub(crate) fn send_chord(
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub(crate) struct TransactionOptions {
+    pub auto_submit: bool,
+    pub auto_submit_key: crate::settings::AutoSubmitKey,
+    pub clipboard_handling: crate::settings::ClipboardHandling,
+    pub completion: handy_tts_core::handoff::PasteCompletion,
+}
+
 /// Attempts the receipt-sequenced paste. Returns `Err` before anything has
 /// been published when the platform transaction cannot start, in which case
 /// the caller should fall back to the legacy paste path. On `Ok`, publishing
@@ -196,19 +204,9 @@ pub(crate) fn try_reliable_paste(
     app_handle: &tauri::AppHandle,
     paste_method: &crate::settings::PasteMethod,
     enigo: &mut enigo::Enigo,
-    auto_submit: bool,
-    auto_submit_key: crate::settings::AutoSubmitKey,
-    clipboard_handling: crate::settings::ClipboardHandling,
+    options: TransactionOptions,
 ) -> Result<(), String> {
-    platform::run(
-        text,
-        app_handle,
-        paste_method,
-        enigo,
-        auto_submit,
-        auto_submit_key,
-        clipboard_handling,
-    )
+    platform::run(text, app_handle, paste_method, enigo, options)
 }
 
 #[cfg(test)]

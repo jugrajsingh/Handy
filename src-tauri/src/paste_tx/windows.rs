@@ -76,6 +76,7 @@ pub(super) struct WinTxShared {
     /// ClipboardHandling::CopyToClipboard — settle by leaving the transcript
     /// on the clipboard as plain text instead of restoring the snapshot.
     preserve_transcript: bool,
+    completion: handy_tts_core::handoff::PasteCompletion,
 }
 
 /// The transaction currently holding the clipboard, if any. A new
@@ -229,14 +230,16 @@ fn flush_pending() {
         st.cancelled = true;
         st.any_receipt_after_injection()
     };
-    if previous.auto_submit && receipt {
-        send_auto_submit(&previous);
-    }
-    let sequence = *previous.sequence.lock().unwrap();
-    let still_ours = unsafe { GetClipboardSequenceNumber() } == sequence;
-    if still_ours {
-        unsafe { settle_clipboard(&previous) };
-    }
+    previous.completion.settle_with(|| {
+        if previous.auto_submit && receipt {
+            send_auto_submit(&previous);
+        }
+        let sequence = *previous.sequence.lock().unwrap();
+        let still_ours = unsafe { GetClipboardSequenceNumber() } == sequence;
+        if still_ours {
+            unsafe { settle_clipboard(&previous) };
+        }
+    });
 }
 
 /// Settle-time clipboard handling once we know we still own the clipboard:
@@ -456,17 +459,19 @@ fn on_timer(_hwnd: HWND, shared: &WinTxShared) {
 
     // Auto-submit only once the target demonstrably read the transcript;
     // pressing Enter after an unconfirmed paste could submit stale content.
-    if shared.auto_submit && receipt {
-        send_auto_submit(shared);
-    }
+    shared.completion.settle_with(|| {
+        if shared.auto_submit && receipt {
+            send_auto_submit(shared);
+        }
 
-    let sequence = *shared.sequence.lock().unwrap();
-    let still_ours = !ownership_lost && unsafe { GetClipboardSequenceNumber() } == sequence;
-    if still_ours {
-        unsafe { settle_clipboard(shared) };
-    } else {
-        info!("[reliable-paste] clipboard changed externally; leaving it untouched");
-    }
+        let sequence = *shared.sequence.lock().unwrap();
+        let still_ours = !ownership_lost && unsafe { GetClipboardSequenceNumber() } == sequence;
+        if still_ours {
+            unsafe { settle_clipboard(shared) };
+        } else {
+            info!("[reliable-paste] clipboard changed externally; leaving it untouched");
+        }
+    });
 
     if let Ok(mut slot) = PENDING.lock() {
         let is_us = slot
@@ -576,10 +581,14 @@ pub(super) fn run(
     app_handle: &tauri::AppHandle,
     paste_method: &PasteMethod,
     enigo: &mut enigo::Enigo,
-    auto_submit: bool,
-    auto_submit_key: AutoSubmitKey,
-    clipboard_handling: ClipboardHandling,
+    options: super::TransactionOptions,
 ) -> Result<(), String> {
+    let super::TransactionOptions {
+        auto_submit,
+        auto_submit_key,
+        clipboard_handling,
+        completion,
+    } = options;
     let shared = Arc::new(WinTxShared {
         state: Mutex::new(TxState::new()),
         text: text.to_string(),
@@ -590,6 +599,7 @@ pub(super) fn run(
         auto_submit,
         auto_submit_key,
         preserve_transcript: clipboard_handling == ClipboardHandling::CopyToClipboard,
+        completion,
     });
 
     let (ready_tx, ready_rx) = std::sync::mpsc::channel();

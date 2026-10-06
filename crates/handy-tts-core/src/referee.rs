@@ -132,6 +132,10 @@ impl Referee {
                     effects.extend([Effect::StopReading, Effect::ClosePopup]);
                     self.activity = Activity::Idle;
                 }
+                if event == Event::Cancel {
+                    self.activity = Activity::Idle;
+                    self.dictation_finished = true;
+                }
                 self.popup_open = false;
             }
             Event::Clipboard { .. } => {}
@@ -259,5 +263,44 @@ mod tests {
             })
             .is_empty()
         );
+    }
+    #[test]
+    fn fix1_cancelled_or_failed_start_opens_next_read_without_toggling_dictation() {
+        for captured in [false, true] {
+            let mut referee = Referee::default();
+            referee.apply(Event::DictationStart);
+            let old = referee.apply(Event::ReadShortcut);
+            let Effect::Capture { ticket } = old[0] else {
+                panic!()
+            };
+            if captured {
+                referee.apply(Event::Clipboard {
+                    ticket,
+                    text: "abandoned".into(),
+                });
+            }
+            referee.apply(Event::Cancel);
+            assert_eq!(referee.activity, Activity::Idle);
+            assert!(
+                referee
+                    .apply(Event::Clipboard {
+                        ticket,
+                        text: "stale".into()
+                    })
+                    .is_empty()
+            );
+            let Effect::Capture { ticket } = referee.apply(Event::ReadShortcut)[0] else {
+                panic!()
+            };
+            assert_eq!(
+                referee.apply(Event::Clipboard {
+                    ticket,
+                    text: "fresh".into()
+                }),
+                vec![Effect::OpenPopup {
+                    text: "fresh".into()
+                }]
+            );
+        }
     }
 }
