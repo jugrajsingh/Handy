@@ -104,6 +104,16 @@ function App() {
     checkOnboardingStatus();
   }, []);
 
+  useEffect(() => {
+    const unlisten = listen("open-tts-models", () => {
+      setCurrentSection("ttsmodels");
+      void commands.showMainWindowCommand();
+    });
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, []);
+
   // Initialize RTL direction when language changes
   useEffect(() => {
     initializeRTL(i18n.language);

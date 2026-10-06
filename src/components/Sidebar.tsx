@@ -12,6 +12,8 @@ import {
   PostProcessingSettings,
   ModelsSettings,
 } from "./settings";
+import { SettingsPage as TtsSettingsPage } from "./settings/tts/SettingsPage";
+import { ModelsPage as TtsModelsPage } from "./settings/tts/ModelsPage";
 
 export type SidebarSection = keyof typeof SECTIONS_CONFIG;
 
@@ -61,6 +63,18 @@ export const SECTIONS_CONFIG = {
     icon: Sparkles,
     component: PostProcessingSettings,
     enabled: (settings) => settings?.post_process_enabled ?? false,
+  },
+  tts: {
+    labelKey: "tts.settingsTitle",
+    icon: Sparkles,
+    component: TtsSettingsPage,
+    enabled: () => true,
+  },
+  ttsmodels: {
+    labelKey: "tts.modelsTitle",
+    icon: Cpu,
+    component: TtsModelsPage,
+    enabled: () => true,
   },
   debug: {
     labelKey: "sidebar.debug",
