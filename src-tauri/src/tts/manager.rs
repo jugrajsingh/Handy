@@ -13,7 +13,10 @@ use handy_tts_core::{
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, TryLockError,
+    },
     time::{Duration, Instant},
 };
 
@@ -58,6 +61,8 @@ pub struct TtsManager<B: Transport = WorkerBackend> {
     started: Instant,
     cached: Mutex<ManagerSnapshot>,
     cancelled_id: std::sync::atomic::AtomicU64,
+    interruption: AtomicU64,
+    activity: AtomicU64,
     invalid: Arc<Mutex<BTreeMap<String, Vec<Device>>>>,
 }
 impl TtsManager {
@@ -110,6 +115,8 @@ impl<B: Transport> TtsManager<B> {
             checks,
             started: Instant::now(),
             cancelled_id: std::sync::atomic::AtomicU64::new(0),
+            interruption: AtomicU64::new(0),
+            activity: AtomicU64::new(0),
             invalid,
             cached: Mutex::new(ManagerSnapshot {
                 state: State::Unloaded,
@@ -149,15 +156,7 @@ impl<B: Transport> TtsManager<B> {
         selection: &Selection,
         cancelled: &std::sync::atomic::AtomicBool,
     ) -> Result<(), TtsError> {
-        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-            return Err(TtsError::Cancelled);
-        }
-        let result = self.ensure(selection);
-        if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-            self.unload();
-            return Err(TtsError::Cancelled);
-        }
-        result
+        self.ensure_with(selection, || cancelled.load(Ordering::Acquire), true)
     }
     pub fn snapshot(&self) -> ManagerSnapshot {
         let mut snapshot = self
@@ -197,15 +196,18 @@ impl<B: Transport> TtsManager<B> {
             .is_some_and(|key| key.model == model)
     }
     pub fn cancel(&self, id: u64) {
+        self.activity.fetch_add(1, Ordering::AcqRel);
         self.cancelled_id
             .store(id, std::sync::atomic::Ordering::Release);
         self.control.cancel(id);
     }
     pub fn interrupt(&self) {
+        self.interruption.fetch_add(1, Ordering::AcqRel);
+        self.activity.fetch_add(1, Ordering::AcqRel);
         self.control.kill();
     }
     pub fn unload(&self) {
-        self.control.kill();
+        self.interrupt();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let failed = inner.lifecycle.state == State::Failed;
         inner.lifecycle.stopping();
@@ -239,8 +241,22 @@ impl<B: Transport> TtsManager<B> {
         Ok(())
     }
     pub fn ensure(&self, selection: &Selection) -> Result<(), TtsError> {
+        self.ensure_with(selection, || false, false)
+    }
+    fn ensure_with(
+        &self,
+        selection: &Selection,
+        cancelled: impl Fn() -> bool,
+        discard_cancelled_ready: bool,
+    ) -> Result<(), TtsError> {
+        let generation = self.interruption.load(Ordering::Acquire);
+        self.activity.fetch_add(1, Ordering::AcqRel);
+        let interrupted = || cancelled() || self.interruption.load(Ordering::Acquire) != generation;
         let call = Instant::now();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if interrupted() {
+            return Err(TtsError::Cancelled);
+        }
         if let Some((failed, error)) = &inner.last_failure {
             if *failed >= call {
                 return Err(error.clone());
@@ -259,6 +275,15 @@ impl<B: Transport> TtsManager<B> {
                 && inner.backend.alive()
             {
                 inner.lifecycle.touch(self.started.elapsed());
+                if interrupted() {
+                    if discard_cancelled_ready {
+                        inner.backend.stop();
+                        inner.key = None;
+                        inner.lifecycle.stopped();
+                        self.publish(State::Unloaded, Preparation::Idle);
+                    }
+                    return Err(TtsError::Cancelled);
+                }
                 return Ok(());
             }
         }
@@ -285,7 +310,13 @@ impl<B: Transport> TtsManager<B> {
         };
         let mut last = TtsError::Start;
         for device in attempts {
+            if interrupted() {
+                return Err(TtsError::Cancelled);
+            }
             let available = (self.checks.memory)()?;
+            if interrupted() {
+                return Err(TtsError::Cancelled);
+            }
             inner.lifecycle.begin_start(available).map_err(|_| {
                 if available < handy_tts_core::memory::MIN_AVAILABLE_BYTES {
                     TtsError::Memory
@@ -314,6 +345,13 @@ impl<B: Transport> TtsManager<B> {
                 cache: &cache,
                 home: &config.home,
             });
+            if interrupted() && (discard_cancelled_ready || result.is_err()) {
+                inner.backend.stop();
+                inner.key = None;
+                inner.lifecycle.stopped();
+                self.publish(State::Unloaded, Preparation::Idle);
+                return Err(TtsError::Cancelled);
+            }
             match result {
                 Err(TtsError::Memory) => {
                     inner.backend.stop();
@@ -341,13 +379,30 @@ impl<B: Transport> TtsManager<B> {
                     let mut cached = self.cached.lock().unwrap_or_else(|p| p.into_inner());
                     cached.ready = Some(ready);
                     cached.fallback_from = (device != first).then_some(first);
+                    drop(cached);
+                    if interrupted() {
+                        if discard_cancelled_ready {
+                            inner.backend.stop();
+                            inner.key = None;
+                            inner.lifecycle.stopped();
+                            self.publish(State::Unloaded, Preparation::Idle);
+                        }
+                        return Err(TtsError::Cancelled);
+                    }
                     return Ok(());
                 }
                 outcome => {
                     last = outcome.err().unwrap_or(TtsError::Protocol);
                     inner.backend.stop();
+                    inner.key = None;
+                    if interrupted() {
+                        inner.lifecycle.stopped();
+                        self.publish(State::Unloaded, Preparation::Idle);
+                        return Err(TtsError::Cancelled);
+                    }
                     inner.lifecycle.start_failed();
-                    if device == Device::Npu {
+                    if device == Device::Npu && last == TtsError::Device(DeviceError::CompileFailed)
+                    {
                         self.invalid
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
@@ -384,7 +439,11 @@ impl<B: Transport> TtsManager<B> {
             if self.cancelled_id.load(std::sync::atomic::Ordering::Acquire) == id {
                 return Err(TtsError::Cancelled);
             }
-            self.ensure(selection)?;
+            self.ensure_with(
+                selection,
+                || self.cancelled_id.load(Ordering::Acquire) == id,
+                false,
+            )?;
             if self.cancelled_id.load(std::sync::atomic::Ordering::Acquire) == id {
                 let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if !inner.backend.alive() {
@@ -425,19 +484,51 @@ impl<B: Transport> TtsManager<B> {
         Err(TtsError::Worker)
     }
     pub fn idle(&self, timeout: UnloadAfter, busy: bool) {
-        let due = {
-            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-            inner.lifecycle.busy = busy;
-            if busy {
+        self.idle_with(timeout, || busy, || {});
+    }
+    fn idle_with(&self, timeout: UnloadAfter, busy: impl Fn() -> bool, before_stop: impl FnOnce()) {
+        let (generation, last_used) = {
+            let mut inner = match self.inner.try_lock() {
+                Ok(inner) => inner,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => return,
+            };
+            inner.lifecycle.busy = busy();
+            if inner.lifecycle.busy {
                 inner.lifecycle.touch(self.started.elapsed());
             }
-            inner
+            if !inner
                 .lifecycle
                 .needs_unload(self.started.elapsed(), timeout)
+            {
+                return;
+            }
+            (
+                self.activity.load(Ordering::Acquire),
+                inner.lifecycle.last_used,
+            )
         };
-        if due {
-            self.unload();
+        before_stop();
+        let mut inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return,
+        };
+        inner.lifecycle.busy = busy();
+        if self.activity.load(Ordering::Acquire) != generation
+            || inner.lifecycle.last_used != last_used
+            || !inner
+                .lifecycle
+                .needs_unload(self.started.elapsed(), timeout)
+        {
+            return;
         }
+        inner.lifecycle.stopping();
+        self.publish(State::Stopping, Preparation::Idle);
+        inner.backend.stop();
+        inner.key = None;
+        inner.lifecycle.stopped();
+        self.publish(State::Unloaded, Preparation::Idle);
     }
     pub fn spawn_idle(
         self: &Arc<Self>,
@@ -451,9 +542,10 @@ impl<B: Transport> TtsManager<B> {
                 break;
             };
             let settings = crate::settings::get_settings(&app);
-            manager.idle(
+            manager.idle_with(
                 super::unload_after(settings.model_unload_timeout),
-                busy.load(std::sync::atomic::Ordering::Acquire),
+                || busy.load(Ordering::Acquire),
+                || {},
             );
         });
     }
@@ -503,8 +595,11 @@ mod tests {
             if trace.memory_at_load {
                 return Err(TtsError::Memory);
             }
-            if trace.fail_all || trace.fail_npu && spec.device == Device::Npu {
+            if trace.fail_all {
                 return Err(TtsError::Start);
+            }
+            if trace.fail_npu && spec.device == Device::Npu {
+                return Err(TtsError::Device(DeviceError::CompileFailed));
             }
             self.control.alive.store(true, Ordering::Release);
             Ok(WorkerReady {
@@ -609,6 +704,182 @@ mod tests {
     }
     fn enough() -> Result<u64, TtsError> {
         Ok(handy_tts_core::memory::MIN_AVAILABLE_BYTES)
+    }
+    #[test]
+    fn interrupted_npu_start_is_cancelled_without_failure_retry_or_driver_rejection() {
+        use std::io::Read;
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        for mode in 0..3 {
+            let fixture =
+                tempfile::tempdir_in(std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap()).unwrap();
+            let listener = UnixListener::bind(fixture.path().join("gate.sock")).unwrap();
+            let binary = fixture.path().join("starting-worker.py");
+            std::fs::write(&binary, r#"#!/usr/bin/python3
+import json, pathlib, socket, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['type'] == 'load':
+        root = pathlib.Path(request['model_dir']).parent
+        starts = root / 'starts'
+        first = not starts.exists()
+        with starts.open('a') as out:
+            out.write(request['device'] + '\n')
+        if first:
+            gate = socket.socket(socket.AF_UNIX)
+            gate.connect(str(root / 'gate.sock'))
+            gate.sendall(b'S')
+            gate.recv(1)
+        device = request['device']
+        print(json.dumps({'id': 0, 'status': 'ready', 'device': device, 'placement': {'main': device}, 'samples': 0}), flush=True)
+"#).unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut config = config(RunOn::Auto);
+            config.root = fixture.path().into();
+            config.binary = binary;
+            config.cache = fixture.path().join("cache");
+            config.home = fixture.path().join("home");
+            let parent = TtsManager::with_backend(
+                config,
+                WorkerBackend::default(),
+                Checks {
+                    memory: enough,
+                    downloaded: |_, _| true,
+                },
+            )
+            .unwrap();
+            let child = parent.fork().unwrap();
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let task = {
+                let child = child.clone();
+                let cancelled = cancelled.clone();
+                std::thread::spawn(move || match mode {
+                    0 => child.ensure_cancellable(&selection(), &cancelled),
+                    1 => child
+                        .synthesize(&selection(), 91, "interrupted")
+                        .map(|_| ()),
+                    _ => child.ensure(&selection()),
+                })
+            };
+            let (mut gate, _) = listener.accept().unwrap();
+            gate.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut signal = [0];
+            gate.read_exact(&mut signal).unwrap();
+            assert_eq!(signal, [b'S']);
+            if mode == 0 {
+                cancelled.store(true, Ordering::Release);
+            }
+            if mode == 1 {
+                child.cancel(91);
+            }
+            child.interrupt();
+            assert_eq!(task.join().unwrap(), Err(TtsError::Cancelled));
+            assert_eq!(
+                std::fs::read_to_string(fixture.path().join("starts")).unwrap(),
+                "npu\n"
+            );
+            assert_eq!(child.inner.lock().unwrap().lifecycle.failed_starts, 0);
+            assert!(!child.npu_driver_too_old("supertonic-3"));
+            assert!(!parent.npu_driver_too_old("supertonic-3"));
+            assert_eq!(child.status(), State::Unloaded);
+        }
+    }
+    #[test]
+    fn npu_transport_failure_does_not_reject_the_driver() {
+        let trace = Arc::new(Mutex::new(Trace {
+            fail_all: true,
+            ..Trace::default()
+        }));
+        let manager = manager(RunOn::Npu, trace.clone(), enough);
+        assert_eq!(manager.ensure(&selection()), Err(TtsError::Start));
+        assert_eq!(manager.inner.lock().unwrap().lifecycle.failed_starts, 2);
+        assert!(!manager.npu_driver_too_old("supertonic-3"));
+    }
+    #[test]
+    fn idle_rechecks_activity_and_generation_after_its_decision() {
+        for stays_busy in [false, true] {
+            let trace = Arc::new(Mutex::new(Trace::default()));
+            let manager = manager(RunOn::Cpu, trace.clone(), enough);
+            manager.ensure(&selection()).unwrap();
+            let busy = Arc::new(AtomicBool::new(false));
+            let gate = Arc::new(std::sync::Barrier::new(2));
+            let idle = {
+                let manager = manager.clone();
+                let busy = busy.clone();
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    manager.idle_with(
+                        UnloadAfter::Immediately,
+                        || busy.load(Ordering::Acquire),
+                        || {
+                            gate.wait();
+                            gate.wait();
+                        },
+                    )
+                })
+            };
+            gate.wait();
+            busy.store(true, Ordering::Release);
+            if !stays_busy {
+                manager.ensure(&selection()).unwrap();
+            }
+            busy.store(stays_busy, Ordering::Release);
+            gate.wait();
+            idle.join().unwrap();
+            assert_eq!(manager.status(), State::Ready);
+            assert!(manager.control.alive.load(Ordering::Acquire));
+            assert_eq!(trace.lock().unwrap().stopped, 0);
+            busy.store(false, Ordering::Release);
+            manager.idle_with(
+                UnloadAfter::Immediately,
+                || busy.load(Ordering::Acquire),
+                || {},
+            );
+            assert_eq!(manager.status(), State::Unloaded);
+            assert_eq!(trace.lock().unwrap().stopped, 1);
+        }
+    }
+    #[test]
+    fn idle_tick_does_not_wait_behind_startup_with_stale_activity() {
+        let gate = Arc::new(std::sync::Barrier::new(2));
+        let trace = Arc::new(Mutex::new(Trace {
+            start_gate: Some(gate.clone()),
+            ..Trace::default()
+        }));
+        let manager = manager(RunOn::Cpu, trace.clone(), enough);
+        let start = manager.prepare(selection());
+        gate.wait();
+        let busy = AtomicBool::new(false);
+        let samples = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            let (done, wait) = std::sync::mpsc::channel();
+            let manager = &manager;
+            let busy = &busy;
+            let samples = &samples;
+            scope.spawn(move || {
+                manager.idle_with(
+                    UnloadAfter::Immediately,
+                    || {
+                        samples.fetch_add(1, Ordering::Relaxed);
+                        busy.load(Ordering::Acquire)
+                    },
+                    || {},
+                );
+                done.send(()).unwrap();
+            });
+            let skipped = wait.recv_timeout(Duration::from_secs(1)).is_ok();
+            busy.store(true, Ordering::Release);
+            gate.wait();
+            start.join().unwrap().unwrap();
+            assert!(
+                skipped,
+                "a contended idle tick must return without waiting for startup"
+            );
+        });
+        assert_eq!(samples.load(Ordering::Relaxed), 0);
+        assert_eq!(manager.status(), State::Ready);
+        assert!(manager.control.alive.load(Ordering::Acquire));
+        manager.idle(UnloadAfter::Immediately, false);
+        assert_eq!(manager.status(), State::Unloaded);
     }
     #[test]
     fn cancelled_prepare_cannot_leave_a_worker_spawned_after_its_stop() {

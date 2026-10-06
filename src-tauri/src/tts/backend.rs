@@ -7,7 +7,7 @@ use std::io::BufReader;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct LoadSpec<'a> {
     pub binary: &'a Path,
@@ -75,6 +75,7 @@ struct Reply {
 pub struct WorkerBackend {
     control: WorkerControl,
     replies: Option<mpsc::Receiver<Result<Reply, TtsError>>>,
+    abandoned: std::collections::BTreeSet<u64>,
 }
 impl WorkerBackend {
     pub fn control(&self) -> WorkerControl {
@@ -104,7 +105,7 @@ impl WorkerBackend {
             .stderr(Stdio::piped());
         let driver = if device == handy_tts_core::device::Device::Npu {
             handy_tts_core::worker_env::discover_driver(&home.join(".local/share/intel-npu"))
-                .map_err(|_| TtsError::Device(handy_tts_core::device::DeviceError::CompileFailed))?
+                .map_err(|_| TtsError::Start)?
         } else {
             None
         };
@@ -202,6 +203,12 @@ impl WorkerBackend {
                     && reply.header.message.as_deref() == Some("not_enough_memory")
                 {
                     TtsError::Memory
+                } else if reply.header.id == 0
+                    && reply.header.status == Status::Error
+                    && reply.header.message.as_deref() == Some("npu_compile_failed")
+                    && device == handy_tts_core::device::Device::Npu
+                {
+                    TtsError::Device(handy_tts_core::device::DeviceError::CompileFailed)
                 } else {
                     TtsError::Start
                 },
@@ -225,12 +232,44 @@ impl WorkerBackend {
             .map_err(|_| TtsError::Worker)?
     }
     pub fn synthesize(&mut self, id: u64, text: &str, speed: Option<f32>) -> Result<Pcm, TtsError> {
+        self.synthesize_with_timeout(id, text, speed, Duration::from_secs(60))
+    }
+    fn synthesize_with_timeout(
+        &mut self,
+        id: u64,
+        text: &str,
+        speed: Option<f32>,
+        timeout: Duration,
+    ) -> Result<Pcm, TtsError> {
+        if self.abandoned.contains(&id) {
+            return Err(TtsError::Worker);
+        }
         self.send(&Request::Synthesize {
             id,
             text: text.into(),
             speed,
         })?;
-        let reply = self.receive(Duration::from_secs(60))?;
+        let deadline = Instant::now() + timeout;
+        let reply = loop {
+            let result = if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                self.receive(remaining)
+            } else {
+                Err(TtsError::Worker)
+            };
+            let reply = match result {
+                Ok(reply) => reply,
+                Err(error) => {
+                    self.abandoned.insert(id);
+                    self.control.cancel(id);
+                    return Err(error);
+                }
+            };
+            if reply.header.id != id {
+                self.abandoned.remove(&reply.header.id);
+                continue;
+            }
+            break reply;
+        };
         if reply.header.id != id || reply.header.status != Status::Ok {
             return Err(TtsError::Worker);
         }
@@ -264,6 +303,7 @@ impl WorkerBackend {
             .unwrap_or_else(|p| p.into_inner())
             .take();
         self.replies = None;
+        self.abandoned.clear();
     }
 }
 impl Drop for WorkerBackend {
@@ -306,6 +346,77 @@ impl Transport for WorkerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn timed_out_reply_is_drained_before_retry_and_worker_stays_alive() {
+        use handy_tts_core::device::Device;
+        use std::io::{Read, Write};
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let fixture =
+            tempfile::tempdir_in(std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap()).unwrap();
+        let socket = fixture.path().join("gate.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let binary = fixture.path().join("late-worker.py");
+        std::fs::write(&binary, r#"#!/usr/bin/python3
+import json, pathlib, socket, struct, sys
+root = None
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['type'] == 'load':
+        root = pathlib.Path(request['model_dir'])
+        print(json.dumps({'id': 0, 'status': 'ready', 'device': 'cpu', 'placement': {'main': 'cpu'}, 'samples': 0}), flush=True)
+    elif request['type'] == 'cancel':
+        (root / 'cancelled').write_text(str(request['id']))
+    elif request['type'] == 'synthesize':
+        if request['id'] == 1:
+            gate = socket.socket(socket.AF_UNIX)
+            gate.connect(str(root / 'gate.sock'))
+            gate.sendall(b'S')
+            gate.recv(1)
+            gate.close()
+        print(json.dumps({'id': request['id'], 'status': 'ok', 'sample_rate': 24000, 'samples': 1}), flush=True)
+        sys.stdout.buffer.write(struct.pack('<f', float(request['id'])))
+        sys.stdout.buffer.flush()
+"#).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut backend = WorkerBackend::default();
+        backend
+            .start(&LoadSpec {
+                binary: &binary,
+                root: fixture.path(),
+                entry: handy_tts_core::catalog::entry("pocket-en").unwrap(),
+                voice: "alba",
+                device: Device::Cpu,
+                cache: fixture.path(),
+                home: fixture.path(),
+            })
+            .unwrap();
+        let child = backend.control.child.lock().unwrap().as_ref().unwrap().id();
+        let timeout = backend.synthesize_with_timeout(1, "A", None, Duration::from_millis(50));
+        assert!(matches!(timeout, Err(TtsError::Worker)));
+        let (mut gate, _) = listener.accept().unwrap();
+        gate.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut signal = [0];
+        gate.read_exact(&mut signal).unwrap();
+        assert_eq!(signal, [b'S']);
+        gate.write_all(b"R").unwrap();
+        for id in [2, 3] {
+            let pcm = backend
+                .synthesize_with_timeout(id, "retry", None, Duration::from_secs(2))
+                .unwrap();
+            assert_eq!(pcm.id, id);
+            assert_eq!(pcm.samples, [id as f32]);
+            assert!(backend.alive());
+            assert_eq!(
+                backend.control.child.lock().unwrap().as_ref().unwrap().id(),
+                child
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("cancelled")).unwrap(),
+            "1"
+        );
+        backend.stop();
+    }
     #[test]
     fn control_and_reaper_share_the_owned_child_instead_of_a_reusable_pid() {
         use handy_tts_core::device::Device;

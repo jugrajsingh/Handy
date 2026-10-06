@@ -1,6 +1,13 @@
 use anyhow::{Context, Result, ensure};
 use openvino::{Core, DeviceType, InferRequest, PartialShape, RwPropertyKey, Tensor};
 use std::{collections::BTreeMap, path::Path, time::Instant};
+#[derive(Debug)]
+pub(crate) struct NpuCompileRejected;
+impl std::fmt::Display for NpuCompileRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("NPU graph compile rejected")
+    }
+}
 #[derive(Debug, serde::Serialize)]
 pub struct GraphInfo {
     pub device: String,
@@ -81,6 +88,14 @@ impl Graph {
         let start = Instant::now();
         let mut compiled = core
             .compile_model(&model, kind)
+            .map_err(|error| {
+                let error = anyhow::Error::new(error);
+                if device == "NPU" {
+                    error.context(NpuCompileRejected)
+                } else {
+                    error
+                }
+            })
             .context("compile ONNX on explicit OpenVINO device")?;
         let compile_seconds = start.elapsed().as_secs_f64();
         let cached = compiled

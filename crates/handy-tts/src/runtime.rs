@@ -245,6 +245,13 @@ pub fn run(
                     }
                     Err(error) => {
                         log_failure("load", &error);
+                        let message = if device == handy_tts_core::device::Device::Npu
+                            && error.is::<crate::ov_graph::NpuCompileRejected>()
+                        {
+                            "npu_compile_failed"
+                        } else {
+                            "load_failed"
+                        };
                         write_reply(
                             &mut writer,
                             &Header {
@@ -254,7 +261,7 @@ pub fn run(
                                 status: Status::Error,
                                 sample_rate: None,
                                 samples: None,
-                                message: Some("load_failed".into()),
+                                message: Some(message.into()),
                             },
                             &[],
                         )?;
@@ -410,6 +417,48 @@ pub fn parse_model(args: impl Iterator<Item = String>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_npu_compile_rejection_has_the_driver_failure_header() {
+        use handy_tts_core::device::Device;
+        for (device, compile_rejected, expected) in [
+            (Device::Npu, true, "npu_compile_failed"),
+            (Device::Npu, false, "load_failed"),
+            (Device::Cpu, true, "load_failed"),
+        ] {
+            let mut controls = Vec::new();
+            handy_tts_core::protocol::write_request(
+                &mut controls,
+                &Request::Load {
+                    model_dir: "/fixture".into(),
+                    voice: "fixture".into(),
+                    threads: 4,
+                    device,
+                    cache_dir: "/fixture/cache".into(),
+                },
+            )
+            .unwrap();
+            handy_tts_core::protocol::write_request(&mut controls, &Request::Shutdown).unwrap();
+            let mut replies = Vec::new();
+            run(
+                std::io::Cursor::new(controls),
+                &mut replies,
+                |_, _, _, _, _| {
+                    let error = anyhow::anyhow!("fixture load failure");
+                    Err(if compile_rejected {
+                        error.context(crate::ov_graph::NpuCompileRejected)
+                    } else {
+                        error
+                    })
+                },
+                || Ok(u64::MAX),
+            )
+            .unwrap();
+            let header =
+                handy_tts_core::protocol::read_header(&mut std::io::Cursor::new(replies)).unwrap();
+            assert_eq!(header.status, Status::Error);
+            assert_eq!(header.message.as_deref(), Some(expected));
+        }
+    }
     #[test]
     fn follow_up_missing_voice_logs_safe_stderr() {
         const CHILD: &str = "HANDY_TTS_TEST_MISSING_VOICE";

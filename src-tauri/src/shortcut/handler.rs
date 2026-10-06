@@ -4,7 +4,7 @@
 //! used by both the Tauri and handy-keys implementations.
 
 use log::warn;
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, Arc};
 use tauri::{AppHandle, Manager};
 
 use crate::actions::ACTION_MAP;
@@ -12,6 +12,26 @@ use crate::managers::audio::AudioRecordingManager;
 use crate::settings::get_settings;
 use crate::transcription_coordinator::is_transcribe_binding;
 use crate::TranscriptionCoordinator;
+
+static READ_ALOUD_UNWIRED_LOGGED: AtomicBool = AtomicBool::new(false);
+
+fn action_for_binding<'a, T>(
+    binding_id: &str,
+    actions: &'a std::collections::HashMap<String, T>,
+    logged: &AtomicBool,
+    log_unwired: impl FnOnce(),
+) -> Result<Option<&'a T>, ()> {
+    if let Some(action) = actions.get(binding_id) {
+        return Ok(Some(action));
+    }
+    if binding_id == "read_aloud" {
+        if !logged.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            log_unwired();
+        }
+        return Ok(None);
+    }
+    Err(())
+}
 
 /// Handle a shortcut event from either implementation.
 ///
@@ -32,10 +52,9 @@ pub fn handle_shortcut_event(
     hotkey_string: &str,
     is_pressed: bool,
 ) {
-    let settings = get_settings(app);
-
     // Transcribe bindings are handled by the coordinator.
     if is_transcribe_binding(binding_id) {
+        let settings = get_settings(app);
         if let Some(coordinator) = app.try_state::<TranscriptionCoordinator>() {
             coordinator.send_input(
                 binding_id,
@@ -50,13 +69,20 @@ pub fn handle_shortcut_event(
         return;
     }
 
-    let Some(action) = ACTION_MAP.get(binding_id) else {
-        warn!(
+    let action =
+        match action_for_binding(binding_id, &ACTION_MAP, &READ_ALOUD_UNWIRED_LOGGED, || {
+            log::info!("Read aloud shortcut action is not initialized");
+        }) {
+            Ok(Some(action)) => action,
+            Ok(None) => return,
+            Err(()) => {
+                warn!(
             "No action defined in ACTION_MAP for shortcut ID '{}'. Shortcut: '{}', Pressed: {}",
             binding_id, hotkey_string, is_pressed
         );
-        return;
-    };
+                return;
+            }
+        };
 
     // Cancel binding: only fires when recording and key is pressed
     if binding_id == "cancel" {
@@ -72,5 +98,34 @@ pub fn handle_shortcut_event(
         action.start(app, binding_id, hotkey_string);
     } else {
         action.stop(app, binding_id, hotkey_string);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn unwired_read_aloud_is_a_safe_noop_logged_once() {
+        let logged = AtomicBool::new(false);
+        let calls = std::cell::Cell::new(0);
+        let actions = std::collections::HashMap::<String, ()>::new();
+        for _pressed in [true, false, true, false] {
+            assert!(action_for_binding("read_aloud", &actions, &logged, || calls
+                .set(calls.get() + 1))
+            .unwrap()
+            .is_none());
+        }
+        assert_eq!(calls.get(), 1);
+        assert!(action_for_binding("unknown", &actions, &logged, || panic!(
+            "unknown action is not read aloud"
+        ))
+        .is_err());
+        let wired = std::collections::HashMap::from([("read_aloud".into(), ())]);
+        assert_eq!(
+            action_for_binding("read_aloud", &wired, &logged, || panic!(
+                "wired action is not a noop"
+            )),
+            Ok(Some(&()))
+        );
     }
 }

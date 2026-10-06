@@ -385,10 +385,15 @@ mod registration_path_tests {
             }
         }
 
-        fn assert_clean_only(&self, implementation: KeyboardImplementation) {
+        fn assert_clean_and_read_aloud(&self, implementation: KeyboardImplementation) {
+            let mut calls = self.calls.borrow().clone();
+            calls.sort_by(|left, right| left.1.cmp(&right.1));
             assert_eq!(
-                *self.calls.borrow(),
-                [(implementation, "transcribe_with_post_process".into())]
+                calls,
+                [
+                    (implementation, "read_aloud".into()),
+                    (implementation, "transcribe_with_post_process".into()),
+                ]
             );
         }
     }
@@ -421,14 +426,17 @@ mod registration_path_tests {
                     assert!(*context.managed.borrow());
                 }
             }
-            context.assert_clean_only(implementation);
+            context.assert_clean_and_read_aloud(implementation);
             context.calls.borrow_mut().clear();
             super::super::resume_all_shortcuts(&context);
-            context.assert_clean_only(implementation);
+            context.assert_clean_and_read_aloud(implementation);
             context.calls.borrow_mut().clear();
             context.settings.borrow_mut().post_process_enabled = false;
             super::super::resume_all_shortcuts(&context);
-            assert!(context.calls.borrow().is_empty());
+            assert_eq!(
+                *context.calls.borrow(),
+                [(implementation, "read_aloud".into())]
+            );
         }
     }
 
@@ -446,7 +454,7 @@ mod registration_path_tests {
                 context.settings().bindings["transcribe"].current_binding,
                 "   "
             );
-            context.assert_clean_only(implementation);
+            context.assert_clean_and_read_aloud(implementation);
             context.calls.borrow_mut().clear();
             context
                 .settings
@@ -462,7 +470,16 @@ mod registration_path_tests {
                 context.settings().bindings["transcribe"].current_binding,
                 context.settings().bindings["transcribe"].default_binding
             );
-            assert_eq!(context.calls.borrow().len(), 2);
+            let mut calls = context.calls.borrow().clone();
+            calls.sort_by(|left, right| left.1.cmp(&right.1));
+            assert_eq!(
+                calls,
+                [
+                    (implementation, "read_aloud".into()),
+                    (implementation, "transcribe".into()),
+                    (implementation, "transcribe_with_post_process".into()),
+                ]
+            );
         }
     }
 }
