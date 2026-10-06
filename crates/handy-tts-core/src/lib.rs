@@ -7,3 +7,4 @@ pub mod playback;
 pub mod protocol;
 pub mod selection_options;
 pub mod text;
+pub mod worker_env;

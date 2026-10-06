@@ -22,6 +22,7 @@ mod notices;
 mod overlay;
 mod paste_tx;
 pub mod portable;
+pub mod process_supervisor;
 mod secure_input;
 mod settings;
 mod shortcut;

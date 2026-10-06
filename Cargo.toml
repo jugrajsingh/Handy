@@ -1,5 +1,5 @@
 [workspace]
-members = ["src-tauri", "crates/handy-tts-core"]
+members = ["src-tauri", "crates/handy-tts", "crates/handy-tts-core"]
 default-members = ["src-tauri"]
 resolver = "2"
 

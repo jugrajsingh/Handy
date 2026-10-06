@@ -1,0 +1,24 @@
+[package]
+name = "handy-tts"
+version = "0.1.0"
+edition = "2024"
+license = "MIT AND Apache-2.0"
+
+[lints]
+workspace = true
+
+[dependencies]
+handy-tts-core = { path = "../handy-tts-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ort.workspace = true
+ndarray.workspace = true
+rand.workspace = true
+rand_distr.workspace = true
+regex.workspace = true
+unicode-normalization.workspace = true
+sentencepiece-rs.workspace = true
+misaki-rs.workspace = true
+openvino.workspace = true
+openvino-sys.workspace = true
