@@ -81,7 +81,7 @@ impl Supertonic {
     }
     pub fn voice(&mut self, root: &Path, name: &str) -> Result<()> {
         let data: Voice = serde_json::from_slice(
-            &fs::read(root.join(format!("voice_styles/{name}.json")))
+            &crate::runtime::read_voice_file(&root.join(format!("voice_styles/{name}.json")))
                 .context("read voice style")?,
         )
         .context("parse voice style")?;

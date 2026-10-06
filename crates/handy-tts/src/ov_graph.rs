@@ -148,9 +148,6 @@ impl Graph {
             })
             .collect()
     }
-    pub fn cancel(&mut self) -> Result<()> {
-        self.request.cancel().context("cancel graph request")
-    }
 }
 pub fn probe(path: &Path, device: &str, cache: &Path) -> Result<GraphInfo> {
     let fixed = if device == "NPU" {

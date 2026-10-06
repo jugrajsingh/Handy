@@ -1,9 +1,51 @@
 use anyhow::{Context, Result, bail, ensure};
 use handy_tts_core::protocol::{Header, Request, Status, write_reply};
 use std::io::{BufRead, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
+
+#[derive(Debug)]
+struct VoiceFile {
+    name: String,
+}
+impl std::fmt::Display for VoiceFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "voice file {:?}", self.name)
+    }
+}
+
+pub(crate) fn read_voice_file(path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| VoiceFile {
+        name: path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned(),
+    })
+}
+
+fn log_failure(operation: &str, error: &anyhow::Error) {
+    let kind = if let Some(error) = error.downcast_ref::<std::io::Error>() {
+        format!("{:?}", error.kind())
+    } else if let Some(error) = error.downcast_ref::<openvino::InferenceError>() {
+        format!("OpenVino{:?}", error.kind)
+    } else if let Some(error) = error.downcast_ref::<serde_json::Error>() {
+        format!("Json{:?}", error.classify())
+    } else if error.is::<ort::Error>() {
+        "OnnxRuntime".into()
+    } else {
+        "Other".into()
+    };
+    if let Some(file) = error.downcast_ref::<VoiceFile>() {
+        eprintln!(
+            "handy-tts: {operation} failed: file={:?} kind={kind}",
+            file.name
+        );
+    } else {
+        eprintln!("handy-tts: {operation} failed: kind={kind}");
+    }
+}
 
 pub trait SynthEngine: Send {
     fn synthesize(
@@ -161,7 +203,8 @@ pub fn run(
                             &[],
                         )?;
                     }
-                    Err(_) => {
+                    Err(error) => {
+                        log_failure("load", &error);
                         write_reply(
                             &mut writer,
                             &Header {
@@ -202,7 +245,7 @@ pub fn run(
                     );
                     Ok::<_, anyhow::Error>((engine.sample_rate(), samples))
                 })();
-                if cancel.load(Ordering::SeqCst) {
+                if id != 0 && cancel.load(Ordering::SeqCst) {
                     write_reply(
                         &mut writer,
                         &Header {
@@ -231,19 +274,22 @@ pub fn run(
                             },
                             &samples,
                         )?,
-                        Err(_) => write_reply(
-                            &mut writer,
-                            &Header {
-                                device: None,
-                                placement: None,
-                                id,
-                                status: Status::Error,
-                                sample_rate: None,
-                                samples: None,
-                                message: Some("chunk_failed".into()),
-                            },
-                            &[],
-                        )?,
+                        Err(error) => {
+                            log_failure("chunk", &error);
+                            write_reply(
+                                &mut writer,
+                                &Header {
+                                    device: None,
+                                    placement: None,
+                                    id,
+                                    status: Status::Error,
+                                    sample_rate: None,
+                                    samples: None,
+                                    message: Some("chunk_failed".into()),
+                                },
+                                &[],
+                            )?;
+                        }
                     }
                 }
                 active_id.store(0, Ordering::SeqCst);
@@ -321,13 +367,107 @@ pub fn parse_model(args: impl Iterator<Item = String>) -> Result<String> {
     );
     Ok(args[1].clone())
 }
-pub fn model_path(path: PathBuf) -> Result<PathBuf> {
-    ensure!(path.is_dir(), "model directory missing");
-    Ok(path)
-}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn follow_up_missing_voice_logs_safe_stderr() {
+        const CHILD: &str = "HANDY_TTS_TEST_MISSING_VOICE";
+        if std::env::var_os(CHILD).is_some() {
+            let mut controls = Vec::new();
+            handy_tts_core::protocol::write_request(
+                &mut controls,
+                &Request::Load {
+                    model_dir: "/fixture/private-parent".into(),
+                    voice: "missing-voice".into(),
+                    threads: 4,
+                    device: handy_tts_core::device::Device::Cpu,
+                    cache_dir: "/fixture/cache".into(),
+                },
+            )
+            .unwrap();
+            handy_tts_core::protocol::write_request(
+                &mut controls,
+                &Request::Synthesize {
+                    id: 0,
+                    text: "fixture-private-text".into(),
+                    speed: None,
+                },
+            )
+            .unwrap();
+            handy_tts_core::protocol::write_request(&mut controls, &Request::Shutdown).unwrap();
+            let mut replies = Vec::new();
+            run(
+                std::io::Cursor::new(controls),
+                &mut replies,
+                |_, _, _, _, _| {
+                    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/missing-voice.bin");
+                    read_voice_file(&path).context("fixture-private-error-text")?;
+                    bail!("fixture file unexpectedly exists")
+                },
+                || Ok(u64::MAX),
+            )
+            .unwrap();
+            let mut replies = std::io::Cursor::new(replies);
+            let header = handy_tts_core::protocol::read_header(&mut replies).unwrap();
+            assert_eq!(header.status, Status::Error);
+            assert_eq!(header.message.as_deref(), Some("load_failed"));
+            let header = handy_tts_core::protocol::read_header(&mut replies).unwrap();
+            assert_eq!(header.status, Status::Error);
+            assert_eq!(header.message.as_deref(), Some("chunk_failed"));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "runtime::tests::follow_up_missing_voice_logs_safe_stderr",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "child test failed");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(
+            stderr,
+            "handy-tts: load failed: file=\"missing-voice.bin\" kind=NotFound\nhandy-tts: chunk failed: kind=Other\n"
+        );
+    }
+
+    #[test]
+    fn follow_up_zero_id_is_invalid_even_with_cancel_sentinel() {
+        for pending in [None, Some(0), Some(7)] {
+            let mut controls = Vec::new();
+            if let Some(id) = pending {
+                handy_tts_core::protocol::write_request(&mut controls, &Request::Cancel { id })
+                    .unwrap();
+            }
+            handy_tts_core::protocol::write_request(
+                &mut controls,
+                &Request::Synthesize {
+                    id: 0,
+                    text: "fixture-private-text".into(),
+                    speed: None,
+                },
+            )
+            .unwrap();
+            handy_tts_core::protocol::write_request(&mut controls, &Request::Shutdown).unwrap();
+            let mut replies = Vec::new();
+            run(
+                std::io::Cursor::new(controls),
+                &mut replies,
+                |_, _, _, _, _| panic!("invalid synthesis must not load"),
+                || Ok(u64::MAX),
+            )
+            .unwrap();
+            let header =
+                handy_tts_core::protocol::read_header(&mut std::io::Cursor::new(replies)).unwrap();
+            assert_eq!(header.id, 0);
+            assert_eq!(header.status, Status::Error);
+            assert_eq!(header.message.as_deref(), Some("chunk_failed"));
+        }
+    }
+
     #[test]
     fn parses_available_memory_without_defaulting_missing_data_to_safe() {
         assert_eq!(

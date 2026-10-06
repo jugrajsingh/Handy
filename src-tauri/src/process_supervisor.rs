@@ -16,14 +16,14 @@ pub fn spawn_from_supervisor(cmd: Command) -> io::Result<Child> {
     let sender = SPAWNER.get_or_init(|| {
         let (tx, rx) = mpsc::channel::<SpawnJob>();
         let started = std::thread::Builder::new()
-            .name("local-llm-spawner".into())
+            .name("handy-process-spawner".into())
             .spawn(move || {
                 for mut job in rx {
                     let _ = job.reply.send(job.cmd.spawn());
                 }
             });
         if let Err(e) = started {
-            warn!("local-llm: cannot start the spawner thread: {e}");
+            warn!("process-supervisor: cannot start the spawner thread: {e}");
         }
         Mutex::new(tx)
     });

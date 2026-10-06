@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 pub fn pad<T: Default + Clone>(shape: &[i64], target: &[i64], data: &[T]) -> Result<Vec<T>> {
     ensure!(
         shape.len() == target.len() && shape.iter().zip(target).all(|(a, b)| *a >= 0 && *a <= *b),
@@ -38,9 +38,23 @@ pub fn crop_axis<T: Clone>(
         axis < shape.len() && length >= 0 && length <= shape[axis],
         "invalid output crop"
     );
-    let inner = shape[axis + 1..].iter().product::<i64>() as usize;
-    let block = shape[axis] as usize * inner;
-    let kept = length as usize * inner;
+    let product = |dimensions: &[i64]| {
+        dimensions
+            .iter()
+            .try_fold(1usize, |count, &dimension| {
+                count.checked_mul(usize::try_from(dimension).ok()?)
+            })
+            .context("invalid or overflowing output shape")
+    };
+    ensure!(
+        product(shape)? == data.len(),
+        "shape and output size mismatch"
+    );
+    let inner = product(&shape[axis + 1..])?;
+    let block = product(&shape[axis..])?;
+    let kept = (length as usize)
+        .checked_mul(inner)
+        .context("output crop overflow")?;
     ensure!(block > 0 || data.is_empty(), "empty shape has output data");
     let result = if block == 0 {
         vec![]
@@ -55,6 +69,27 @@ pub fn crop_axis<T: Clone>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn follow_up_crop_rejects_mismatched_buffers_without_panicking() {
+        for data in [&[1, 2, 3, 4, 5][..], &[1, 2, 3, 4][..], &[0; 12][..]] {
+            let mut shape = [1, 2, 4];
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crop_axis(&mut shape, 2, 2, data)
+            }));
+            assert!(
+                result.is_ok(),
+                "crop must return an error instead of panicking"
+            );
+            assert!(result.unwrap().is_err());
+            assert_eq!(shape, [1, 2, 4]);
+        }
+        for mut shape in [vec![1, -1, 4], vec![i64::MAX, i64::MAX, 4]] {
+            assert!(crop_axis::<u8>(&mut shape, 2, 2, &[]).is_err());
+        }
+        let mut shape = [1, 0, 4];
+        assert!(crop_axis::<u8>(&mut shape, 2, 2, &[]).unwrap().is_empty());
+    }
+
     #[test]
     fn static_shapes_zero_pad_without_truncation_and_crop_owned_output() {
         assert_eq!(

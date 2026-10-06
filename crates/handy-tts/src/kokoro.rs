@@ -37,8 +37,8 @@ impl Kokoro {
         Ok(engine)
     }
     pub fn voice(&mut self, root: &Path, name: &str) -> Result<()> {
-        let bytes =
-            fs::read(root.join(format!("voices/{name}.bin"))).context("read Kokoro voice")?;
+        let bytes = crate::runtime::read_voice_file(&root.join(format!("voices/{name}.bin")))
+            .context("read Kokoro voice")?;
         ensure!(
             bytes.len() % 1024 == 0,
             "voice pack must contain rows of 256 float32 values"

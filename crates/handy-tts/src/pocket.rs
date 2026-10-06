@@ -128,7 +128,7 @@ impl Pocket {
         Ok(engine)
     }
     pub fn voice(&mut self, root: &Path, name: &str) -> Result<()> {
-        let bytes = fs::read(root.join(format!(
+        let bytes = crate::runtime::read_voice_file(&root.join(format!(
             "languages/english_2026-04/embeddings/{name}.safetensors"
         )))
         .context("read Pocket preset state")?;
