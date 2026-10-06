@@ -5,6 +5,47 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--measure-continuity") {
+        anyhow::ensure!(
+            args.len() == 7,
+            "continuity needs model, root, device, cache, corpus and output"
+        );
+        handy_tts::initialize_run_options()?;
+        let device = match args[3].as_str() {
+            "cpu" => handy_tts_core::device::Device::Cpu,
+            "gpu" => handy_tts_core::device::Device::Gpu,
+            "npu" => handy_tts_core::device::Device::Npu,
+            _ => anyhow::bail!("unknown device"),
+        };
+        return handy_tts::measure::continuity(
+            &args[1],
+            std::path::Path::new(&args[2]),
+            device,
+            std::path::Path::new(&args[4]),
+            std::path::Path::new(&args[5]),
+            std::path::Path::new(&args[6]),
+        );
+    }
+    if args.first().is_some_and(|a| a == "--measure-matrix") {
+        anyhow::ensure!(
+            args.len() == 6,
+            "matrix measurement needs model, root, device, cache and corpus"
+        );
+        handy_tts::initialize_run_options()?;
+        let device = match args[3].as_str() {
+            "cpu" => handy_tts_core::device::Device::Cpu,
+            "gpu" => handy_tts_core::device::Device::Gpu,
+            "npu" => handy_tts_core::device::Device::Npu,
+            _ => anyhow::bail!("unknown device"),
+        };
+        return handy_tts::measure::run(
+            &args[1],
+            std::path::Path::new(&args[2]),
+            device,
+            std::path::Path::new(&args[4]),
+            std::path::Path::new(&args[5]),
+        );
+    }
     if args.first().is_some_and(|a| a == "--measure-once") {
         anyhow::ensure!(
             args.len() == 5,

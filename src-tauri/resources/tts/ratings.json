@@ -1,0 +1,153 @@
+{
+  "schema_version": 1,
+  "metadata": {
+    "machine": "Intel Core Ultra 7 258V; 8 cores",
+    "openvino": "2026.4.1-22982-e213a147257-releases/2026/4",
+    "gpu_driver": "intel-compute-runtime-26.22.38646.6-4.fc44.x86_64; intel-level-zero-26.22.38646.6-4.fc44.x86_64",
+    "npu_driver": "Intel user-space NPU 1.38.0; oneapi-level-zero-1.28.6-1.fc44.x86_64",
+    "date": "2026-10-02T00:43:58.633341+00:00"
+  },
+  "models": {
+    "pocket-en": {
+      "quality": 9,
+      "devices": {
+        "cpu": {
+          "supported": true,
+          "placement": {
+            "flow_lm_flow_int8": "cpu",
+            "flow_lm_main_int8": "cpu",
+            "mimi_decoder_int8": "cpu",
+            "text_conditioner": "cpu"
+          },
+          "recommended": true,
+          "first_audio_p95_s": 1.344951961,
+          "rtf_1x": 0.24016999303571432,
+          "rtf_2x": 0.6050285814102564,
+          "load_s_cold": 0.566832067,
+          "load_s_cached": 0.433833059,
+          "speed_score": 4.449620358972433
+        },
+        "npu": {
+          "supported": false,
+          "placement": {},
+          "recommended": false,
+          "first_audio_p95_s": null,
+          "rtf_1x": null,
+          "rtf_2x": null,
+          "load_s_cold": null,
+          "load_s_cached": null,
+          "speed_score": null
+        },
+        "gpu": {
+          "supported": true,
+          "placement": {
+            "flow_lm_flow_int8": "gpu",
+            "flow_lm_main_int8": "cpu",
+            "mimi_decoder_int8": "cpu",
+            "text_conditioner": "gpu"
+          },
+          "recommended": false,
+          "first_audio_p95_s": 2.025758211,
+          "rtf_1x": 0.32464073894230766,
+          "rtf_2x": 0.7188243266666666,
+          "load_s_cold": 1.138665897,
+          "load_s_cached": 0.565087251,
+          "speed_score": 3.3621848685057625
+        }
+      }
+    },
+    "supertonic-3": {
+      "quality": 8,
+      "devices": {
+        "cpu": {
+          "supported": true,
+          "placement": {
+            "duration_predictor": "cpu",
+            "text_encoder": "cpu",
+            "vector_estimator": "cpu",
+            "vocoder": "cpu"
+          },
+          "recommended": false,
+          "first_audio_p95_s": 1.237605602,
+          "rtf_1x": 0.18285324063571454,
+          "rtf_2x": 0.2195773040286664,
+          "load_s_cold": 0.487908204,
+          "load_s_cached": 0.450072963,
+          "speed_score": 4.981320217007145
+        },
+        "npu": {
+          "supported": true,
+          "placement": {
+            "duration_predictor": "npu",
+            "text_encoder": "npu",
+            "vector_estimator": "npu",
+            "vocoder": "npu"
+          },
+          "recommended": true,
+          "first_audio_p95_s": 0.649209776,
+          "rtf_1x": 0.12986701089260577,
+          "rtf_2x": 0.25490083205266206,
+          "load_s_cold": 19.439732913,
+          "load_s_cached": 0.99015986,
+          "speed_score": 6.499390484222456
+        },
+        "gpu": {
+          "supported": true,
+          "placement": {
+            "duration_predictor": "gpu",
+            "text_encoder": "gpu",
+            "vector_estimator": "gpu",
+            "vocoder": "gpu"
+          },
+          "recommended": false,
+          "first_audio_p95_s": 1.444336378,
+          "rtf_1x": 0.18768726243385306,
+          "rtf_2x": 0.10829180608964313,
+          "load_s_cold": 2.311364632,
+          "load_s_cached": 0.566786237,
+          "speed_score": 4.699933036456997
+        }
+      }
+    },
+    "kokoro-82m-int8": {
+      "quality": 6,
+      "devices": {
+        "cpu": {
+          "supported": true,
+          "placement": {
+            "model_quantized": "cpu"
+          },
+          "recommended": true,
+          "first_audio_p95_s": 5.593187254,
+          "rtf_1x": 0.5656138973076923,
+          "rtf_2x": 0.5616113555932204,
+          "load_s_cold": 2.898639221,
+          "load_s_cached": 2.682138262,
+          "speed_score": 0.9481712252637695
+        },
+        "npu": {
+          "supported": false,
+          "placement": {},
+          "recommended": false,
+          "first_audio_p95_s": null,
+          "rtf_1x": null,
+          "rtf_2x": null,
+          "load_s_cold": null,
+          "load_s_cached": null,
+          "speed_score": null
+        },
+        "gpu": {
+          "supported": false,
+          "placement": {},
+          "recommended": false,
+          "first_audio_p95_s": null,
+          "rtf_1x": null,
+          "rtf_2x": null,
+          "load_s_cold": null,
+          "load_s_cached": null,
+          "speed_score": null
+        }
+      }
+    }
+  }
+}
