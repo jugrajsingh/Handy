@@ -12,9 +12,15 @@ pub enum PlaybackError {
     Unavailable,
 }
 pub trait Output {
+    /// An uncommitted stream whose drop releases only its own resources.
+    type Prepared;
     fn names(&self) -> Result<Vec<String>, PlaybackError>;
     /// Opens a replacement stream, preserving the active stream on failure.
     fn open(&mut self, name: Option<&str>) -> Result<(), PlaybackError>;
+    /// Opens a candidate stream without changing the active stream, even on failure.
+    fn prepare(&mut self, name: Option<&str>) -> Result<Self::Prepared, PlaybackError>;
+    /// Replaces the active stream with an already prepared stream, without failing.
+    fn commit(&mut self, prepared: Self::Prepared);
     fn play(&mut self, pcm: Pcm, pause_ms: u32) -> Result<(), PlaybackError>;
     fn poll(&mut self) -> Poll;
     fn pause(&mut self);
@@ -34,6 +40,10 @@ pub fn resolve_output(
         Some(_) => (None, true),
         None => (None, false),
     }
+}
+pub struct PreparedOutput<T> {
+    stream: T,
+    fell_back: bool,
 }
 pub struct Playback<B: Output> {
     pub output: B,
@@ -67,6 +77,32 @@ impl<B: Output> Playback<B> {
             paused: false,
             replay_pending: false,
         })
+    }
+    /// Prepares a device change without changing playback or fallback reporting.
+    pub fn prepare(
+        &mut self,
+        tts: Option<&str>,
+        handy: Option<&str>,
+    ) -> Result<PreparedOutput<B::Prepared>, PlaybackError> {
+        let (selected, fallback) = match self.output.names() {
+            Ok(names) => resolve_output(tts, handy, &names),
+            Err(_) => (None, true),
+        };
+        let (stream, fell_back) = match self.output.prepare(selected.as_deref()) {
+            Ok(stream) => (stream, fallback),
+            Err(_) if selected.is_some() => (self.output.prepare(None)?, true),
+            Err(error) => return Err(error),
+        };
+        Ok(PreparedOutput { stream, fell_back })
+    }
+    /// Commits a prepared device change and retains the current sentence for replay.
+    pub fn commit(&mut self, prepared: PreparedOutput<B::Prepared>) {
+        self.output.commit(prepared.stream);
+        self.replay_pending = self.current.is_some();
+        self.pending_fallback |= prepared.fell_back;
+        if self.paused {
+            self.output.pause();
+        }
     }
     pub fn reopen(&mut self, tts: Option<&str>, handy: Option<&str>) -> Result<(), PlaybackError> {
         let (selected, fallback) = match self.output.names() {
@@ -176,6 +212,7 @@ mod tests {
         names_failed: bool,
     }
     impl Output for Fake {
+        type Prepared = Option<String>;
         fn names(&self) -> Result<Vec<String>, PlaybackError> {
             if self.names_failed {
                 return Err(PlaybackError::Unavailable);
@@ -189,6 +226,16 @@ mod tests {
             self.paused = false;
             self.opened.push(name.map(String::from));
             Ok(())
+        }
+        fn prepare(&mut self, name: Option<&str>) -> Result<Self::Prepared, PlaybackError> {
+            if name.is_none() && self.default_missing {
+                return Err(PlaybackError::Unavailable);
+            }
+            Ok(name.map(String::from))
+        }
+        fn commit(&mut self, prepared: Self::Prepared) {
+            self.paused = false;
+            self.opened.push(prepared);
         }
         fn play(&mut self, pcm: Pcm, _: u32) -> Result<(), PlaybackError> {
             self.played.push(pcm.id);

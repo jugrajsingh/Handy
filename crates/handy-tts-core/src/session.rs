@@ -201,6 +201,9 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         self.cursor = cursor;
         self.pending_text = pending;
         self.metadata.clear();
+        if let Some(text) = &self.pending_text {
+            self.metadata.insert(text.index, text.clone());
+        }
         self.parts = None;
         self.output_ticket = None;
         Ok(())
@@ -293,24 +296,21 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             || self.selection.voice != selection.voice;
         let output_changed = self.selection.output_device != selection.output_device;
         let mut changed = select_with(&mut self.queue, selection.clone(), downloaded, |value| {
-            if output_changed {
-                self.playback
-                    .reopen(
-                        selection.output_device.as_deref(),
-                        self.handy_output.as_deref(),
-                    )
-                    .map_err(|_| SelectionError::Controls)?;
-            }
-            if let Err(error) = persist(value) {
-                if output_changed {
+            let prepared = if output_changed {
+                Some(
                     self.playback
-                        .reopen(
-                            self.selection.output_device.as_deref(),
+                        .prepare(
+                            selection.output_device.as_deref(),
                             self.handy_output.as_deref(),
                         )
-                        .map_err(|_| SelectionError::Controls)?;
-                }
-                return Err(error);
+                        .map_err(|_| SelectionError::Controls)?,
+                )
+            } else {
+                None
+            };
+            persist(value)?;
+            if let Some(prepared) = prepared {
+                self.playback.commit(prepared);
             }
             Ok(())
         })?;
@@ -592,6 +592,7 @@ impl<W: Worker, O: Output> Drop for Session<'_, W, O> {
 mod tests {
     use super::*;
     use crate::playback::PlaybackError;
+    use std::rc::Rc;
     #[derive(Default)]
     struct FakeWorker {
         now: f64,
@@ -644,6 +645,15 @@ mod tests {
             self.selections += 1;
         }
     }
+    struct PreparedStream {
+        name: Option<String>,
+        live: Rc<Cell<usize>>,
+    }
+    impl Drop for PreparedStream {
+        fn drop(&mut self) {
+            self.live.set(self.live.get() - 1);
+        }
+    }
     #[derive(Default)]
     struct FakeOutput {
         now: f64,
@@ -658,18 +668,39 @@ mod tests {
         names: Vec<String>,
         last_open: Option<String>,
         fail_open: bool,
+        fail_after_open: Option<usize>,
+        prepared: Rc<Cell<usize>>,
+        commits: Rc<Cell<usize>>,
     }
     impl Output for FakeOutput {
+        type Prepared = PreparedStream;
         fn names(&self) -> Result<Vec<String>, PlaybackError> {
             Ok(self.names.clone())
         }
         fn open(&mut self, name: Option<&str>) -> Result<(), PlaybackError> {
-            if self.fail_open {
+            let prepared = self.prepare(name)?;
+            self.commit(prepared);
+            Ok(())
+        }
+        fn prepare(&mut self, name: Option<&str>) -> Result<Self::Prepared, PlaybackError> {
+            if self.fail_open
+                || self
+                    .fail_after_open
+                    .is_some_and(|limit| self.opens >= limit)
+            {
                 return Err(PlaybackError::Unavailable);
             }
-            self.last_open = name.map(str::to_owned);
             self.opens += 1;
-            Ok(())
+            self.prepared.set(self.prepared.get() + 1);
+            Ok(PreparedStream {
+                name: name.map(str::to_owned),
+                live: self.prepared.clone(),
+            })
+        }
+        fn commit(&mut self, prepared: Self::Prepared) {
+            self.last_open = prepared.name.clone();
+            self.deadline = None;
+            self.commits.set(self.commits.get() + 1);
         }
         fn play(&mut self, pcm: Pcm, pause: u32) -> Result<(), PlaybackError> {
             self.pauses.push(pause);
@@ -735,6 +766,175 @@ mod tests {
         s.playback.output.now = now;
         s.tick(now).unwrap();
         assert!(s.queue.queued_seconds() <= 30.00001);
+    }
+    #[test]
+    fn followup_n1_code_toggle_after_retry_before_tick_retains_destination() {
+        let source = format!(
+            "# Start\n\n```\n{}\n```\n\nThe destination sentence must remain the active source after switching.\n\nAnother long sentence follows the destination sentence here.",
+            "alpha beta gamma delta ".repeat(60)
+        );
+        let target = source.find("The destination").unwrap() as u32;
+        let mut cursor = TextCursor::new(&source, true).unwrap();
+        let mut destination = None;
+        while let Some(chunk) = cursor.next_chunk().unwrap() {
+            if chunk.source_start == target {
+                destination = Some(chunk.index);
+                break;
+            }
+        }
+        let destination = destination.unwrap();
+        assert_eq!(destination, 6);
+        let mut cursor = TextCursor::new(&source, false).unwrap();
+        let mut expected = Vec::new();
+        while let Some(chunk) = cursor.next_chunk().unwrap() {
+            if chunk.source_start >= target {
+                expected.push(chunk.index as u64 + 1);
+            }
+        }
+        for pause_before_select in [false, true] {
+            let mut s = session(&source, 0.01);
+            s.selection.read_code = true;
+            s.worker.fail_once = Some(destination);
+            s.play().unwrap();
+            let mut now = 0.0;
+            for _ in 0..500 {
+                step(&mut s, now);
+                now += 0.1;
+                if s.queue.state == PlaybackState::Error {
+                    break;
+                }
+            }
+            assert_eq!(s.queue.state, PlaybackState::Error);
+            assert_eq!(s.snapshot().source_start, target);
+            let played_before = s.playback.output.played.len();
+            s.play().unwrap();
+            if pause_before_select {
+                s.pause();
+            }
+            s.select(selection(), true, |_| Ok(())).unwrap();
+            s.pause();
+            let requested = s.worker.requested.len();
+            step(&mut s, now);
+            now += 0.1;
+            assert_eq!(s.worker.requested.len(), requested);
+            s.play().unwrap();
+            let mut first_source = None;
+            for _ in 0..200 {
+                step(&mut s, now);
+                now += 0.1;
+                if let Some(audio) = &s.queue.playing {
+                    first_source.get_or_insert(audio.source_start);
+                }
+                if s.queue.state == PlaybackState::Finished {
+                    break;
+                }
+            }
+            assert_eq!(first_source, Some(target));
+            assert_eq!(s.queue.state, PlaybackState::Finished);
+            assert_eq!(&s.playback.output.played[played_before..], expected);
+        }
+    }
+    #[test]
+    fn followup_n2_failed_persist_does_not_reopen_or_repeat_active_sentence() {
+        let source =
+            "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(20);
+        for restore_would_fail in [false, true] {
+            let mut s = session(&source, 0.1);
+            s.playback.output.names.push("Headphones".into());
+            s.play().unwrap();
+            for i in 0..12 {
+                step(&mut s, f64::from(i) * 0.1);
+            }
+            let before = (
+                s.playback.output.opens,
+                s.playback.output.stops,
+                s.queue.epoch,
+            );
+            let old_selection = s.selection.clone();
+            let old_deadline = s.playback.output.deadline;
+            let old_ticket = s.queue.playing.as_ref().unwrap().ticket;
+            let old_pending = s.queue.in_flight;
+            let old_waiting: Vec<_> = s.queue.waiting.iter().map(|c| c.ticket).collect();
+            let prepared = s.playback.output.prepared.clone();
+            let commits = s.playback.output.commits.clone();
+            let old_commits = commits.get();
+            if restore_would_fail {
+                s.playback.output.fail_after_open = Some(before.0 + 1);
+            }
+            let mut chosen = selection();
+            chosen.output_device = Some("Headphones".into());
+            assert_eq!(
+                s.select(chosen, true, |_| {
+                    assert_eq!(prepared.get(), 1);
+                    assert_eq!(commits.get(), old_commits);
+                    Err(SelectionError::Persist)
+                }),
+                Err(SelectionError::Persist)
+            );
+            assert_eq!(prepared.get(), 0);
+            assert_eq!(commits.get(), old_commits);
+            assert_eq!(s.playback.output.last_open, None);
+            assert_eq!(s.playback.output.deadline, old_deadline);
+            assert_eq!(s.selection, old_selection);
+            assert_eq!(s.queue.playing.as_ref().unwrap().ticket, old_ticket);
+            assert_eq!(s.queue.in_flight, old_pending);
+            assert_eq!(
+                s.queue.waiting.iter().map(|c| c.ticket).collect::<Vec<_>>(),
+                old_waiting
+            );
+            assert!(s.worker.cancelled.is_empty());
+            assert_eq!(s.worker.selections, 0);
+            step(&mut s, 1.2);
+            assert_eq!(s.playback.output.stops, 0);
+            assert!(s.playback.output.opens <= before.0 + 1);
+            assert_eq!(s.queue.epoch, before.2);
+            assert_eq!(s.selection.output_device, None);
+            assert_eq!(
+                s.playback
+                    .output
+                    .played
+                    .iter()
+                    .filter(|id| **id == 1)
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn followup_output_change_commits_only_after_persistence() {
+        let source =
+            "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(20);
+        let mut s = session(&source, 0.1);
+        s.playback.output.names.push("Headphones".into());
+        s.play().unwrap();
+        for i in 0..12 {
+            step(&mut s, f64::from(i) * 0.1);
+        }
+        let prepared = s.playback.output.prepared.clone();
+        let commits = s.playback.output.commits.clone();
+        let before = (s.queue.epoch, s.playback.output.opens, commits.get());
+        let mut chosen = selection();
+        chosen.output_device = Some("Headphones".into());
+        let changed = s
+            .select(chosen.clone(), true, |value| {
+                assert_eq!(value, &chosen);
+                assert_eq!(prepared.get(), 1);
+                assert_eq!(commits.get(), before.2);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(prepared.get(), 0);
+        assert_eq!(commits.get(), before.2 + 1);
+        assert_eq!(s.playback.output.opens, before.1 + 1);
+        assert_eq!(s.playback.output.last_open.as_deref(), Some("Headphones"));
+        assert_eq!(s.playback.output.stops, 1);
+        assert_eq!(changed.epoch, before.0 + 1);
+        assert_eq!(changed.sentence_index, 0);
+        assert_eq!(s.selection, chosen);
+        for i in 12..17 {
+            step(&mut s, f64::from(i) * 0.1);
+        }
+        assert_eq!(s.playback.output.played, [1, 1]);
     }
     #[test]
     fn fix2_reopen_or_seek_error_preserves_the_entire_old_session() {
