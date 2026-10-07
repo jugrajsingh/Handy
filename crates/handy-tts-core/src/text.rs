@@ -45,6 +45,7 @@ pub struct TextCursor<'a> {
     word_code: Vec<Range<usize>>,
     read_code: bool,
     in_code: bool,
+    item_depth: usize,
     skip_depth: usize,
     index: usize,
     byte_cursor: usize,
@@ -81,6 +82,7 @@ impl<'a> TextCursor<'a> {
             word_code: Vec::new(),
             read_code,
             in_code: false,
+            item_depth: 0,
             skip_depth: 0,
             index: 0,
             byte_cursor: 0,
@@ -328,6 +330,7 @@ impl<'a> TextCursor<'a> {
             match event {
                 Event::Start(Tag::FootnoteDefinition(_)) => self.skip_depth = 1,
                 Event::Start(Tag::Item) => {
+                    self.item_depth += 1;
                     if !self.word.is_empty() {
                         return self.boundary(range, 250);
                     }
@@ -367,9 +370,16 @@ impl<'a> TextCursor<'a> {
                 }
                 Event::Text(t) => self.set_fragment(t, range, self.in_code),
                 Event::Code(t) => self.set_fragment(t, range, true),
-                Event::End(TagEnd::Heading(_)) => return self.boundary(range, 450),
-                Event::End(TagEnd::HtmlBlock) => return self.boundary(range, 250),
-                Event::End(TagEnd::Item | TagEnd::Paragraph) => return self.boundary(range, 250),
+                Event::End(TagEnd::Heading(_)) => return self.boundary(range, 600),
+                Event::End(TagEnd::HtmlBlock) => return self.boundary(range, 450),
+                Event::End(TagEnd::Item) => {
+                    self.item_depth = self.item_depth.saturating_sub(1);
+                    return self.boundary(range, 300);
+                }
+                Event::End(TagEnd::Paragraph) => {
+                    let pause = if self.item_depth > 0 { 300 } else { 450 };
+                    return self.boundary(range, pause);
+                }
                 Event::End(TagEnd::TableCell) => return self.boundary(range, 100),
                 Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
                     return self.boundary(range, 250);
@@ -486,6 +496,15 @@ impl<'a> TextCursor<'a> {
             .map(|w| w.text)
             .collect::<Vec<_>>()
             .join(" ");
+        let ending = text.trim_end_matches([')', ']', '}', '\'', '"']);
+        let punctuation_pause = if ending.ends_with(['.', '!', '?']) {
+            280
+        } else if ending.ends_with([',', ';', ':']) {
+            120
+        } else {
+            0
+        };
+        pause = pause.max(punctuation_pause);
         if pause >= 250
             && !text
                 .trim_end_matches([')', ']', '}', '\'', '"'])
@@ -595,8 +614,8 @@ mod fixes {
     }
     #[test]
     fn structural_pauses() {
-        assert_eq!(chunks("# Heading")[0].pause_ms, 450);
-        assert_eq!(chunks("Paragraph text.")[0].pause_ms, 250);
+        assert_eq!(chunks("# Heading")[0].pause_ms, 600);
+        assert_eq!(chunks("Paragraph text.")[0].pause_ms, 450);
         let table = chunks("| Name | Value |\n| --- | --- |\n| A | 42 |\n");
         assert_eq!(
             table.iter().map(|c| c.pause_ms).collect::<Vec<_>>(),
@@ -606,6 +625,35 @@ mod fixes {
             table.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
             vec!["Name", "Value.", "A", "42."]
         );
+    }
+    #[test]
+    fn sentence_and_clause_pauses() {
+        let out = chunks(
+            "A first sentence with enough words to pass forty characters. Another sentence.",
+        );
+        assert_eq!(
+            out.iter().map(|c| c.pause_ms).collect::<Vec<_>>(),
+            vec![280, 450]
+        );
+        let source = format!(
+            "# Start\n\n{}end, {}ends.",
+            "word ".repeat(39),
+            "word ".repeat(39)
+        );
+        assert_eq!(
+            source.strip_prefix("# Start\n\n").unwrap().chars().count(),
+            400
+        );
+        let out = chunks(&source);
+        assert_eq!(out.len(), 3);
+        assert!(out[1].text.ends_with(','));
+        assert_eq!(out[1].pause_ms, 120);
+        assert_eq!(out[2].pause_ms, 450);
+        assert_eq!(chunks("- List item.")[0].pause_ms, 300);
+        assert_eq!(chunks(&"word ".repeat(30))[0].pause_ms, 0);
+        let quoted =
+            chunks(r#""A quoted sentence with enough characters ends here." More follows."#);
+        assert_eq!(quoted[0].pause_ms, 280);
     }
     #[test]
     fn html_and_footnote_markers_are_dropped() {

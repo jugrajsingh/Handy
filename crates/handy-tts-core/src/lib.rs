@@ -3,6 +3,7 @@ pub mod coverage;
 pub mod device;
 pub mod download;
 pub mod dsp;
+pub mod edges;
 pub mod handoff;
 pub mod lifecycle;
 pub mod managed;
