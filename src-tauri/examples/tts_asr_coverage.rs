@@ -158,6 +158,73 @@ fn prepared_words(source: &str) -> Result<Vec<String>> {
     Ok(words)
 }
 
+fn coverage_report(
+    expected: &[String],
+    path: &Path,
+    transcript: String,
+    first_report: Option<&Report>,
+    anchors: &[&[&str]],
+    calibration: bool,
+) -> Report {
+    let heard = normalize_words(&transcript);
+    let coverage = align(expected, &heard);
+    let baseline = first_report
+        .map(|report| &report.coverage)
+        .unwrap_or(&coverage);
+    let anchors_ok = relative_anchors_in_order(expected, &heard, baseline, anchors);
+    let longest_missing_loss_run = longest_missing_loss_run(&coverage, baseline);
+    let losses = coverage
+        .missing
+        .iter()
+        .filter(|(index, _)| !baseline.missing.iter().any(|(missing, _)| missing == index))
+        .cloned()
+        .collect();
+    let calibration_ok = !calibration || calibration_passes(&coverage);
+    let passed = passes(&coverage, baseline) && anchors_ok && calibration_ok;
+    Report {
+        wav: path.to_path_buf(),
+        transcript,
+        coverage,
+        baseline_wav: first_report
+            .map(|report| report.wav.clone())
+            .unwrap_or_else(|| path.to_path_buf()),
+        longest_missing_loss_run,
+        losses,
+        anchors_ok,
+        calibration_ok,
+        passed,
+    }
+}
+
+fn append_report<'a>(
+    reports: &'a mut Vec<Report>,
+    expected: &[String],
+    path: &Path,
+    transcript: String,
+    anchors: &[&[&str]],
+    calibration: bool,
+) -> &'a Report {
+    let index = reports.len();
+    let report = coverage_report(
+        expected,
+        path,
+        transcript,
+        reports.first(),
+        anchors,
+        calibration,
+    );
+    reports.push(report);
+    &reports[index]
+}
+
+fn exit_status(reports: &[Report]) -> u8 {
+    if reports.iter().all(|report| report.passed) {
+        0
+    } else {
+        1
+    }
+}
+
 fn main() -> Result<ExitCode> {
     let args = Args::parse();
     concatenate(&args.concat)?;
@@ -186,50 +253,271 @@ fn main() -> Result<ExitCode> {
         let transcript = transcribe_cpp::transcribe(&args.model, &pcm, &RunOptions::default())
             .with_context(|| format!("transcribe {}", path.display()))?
             .text;
-        let heard = normalize_words(&transcript);
-        let coverage = align(&expected, &heard);
-        let baseline = reports
-            .first()
-            .map(|report| &report.coverage)
-            .unwrap_or(&coverage);
-        let anchors_ok = relative_anchors_in_order(&expected, &heard, baseline, &anchor_refs);
-        let longest_missing_loss_run = longest_missing_loss_run(&coverage, baseline);
-        let losses = coverage
-            .missing
-            .iter()
-            .filter(|(index, _)| !baseline.missing.iter().any(|(missing, _)| missing == index))
-            .cloned()
-            .collect();
-        let calibration_ok = !args.calibration || calibration_passes(&coverage);
-        let passed = passes(&coverage, baseline) && anchors_ok && calibration_ok;
+        let report = append_report(
+            &mut reports,
+            &expected,
+            path,
+            transcript,
+            &anchor_refs,
+            args.calibration,
+        );
         println!(
             "{}: recall={:.6} longest_missing_run={} longest_missing_loss_run={} anchors_ok={} calibration_ok={} passed={}",
-            path.display(),
-            coverage.recall,
-            coverage.longest_missing_run,
-            longest_missing_loss_run,
-            anchors_ok,
-            calibration_ok,
-            passed
+            report.wav.display(),
+            report.coverage.recall,
+            report.coverage.longest_missing_run,
+            report.longest_missing_loss_run,
+            report.anchors_ok,
+            report.calibration_ok,
+            report.passed
         );
-        reports.push(Report {
-            wav: path.clone(),
-            transcript,
-            coverage,
-            baseline_wav: args.wav[0].clone(),
-            longest_missing_loss_run,
-            losses,
-            anchors_ok,
-            calibration_ok,
-            passed,
-        });
     }
     let file = std::fs::File::create(&args.output)
         .with_context(|| format!("create coverage report {}", args.output.display()))?;
     serde_json::to_writer_pretty(file, &reports).context("write coverage report")?;
-    Ok(if reports.iter().all(|report| report.passed) {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::FAILURE
-    })
+    Ok(ExitCode::from(exit_status(&reports)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wav_fixture<T: hound::Sample + Copy>(
+        spec: hound::WavSpec,
+        samples: &[T],
+    ) -> (tempfile::TempDir, PathBuf) {
+        let scratch = std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap();
+        let directory = tempfile::tempdir_in(scratch).unwrap();
+        let path = directory.path().join("input.wav");
+        let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+        for &sample in samples {
+            writer.write_sample(sample).unwrap();
+        }
+        writer.finalize().unwrap();
+        (directory, path)
+    }
+
+    fn float_spec(channels: u16, sample_rate: u32) -> hound::WavSpec {
+        hound::WavSpec {
+            channels,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        }
+    }
+
+    #[test]
+    fn stereo_wav_downmixes_both_channels() {
+        let (_directory, path) = wav_fixture(
+            float_spec(2, 44_100),
+            &[0.75_f32, -0.25, 0.25, 0.75, -0.5, 0.5],
+        );
+        let (rate, mono) = read_wav(&path).unwrap();
+        assert_eq!(rate, 44_100);
+        assert_eq!(mono, [0.25, 0.5, 0.0]);
+    }
+
+    #[test]
+    fn wav_decodes_integer_and_float_pcm() {
+        let (_integer_directory, integer_path) = wav_fixture(
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: 16_000,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            },
+            &[i16::MIN, -16_384, 0, 16_384, i16::MAX],
+        );
+        let (rate, samples) = read_wav(&integer_path).unwrap();
+        assert_eq!(rate, 16_000);
+        assert_eq!(samples, [-1.0, -0.5, 0.0, 0.5, 32_767.0 / 32_768.0]);
+        let (_float_directory, float_path) =
+            wav_fixture(float_spec(1, 24_000), &[-0.75_f32, 0.125, 0.5]);
+        let (rate, samples) = read_wav(&float_path).unwrap();
+        assert_eq!(rate, 24_000);
+        assert_eq!(samples, [-0.75, 0.125, 0.5]);
+    }
+
+    #[test]
+    fn wav_rejects_invalid_input() {
+        for (spec, samples) in [
+            (float_spec(3, 16_000), vec![0.1_f32; 6]),
+            (float_spec(1, 16_000), vec![]),
+            (float_spec(1, 16_000), vec![f32::NAN]),
+            (float_spec(1, 16_000), vec![f32::INFINITY]),
+        ] {
+            let (_directory, path) = wav_fixture(spec, &samples);
+            assert!(read_wav(&path).is_err(), "accepted {spec:?}");
+        }
+        let (_directory, path) = wav_fixture(float_spec(1, 16_000), &[0.1_f32]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[12..16], b"fmt ");
+        bytes[24..32].fill(0);
+        std::fs::write(&path, bytes).unwrap();
+        assert!(read_wav(&path).is_err());
+    }
+
+    #[test]
+    fn resampling_at_sixteen_khz_is_identity() {
+        let samples = [-0.75, 0.125, 0.0, 0.5, -0.25];
+        assert_eq!(resample(16_000, &samples).unwrap(), samples);
+    }
+
+    #[test]
+    fn resampling_preserves_final_tone_and_duration() {
+        for rate in [44_100, 48_000] {
+            for length in [64, 300, 1024, 4396] {
+                let mut samples = vec![0.0_f32; length];
+                let burst = length.min(200);
+                for (index, sample) in samples[length - burst..].iter_mut().enumerate() {
+                    *sample = 0.5
+                        * (2.0 * std::f32::consts::PI * 1000.0 * index as f32 / rate as f32).sin();
+                }
+                let output = resample(rate, &samples).unwrap();
+                let expected = (length as f64 * 16_000.0 / f64::from(rate)).round() as usize;
+                assert!(output.len().abs_diff(expected) <= 1);
+                assert!(output.iter().all(|sample| sample.is_finite()));
+                let tail_length =
+                    ((burst as f64 * 16_000.0 / f64::from(rate)) / 2.0).round() as usize;
+                let tail = &output[output.len() - tail_length..];
+                let rms = (tail.iter().map(|sample| sample * sample).sum::<f32>()
+                    / tail.len() as f32)
+                    .sqrt();
+                assert!(
+                    rms > 0.15,
+                    "tail tone lost: rate={rate}, length={length}, rms={rms}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn concatenation_preserves_order_and_refuses_to_overwrite_inputs() {
+        let (first_directory, first) = wav_fixture(float_spec(1, 16_000), &[0.25_f32; 16]);
+        let (_second_directory, second) = wav_fixture(float_spec(1, 16_000), &[-0.5_f32; 12]);
+        let output = first_directory.path().join("joined.wav");
+        concatenate(&[output.clone(), first.clone(), second.clone()]).unwrap();
+        let (rate, samples) = read_wav(&output).unwrap();
+        assert_eq!(rate, 16_000);
+        assert_eq!(samples, [vec![0.25; 16], vec![-0.5; 12]].concat());
+        let original = std::fs::read(&first).unwrap();
+        assert!(concatenate(&[first.clone(), first.clone(), second]).is_err());
+        assert_eq!(std::fs::read(first).unwrap(), original);
+    }
+
+    #[test]
+    fn expected_words_use_text_cursor_preparation() {
+        let source = "# A bright morning\n\nRead [the story](https://example.org/article).\n\n```rust\nsecret = 1\n```\n\nWe walked home.";
+        assert_eq!(
+            prepared_words(source).unwrap(),
+            [
+                "a", "bright", "morning", "read", "the", "story", "code", "block", "skipped", "we",
+                "walked", "home",
+            ]
+        );
+        assert!(prepared_words("").is_err());
+    }
+
+    #[test]
+    fn reports_compare_later_wavs_to_first_baseline() {
+        let expected = normalize_words("first second third fourth");
+        let mut reports = Vec::new();
+        append_report(
+            &mut reports,
+            &expected,
+            Path::new("first.wav"),
+            "first second third fourth".into(),
+            &[],
+            false,
+        );
+        append_report(
+            &mut reports,
+            &expected,
+            Path::new("later.wav"),
+            "first fourth".into(),
+            &[],
+            false,
+        );
+        append_report(
+            &mut reports,
+            &expected,
+            Path::new("third.wav"),
+            "first third fourth".into(),
+            &[],
+            false,
+        );
+        let first = &reports[0];
+        let later = &reports[1];
+        assert!(first.passed);
+        assert_eq!(later.baseline_wav, Path::new("first.wav"));
+        assert_eq!(later.coverage.recall, 0.5);
+        assert_eq!(later.longest_missing_loss_run, 2);
+        assert_eq!(later.losses, [(1, "second".into()), (2, "third".into())]);
+        assert!(!later.passed);
+        assert_eq!(reports[2].baseline_wav, Path::new("first.wav"));
+        assert!(!reports[2].passed);
+    }
+
+    #[test]
+    fn reports_propagate_anchor_and_calibration_failures() {
+        let expected = normalize_words("alpha beta gamma");
+        let anchor_failure = coverage_report(
+            &expected,
+            Path::new("anchor.wav"),
+            "alpha beta gamma".into(),
+            None,
+            &[&["missing", "phrase"]],
+            false,
+        );
+        assert_eq!(anchor_failure.coverage.recall, 1.0);
+        assert!(!anchor_failure.anchors_ok);
+        assert!(!anchor_failure.passed);
+        let expected = normalize_words(&"word ".repeat(100));
+        let uncalibrated = coverage_report(
+            &expected,
+            Path::new("plain.wav"),
+            "word ".repeat(94),
+            None,
+            &[],
+            false,
+        );
+        assert!(uncalibrated.passed);
+        let calibrated = coverage_report(
+            &expected,
+            Path::new("calibration.wav"),
+            "word ".repeat(94),
+            None,
+            &[],
+            true,
+        );
+        assert!(calibrated.anchors_ok);
+        assert!(!calibrated.calibration_ok);
+        assert!(!calibrated.passed);
+    }
+
+    #[test]
+    fn any_failed_report_returns_failure() {
+        let expected = normalize_words("first second third fourth");
+        let good = coverage_report(
+            &expected,
+            Path::new("good.wav"),
+            "first second third fourth".into(),
+            None,
+            &[],
+            false,
+        );
+        let bad = coverage_report(
+            &expected,
+            Path::new("bad.wav"),
+            "first fourth".into(),
+            Some(&good),
+            &[],
+            false,
+        );
+        assert_eq!(exit_status(std::slice::from_ref(&good)), 0);
+        let mut reports = [good, bad];
+        assert_eq!(exit_status(&reports), 1);
+        reports.reverse();
+        assert_eq!(exit_status(&reports), 1);
+    }
 }
