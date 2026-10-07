@@ -323,13 +323,7 @@ impl Probe {
             let began = Instant::now();
             let stretched = chunks
                 .iter()
-                .map(|pcm| {
-                    if native == 1.0 {
-                        dsp::transform(pcm.clone(), requested, 0.0, false)
-                    } else {
-                        dsp::transform_ratio(pcm.clone(), ratio, 0.0)
-                    }
-                })
+                .map(|pcm| dsp::stretch(pcm.clone(), ratio, 0.0))
                 .collect::<Result<Vec<_>, _>>()?;
             let seconds = began.elapsed().as_secs_f64();
             let samples: Vec<_> = stretched.into_iter().flat_map(|pcm| pcm.samples).collect();

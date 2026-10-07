@@ -133,7 +133,7 @@ pub fn run(
                     Some(1.0),
                     &AtomicBool::new(false),
                 )?;
-                dsp::transform(
+                dsp::stretch(
                     Pcm {
                         id: 1,
                         sample_rate: engine.sample_rate(),
@@ -141,7 +141,6 @@ pub fn run(
                     },
                     1.0,
                     0.0,
-                    false,
                 )
                 .map_err(Into::into)
             },
@@ -161,7 +160,7 @@ pub fn run(
             let began = Instant::now();
             let plan = handy_tts_core::speed::plan(speed, model.native_speed)?;
             let samples = engine.synthesize(text, Some(plan.native), &AtomicBool::new(false))?;
-            let pcm = dsp::transform_ratio(
+            let pcm = dsp::stretch(
                 Pcm {
                     id: index as u64 + 1,
                     sample_rate: engine.sample_rate(),
@@ -230,7 +229,7 @@ pub fn continuity(
         let samples = engine.synthesize(&chunk.text, None, &AtomicBool::new(false))?;
         let synthesis_seconds = began.elapsed().as_secs_f64();
         let began = Instant::now();
-        let pcm = dsp::transform(
+        let pcm = dsp::stretch(
             Pcm {
                 id: chunk.index as u64 + 1,
                 sample_rate: engine.sample_rate(),
@@ -238,7 +237,6 @@ pub fn continuity(
             },
             2.0,
             0.0,
-            false,
         )?;
         let dsp_seconds = began.elapsed().as_secs_f64();
         let audio_seconds = pcm.samples.len() as f64 / f64::from(pcm.sample_rate);

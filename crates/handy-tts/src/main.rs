@@ -70,24 +70,23 @@ fn main() -> Result<()> {
             std::path::Path::new(&args[4]),
         )?;
         let load_seconds = start.elapsed().as_secs_f64();
-        let native = model.id != "pocket-en";
+        let plan = handy_tts_core::speed::plan(2.0, model.native_speed)?;
         let begin = std::time::Instant::now();
         let samples = engine.synthesize(
             "Reading clearly, one phrase at a time.",
-            if native { Some(2.0) } else { None },
+            Some(plan.native),
             &std::sync::atomic::AtomicBool::new(false),
         )?;
         let synth_seconds = begin.elapsed().as_secs_f64();
         let dsp_start = std::time::Instant::now();
-        let output = handy_tts_core::dsp::transform(
+        let output = handy_tts_core::dsp::stretch(
             handy_tts_core::protocol::Pcm {
                 id: 1,
                 sample_rate: engine.sample_rate(),
                 samples,
             },
-            2.0,
+            plan.stretch,
             0.0,
-            native,
         )?;
         let dsp_seconds = dsp_start.elapsed().as_secs_f64();
         let audio_seconds = output.samples.len() as f64 / f64::from(output.sample_rate);

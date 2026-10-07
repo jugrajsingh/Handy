@@ -10,18 +10,14 @@ pub enum DspError {
     #[error("stretch failed")]
     Stretch,
 }
-pub fn transform(pcm: Pcm, speed: f32, pitch: f32, native_speed: bool) -> Result<Pcm, DspError> {
-    if !(0.5..=2.0).contains(&speed)
-        || !(-6.0..=6.0).contains(&pitch)
-        || (speed * 10.0 - (speed * 10.0).round()).abs() > 0.0001
-    {
-        return Err(DspError::Controls);
-    }
-    transform_ratio(pcm, if native_speed { 1.0 } else { speed }, pitch)
+/// The owner-selected audio stretcher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stretcher {
+    Signalsmith,
 }
 
-/// Applies an exact stretch ratio in the supported interval and pitch in one pass.
-pub fn transform_ratio(mut pcm: Pcm, stretch_ratio: f32, pitch: f32) -> Result<Pcm, DspError> {
+/// Applies an exact stretch ratio and pitch in one latency-flushed pass.
+pub fn stretch(mut pcm: Pcm, stretch_ratio: f32, pitch: f32) -> Result<Pcm, DspError> {
     if !(0.5..=2.0).contains(&stretch_ratio) || !(-6.0..=6.0).contains(&pitch) {
         return Err(DspError::Controls);
     }
@@ -63,7 +59,7 @@ mod tests {
     #[test]
     fn exact_ratios_preserve_duration_and_identity_and_reject_invalid_controls() {
         for ratio in [2.0 / 1.1, 1.5 / 1.3, 0.5, 2.0] {
-            let output = transform_ratio(pcm(), ratio, 0.0).unwrap();
+            let output = stretch(pcm(), ratio, 0.0).unwrap();
             assert_eq!(
                 output.samples.len(),
                 (24000.0 / f64::from(ratio)).round() as usize
@@ -73,22 +69,21 @@ mod tests {
         }
         let input = pcm();
         assert_eq!(
-            transform_ratio(input.clone(), 1.0, 0.0).unwrap().samples,
+            stretch(input.clone(), 1.0, 0.0).unwrap().samples,
             input.samples
         );
         for ratio in [0.49, 2.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert!(matches!(
-                transform_ratio(pcm(), ratio, 0.0),
+                stretch(pcm(), ratio, 0.0),
                 Err(DspError::Controls)
             ));
         }
         for pitch in [-6.01, 6.01, f32::NAN, f32::INFINITY] {
             assert!(matches!(
-                transform_ratio(pcm(), 1.0, pitch),
+                stretch(pcm(), 1.0, pitch),
                 Err(DspError::Controls)
             ));
         }
-        assert!(transform(pcm(), 2.0 / 1.1, 0.0, false).is_err());
     }
     fn pcm() -> Pcm {
         Pcm {
@@ -103,7 +98,7 @@ mod tests {
     fn duration_and_finite_output_for_control_matrix() {
         for speed in [0.5, 1.0, 2.0] {
             for pitch in [-6.0, 0.0, 6.0] {
-                let output = transform(pcm(), speed, pitch, false).unwrap();
+                let output = stretch(pcm(), speed, pitch).unwrap();
                 assert_eq!(output.samples.len(), (24000.0 / speed) as usize);
                 assert!(output.samples.iter().all(|v| v.is_finite()));
                 assert!(output.samples.iter().any(|v| v.abs() > 0.001));
@@ -112,26 +107,22 @@ mod tests {
     }
     #[test]
     fn native_speed_is_applied_once_and_invalid_controls_are_rejected() {
-        assert_eq!(
-            transform(pcm(), 2.0, 0.0, true).unwrap().samples.len(),
-            24000
-        );
+        assert_eq!(stretch(pcm(), 1.0, 0.0).unwrap().samples.len(), 24000);
         for (speed, pitch) in [
             (f32::NAN, 0.0),
-            (1.05, 0.0),
             (0.4, 0.0),
             (2.1, 0.0),
             (1.0, -7.0),
             (1.0, 7.0),
         ] {
-            assert!(transform(pcm(), speed, pitch, false).is_err());
+            assert!(stretch(pcm(), speed, pitch).is_err());
         }
     }
     #[test]
     fn speed_preserves_pitch_and_semitone_stage_moves_frequency_within_five_percent() {
         for speed in [0.5, 1.0, 2.0] {
             for pitch in [-6.0, 0.0, 6.0] {
-                let out = transform(pcm(), speed, pitch, false).unwrap();
+                let out = stretch(pcm(), speed, pitch).unwrap();
                 let data = &out.samples[512..out.samples.len() - 512];
                 let crossings = data
                     .windows(2)
@@ -177,8 +168,8 @@ mod tests {
                                     })
                                     .collect(),
                             };
-                            let out = transform(input, speed, pitch, native).unwrap();
                             let ratio = if native { 1.0 } else { speed };
+                            let out = stretch(input, ratio, pitch).unwrap();
                             assert_eq!(
                                 out.samples.len(),
                                 (len as f64 / f64::from(ratio)).round() as usize
@@ -213,7 +204,15 @@ mod tests {
     fn native_speed_keeps_length_and_applies_nonzero_pitch() {
         for speed in [0.5, 1.0, 1.5, 2.0] {
             for pitch in [-6.0, 6.0] {
-                let out = transform(pcm(), speed, pitch, true).unwrap();
+                let plan = crate::speed::plan(
+                    speed,
+                    crate::speed::NativeWindow {
+                        min: speed,
+                        max: speed,
+                    },
+                )
+                .unwrap();
+                let out = stretch(pcm(), plan.stretch, pitch).unwrap();
                 assert_eq!(out.samples.len(), 24000);
                 let hz = frequency(&out.samples[512..out.samples.len() - 512], out.sample_rate);
                 let expected = 440.0 * 2.0f64.powf(f64::from(pitch) / 12.0);
@@ -222,6 +221,86 @@ mod tests {
                     "frequency={hz} expected={expected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn length_is_round_len_over_stretch_for_off_grid_factors() {
+        for ratio in [1.0 / 1.2, 2.0 / 1.2, 1.5] {
+            let input = pcm();
+            let expected = (input.samples.len() as f64 / f64::from(ratio)).round() as usize;
+            let output = stretch(input, ratio, 0.0).unwrap();
+            assert_eq!(output.samples.len(), expected);
+            assert_eq!(output.id, 1);
+            assert_eq!(output.sample_rate, 24000);
+            assert!(output.samples.iter().all(|sample| sample.is_finite()));
+        }
+    }
+
+    fn rms(samples: &[f32]) -> f64 {
+        (samples
+            .iter()
+            .map(|sample| f64::from(*sample).powi(2))
+            .sum::<f64>()
+            / samples.len() as f64)
+            .sqrt()
+    }
+
+    #[test]
+    fn tail_tone_burst_survives_at_2x() {
+        let mut input = pcm();
+        let burst_len = input.sample_rate as usize / 20;
+        let burst_rms = rms(&input.samples[input.samples.len() - burst_len..]);
+        let quiet_len = input.samples.len() - burst_len;
+        input.samples[..quiet_len].fill(0.0);
+        let output = stretch(input, 2.0, 0.0).unwrap();
+        let tail_len = output.sample_rate as usize / 40;
+        let tail_rms = rms(&output.samples[output.samples.len() - tail_len..]);
+        assert!(
+            tail_rms >= 0.5 * burst_rms,
+            "tail RMS={tail_rms}, burst RMS={burst_rms}"
+        );
+    }
+
+    #[test]
+    fn identity_is_bytes_equal() {
+        let mut input = pcm();
+        input.samples[0] = -0.0;
+        let output = stretch(input.clone(), 1.0, 0.0).unwrap();
+        assert_eq!(output.id, input.id);
+        assert_eq!(output.sample_rate, input.sample_rate);
+        assert_eq!(
+            output
+                .samples
+                .iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>(),
+            input
+                .samples
+                .iter()
+                .map(|sample| sample.to_bits())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn pitch_only_keeps_length() {
+        for pitch in [-6.0, 6.0] {
+            let input = pcm();
+            let len = input.samples.len();
+            let output = stretch(input, 1.0, pitch).unwrap();
+            assert_eq!(output.samples.len(), len);
+            assert!(output.samples.iter().all(|sample| sample.is_finite()));
+        }
+    }
+
+    #[test]
+    fn rejects_stretch_outside_range() {
+        for ratio in [0.49, 2.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                stretch(pcm(), ratio, 0.0),
+                Err(DspError::Controls)
+            ));
         }
     }
 }

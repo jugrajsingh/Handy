@@ -381,7 +381,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         };
         let began = (self.dsp_clock)();
         let pcm = match self.speed_plan().and_then(|plan| {
-            dsp::transform_ratio(pcm, plan.stretch, self.selection.pitch)
+            dsp::stretch(pcm, plan.stretch, self.selection.pitch)
                 .map_err(|_| "tts.errors.audio".to_string())
         }) {
             Ok(pcm) => pcm,

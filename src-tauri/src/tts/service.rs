@@ -342,13 +342,12 @@ impl TtsService {
                     if cancel.load(std::sync::atomic::Ordering::Acquire) {
                         return Ok(());
                     }
-                    let pcm = handy_tts_core::dsp::transform(
-                        raw,
-                        chosen.speed,
-                        chosen.pitch,
-                        chosen.model_id != "pocket-en",
-                    )
-                    .map_err(|e| e.to_string())?;
+                    let model = handy_tts_core::catalog::entry(&chosen.model_id)
+                        .map_err(|e| e.to_string())?;
+                    let plan = handy_tts_core::speed::plan(chosen.speed, model.native_speed)
+                        .map_err(|e| e.to_string())?;
+                    let pcm = handy_tts_core::dsp::stretch(raw, plan.stretch, chosen.pitch)
+                        .map_err(|e| e.to_string())?;
                     let handy = crate::settings::get_settings(&app).selected_output_device;
                     let mut output = Playback::new(
                         super::playback::RodioOutput::default(),
