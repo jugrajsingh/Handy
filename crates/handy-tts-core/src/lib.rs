@@ -1,4 +1,5 @@
 pub mod catalog;
+pub mod coverage;
 pub mod device;
 pub mod download;
 pub mod dsp;
