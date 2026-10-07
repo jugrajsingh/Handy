@@ -375,6 +375,13 @@ impl Queue {
         if self.stored_seconds() + chunk.stored_seconds() - released_native
             > STORED_SECONDS_CEILING + 0.00001
         {
+            if ticket.index == self.next_admit_index
+                && self.playing.is_none()
+                && self.state == PlaybackState::Buffering
+                && !self.waiting.is_empty()
+            {
+                self.start_waiting();
+            }
             return Some(chunk);
         }
         // Later replies reserve one maximum-sized played chunk for the missing prefix.
@@ -458,6 +465,10 @@ impl Queue {
         {
             return;
         }
+        self.start_waiting();
+    }
+    // Storage backpressure can start the buffered prefix before head start is met.
+    fn start_waiting(&mut self) {
         self.state = PlaybackState::Playing;
         self.finish_buffering();
         self.playing = self.waiting.pop_front();
@@ -635,6 +646,101 @@ mod tests {
         assert!(q.complete(second, Ok(later)).is_none());
         assert_eq!(q.playing.as_ref().unwrap().ticket, second);
         assert!(q.stored_seconds() <= STORED_SECONDS_CEILING);
+    }
+    #[test]
+    fn short_prefix_and_maximum_stored_part_make_progress() {
+        assert_short_prefix_progress(1);
+    }
+    #[test]
+    fn short_prefix_makes_progress_with_later_audio_ready_in_three_lanes() {
+        assert_short_prefix_progress(3);
+    }
+    fn assert_short_prefix_progress(lanes: usize) {
+        let mut q = Queue::with_speed(2.0);
+        q.set_lanes(lanes);
+        q.play();
+        let first = q.request_next().unwrap();
+        let make_audio = |ticket, played_seconds: usize| {
+            let mut audio = chunk(ticket);
+            audio.pcm.samples = vec![0.25; played_seconds * 24_000];
+            audio.native = vec![0.5; played_seconds * 2 * 24_000];
+            audio.plan = SpeedPlan {
+                requested: 2.0,
+                native: 1.0,
+                stretch: 2.0,
+            };
+            audio
+        };
+        let first_audio = make_audio(first, 1);
+        let mut expected = vec![(first_audio.pcm.samples.clone(), first_audio.native.clone())];
+        assert!(q.complete_timed(first, Ok(first_audio), 1.0).is_none());
+        assert_eq!(q.state, PlaybackState::Buffering);
+        assert_eq!(q.target_seconds(), 5.0);
+        let second = q.request_next().unwrap();
+        let second_audio = make_audio(second, 20);
+        expected.push((
+            second_audio.pcm.samples.clone(),
+            second_audio.native.clone(),
+        ));
+        if lanes == 3 {
+            let third = q.request_next().unwrap();
+            let later = make_audio(third, 1);
+            expected.push((later.pcm.samples.clone(), later.native.clone()));
+            assert!(q.complete_timed(third, Ok(later), 1.0).is_none());
+            assert!(q.ready.contains_key(&third.index));
+            assert!(q.playing.is_none());
+        }
+        let assert_retained = |queue: &Queue, pending: Option<&AudioChunk>| {
+            assert!(queue.queued_seconds() <= QUEUED_AUDIO_CEILING);
+            assert!(queue.stored_seconds() <= STORED_SECONDS_CEILING);
+            for audio in queue
+                .waiting
+                .iter()
+                .chain(queue.ready.values())
+                .chain(pending)
+            {
+                let (pcm, native) = &expected[audio.ticket.index];
+                assert_eq!(&audio.pcm.samples, pcm);
+                assert_eq!(&audio.native, native);
+            }
+        };
+        assert_retained(&q, Some(&second_audio));
+        let mut pending = q.complete_timed(second, Ok(second_audio), 20.0);
+        q.source_finished = true;
+        for _ in 0..10 {
+            if let Some(audio) = pending.take() {
+                pending = q.complete_timed(second, Ok(audio), 20.0);
+            }
+            q.advance();
+            assert_retained(&q, pending.as_ref());
+        }
+        assert!(q.playing.is_some(), "completed audio must make progress");
+        let mut delivered = Vec::new();
+        let mut delivered_samples = 0;
+        for _ in 0..10 {
+            if let Some(audio) = pending.take() {
+                pending = q.complete_timed(second, Ok(audio), 20.0);
+            }
+            q.advance();
+            assert_retained(&q, pending.as_ref());
+            if let Some(audio) = &q.playing {
+                assert_eq!(audio.ticket.index, delivered.len());
+                assert_eq!(audio.pcm.samples, expected[audio.ticket.index].0);
+                assert!(audio.native.is_empty());
+                delivered_samples += audio.pcm.samples.len();
+                delivered.push(audio.ticket.index);
+                q.playback_finished();
+                assert_retained(&q, pending.as_ref());
+            }
+        }
+        assert!(pending.is_none());
+        assert_eq!(delivered, (0..expected.len()).collect::<Vec<_>>());
+        assert_eq!(
+            delivered_samples,
+            expected.iter().map(|(pcm, _)| pcm.len()).sum::<usize>()
+        );
+        assert_eq!(q.state, PlaybackState::Finished);
+        assert_eq!(q.stored_seconds(), 0.0);
     }
     #[test]
     fn out_of_order_completions_admit_in_index_order() {
