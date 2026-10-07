@@ -398,15 +398,21 @@ impl<'a> TextCursor<'a> {
             }
         }
     }
-    fn structural_pause(&mut self, mut pause: u32) -> u32 {
+    fn structural_pause(&mut self, mut pause: u32) -> (u32, bool) {
+        let mut synthetic_period = pause >= 250;
+        let mut immediate_marker = true;
         while let Some(next) = self.piece() {
             if !next.text.is_empty() {
                 self.pending.push_front(next);
                 break;
             }
+            if immediate_marker && pause == 100 && next.pause >= 250 {
+                synthetic_period = true;
+            }
+            immediate_marker = false;
             pause = pause.max(next.pause);
         }
-        pause
+        (pause, synthetic_period)
     }
     fn source_range(&mut self, range: Range<usize>) -> Result<(u32, u32), TextError> {
         let start = range.start.max(self.byte_cursor);
@@ -435,13 +441,14 @@ impl<'a> TextCursor<'a> {
         let mut words: Vec<Piece> = Vec::new();
         let mut size = 0;
         let mut pause = 0;
+        let mut synthetic_period = false;
         let mut boundary = None;
         while let Some(p) = self.piece() {
             if p.text.is_empty() {
                 if words.is_empty() {
                     continue;
                 }
-                pause = self.structural_pause(p.pause);
+                (pause, synthetic_period) = self.structural_pause(p.pause);
                 break;
             }
             let added = p.text.chars().count() + usize::from(!words.is_empty());
@@ -469,7 +476,7 @@ impl<'a> TextCursor<'a> {
                 boundary = Some(words.len());
             }
             if self.index == 0 && natural && size >= 40 {
-                pause = self.structural_pause(0);
+                (pause, synthetic_period) = self.structural_pause(0);
                 break;
             }
         }
@@ -491,7 +498,7 @@ impl<'a> TextCursor<'a> {
             0
         };
         pause = pause.max(punctuation_pause);
-        if pause >= 250
+        if synthetic_period
             && !text
                 .trim_end_matches([')', ']', '}', '\'', '"'])
                 .ends_with(['.', '!', '?', ':', ',', ';'])
@@ -610,6 +617,30 @@ mod fixes {
         assert_eq!(
             table.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
             vec!["Name", "Value.", "A", "42."]
+        );
+    }
+    #[test]
+    fn empty_trailing_table_cells_preserve_chunk_text() {
+        let source = "| Name | |\n| --- | --- |\n| A | |";
+        let out = chunks(source);
+        assert_eq!(
+            out.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
+            vec!["Name", "A"]
+        );
+        for (chunk, expected) in out.iter().zip(["Name", "A"]) {
+            let start = source.find(expected).unwrap();
+            assert_eq!(
+                chunk.source_start,
+                source[..start].encode_utf16().count() as u32
+            );
+            assert_eq!(
+                chunk.source_end,
+                source[..start + expected.len()].encode_utf16().count() as u32
+            );
+        }
+        assert_eq!(
+            out.iter().map(|c| c.pause_ms).collect::<Vec<_>>(),
+            vec![250, 250]
         );
     }
     #[test]
