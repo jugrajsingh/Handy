@@ -45,7 +45,6 @@ pub struct TextCursor<'a> {
     word_code: Vec<Range<usize>>,
     read_code: bool,
     in_code: bool,
-    item_depth: usize,
     skip_depth: usize,
     index: usize,
     byte_cursor: usize,
@@ -82,7 +81,6 @@ impl<'a> TextCursor<'a> {
             word_code: Vec::new(),
             read_code,
             in_code: false,
-            item_depth: 0,
             skip_depth: 0,
             index: 0,
             byte_cursor: 0,
@@ -330,7 +328,6 @@ impl<'a> TextCursor<'a> {
             match event {
                 Event::Start(Tag::FootnoteDefinition(_)) => self.skip_depth = 1,
                 Event::Start(Tag::Item) => {
-                    self.item_depth += 1;
                     if !self.word.is_empty() {
                         return self.boundary(range, 250);
                     }
@@ -372,14 +369,8 @@ impl<'a> TextCursor<'a> {
                 Event::Code(t) => self.set_fragment(t, range, true),
                 Event::End(TagEnd::Heading(_)) => return self.boundary(range, 600),
                 Event::End(TagEnd::HtmlBlock) => return self.boundary(range, 450),
-                Event::End(TagEnd::Item) => {
-                    self.item_depth = self.item_depth.saturating_sub(1);
-                    return self.boundary(range, 300);
-                }
-                Event::End(TagEnd::Paragraph) => {
-                    let pause = if self.item_depth > 0 { 300 } else { 450 };
-                    return self.boundary(range, pause);
-                }
+                Event::End(TagEnd::Item) => return self.boundary(range, 300),
+                Event::End(TagEnd::Paragraph) => return self.boundary(range, 450),
                 Event::End(TagEnd::TableCell) => return self.boundary(range, 100),
                 Event::End(TagEnd::TableHead | TagEnd::TableRow) => {
                     return self.boundary(range, 250);
@@ -406,6 +397,16 @@ impl<'a> TextCursor<'a> {
                 _ => {}
             }
         }
+    }
+    fn structural_pause(&mut self, mut pause: u32) -> u32 {
+        while let Some(next) = self.piece() {
+            if !next.text.is_empty() {
+                self.pending.push_front(next);
+                break;
+            }
+            pause = pause.max(next.pause);
+        }
+        pause
     }
     fn source_range(&mut self, range: Range<usize>) -> Result<(u32, u32), TextError> {
         let start = range.start.max(self.byte_cursor);
@@ -440,16 +441,7 @@ impl<'a> TextCursor<'a> {
                 if words.is_empty() {
                     continue;
                 }
-                pause = p.pause;
-                if pause == 100
-                    && let Some(next) = self.piece()
-                {
-                    if next.text.is_empty() && next.pause >= 250 {
-                        pause = next.pause;
-                    } else {
-                        self.pending.push_front(next);
-                    }
-                }
+                pause = self.structural_pause(p.pause);
                 break;
             }
             let added = p.text.chars().count() + usize::from(!words.is_empty());
@@ -477,13 +469,7 @@ impl<'a> TextCursor<'a> {
                 boundary = Some(words.len());
             }
             if self.index == 0 && natural && size >= 40 {
-                if let Some(next) = self.piece() {
-                    if next.text.is_empty() {
-                        pause = next.pause;
-                    } else {
-                        self.pending.push_front(next);
-                    }
-                }
+                pause = self.structural_pause(0);
                 break;
             }
         }
@@ -625,6 +611,26 @@ mod fixes {
             table.iter().map(|c| c.text.as_str()).collect::<Vec<_>>(),
             vec!["Name", "Value.", "A", "42."]
         );
+    }
+    #[test]
+    fn paragraph_pauses_inside_lists_keep_the_larger_boundary() {
+        for source in [
+            "- First paragraph.\n\n  Second paragraph.",
+            "- First paragraph.\n\n- Second paragraph.",
+        ] {
+            let out = chunks(source);
+            assert_eq!(
+                out.iter().map(|c| c.pause_ms).collect::<Vec<_>>(),
+                vec![450, 450]
+            );
+            for (chunk, expected) in out.iter().zip(["First paragraph.", "Second paragraph."]) {
+                assert_eq!(chunk.text, expected);
+                let start = source.find(expected).unwrap();
+                assert_eq!(chunk.source_start, start as u32);
+                assert_eq!(chunk.source_end, (start + expected.len()) as u32);
+            }
+        }
+        assert_eq!(chunks("- Tight item.")[0].pause_ms, 300);
     }
     #[test]
     fn sentence_and_clause_pauses() {
