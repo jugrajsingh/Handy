@@ -46,6 +46,47 @@ impl AudioChunk {
     fn stored_seconds(&self) -> f64 {
         (self.pcm.samples.len() + self.native.len()) as f64 / f64::from(self.pcm.sample_rate)
     }
+    fn take_prefix(&mut self, played_budget: f64, stored_budget: f64) -> Option<Self> {
+        let rate = f64::from(self.pcm.sample_rate);
+        let stored_frames = (stored_budget.max(0.0) * rate).floor() as usize;
+        let played_frames = (played_budget.max(0.0) * rate).floor() as usize;
+        let total = self.pcm.samples.len();
+        let native_total = self.native.len();
+        let native_at =
+            |frames: usize| (frames as u128 * native_total as u128 / total.max(1) as u128) as usize;
+        let mut low = 0;
+        let mut high = played_frames.min(total.saturating_sub(1));
+        while low < high {
+            let middle = low + (high - low).div_ceil(2);
+            if middle + native_at(middle) <= stored_frames {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        if low == 0 {
+            return None;
+        }
+        let mut samples = std::mem::take(&mut self.pcm.samples);
+        self.pcm.samples = samples.split_off(low);
+        samples.shrink_to_fit();
+        let mut native = std::mem::take(&mut self.native);
+        self.native = native.split_off(native_at(low));
+        native.shrink_to_fit();
+        Some(Self {
+            ticket: self.ticket,
+            pcm: Pcm {
+                id: self.pcm.id,
+                sample_rate: self.pcm.sample_rate,
+                samples,
+            },
+            native,
+            plan: self.plan,
+            source_start: self.source_start,
+            source_end: self.source_end,
+            pause_ms: 0,
+        })
+    }
 }
 /// Bounds waiting audio and rejects replies from obsolete epochs.
 #[derive(Debug)]
@@ -296,7 +337,8 @@ impl Queue {
         self.waiting.retain(|a| a.ticket.index < index);
         self.advance();
     }
-    /// Stores out-of-order parts and admits only the contiguous prefix.
+    /// Admits the contiguous prefix and returns any unadmitted remainder.
+    /// Synthesis time for a returned remainder scales with its PCM length.
     pub fn complete_part(
         &mut self,
         ticket: Ticket,
@@ -307,7 +349,7 @@ impl Queue {
         if ticket.epoch != self.epoch || self.in_flight.get(&ticket.index) != Some(&ticket) {
             return None;
         }
-        let chunk = match chunk {
+        let mut chunk = match chunk {
             Ok(chunk) => chunk,
             Err(()) => {
                 self.fail_ticket(ticket);
@@ -369,11 +411,10 @@ impl Queue {
         } else {
             0.0
         };
-        if self.queued_seconds() + seconds - released_seconds > QUEUED_AUDIO_CEILING + 0.00001 {
-            return Some(chunk);
-        }
-        if self.stored_seconds() + chunk.stored_seconds() - released_native
-            > STORED_SECONDS_CEILING + 0.00001
+        let mut remainder = None;
+        if self.queued_seconds() + seconds - released_seconds > QUEUED_AUDIO_CEILING + 0.00001
+            || self.stored_seconds() + chunk.stored_seconds() - released_native
+                > STORED_SECONDS_CEILING + 0.00001
         {
             if ticket.index == self.next_admit_index
                 && self.playing.is_none()
@@ -381,8 +422,18 @@ impl Queue {
                 && !self.waiting.is_empty()
             {
                 self.start_waiting();
+                let played_budget = QUEUED_AUDIO_CEILING - self.queued_seconds();
+                let stored_budget = STORED_SECONDS_CEILING - self.stored_seconds();
+                if chunk.seconds() > played_budget || chunk.stored_seconds() > stored_budget {
+                    let Some(prefix) = chunk.take_prefix(played_budget, stored_budget) else {
+                        return Some(chunk);
+                    };
+                    remainder = Some(chunk);
+                    chunk = prefix;
+                }
+            } else {
+                return Some(chunk);
             }
-            return Some(chunk);
         }
         // Later replies reserve one maximum-sized played chunk for the missing prefix.
         if ticket.index > self.next_admit_index
@@ -393,6 +444,7 @@ impl Queue {
         }
         if observed_rtf.is_some() {
             self.rtf_played = next_rtf;
+            let seconds = chunk.seconds();
             self.estimated_chunk_seconds = if self.observations == 0 {
                 seconds
             } else {
@@ -401,7 +453,7 @@ impl Queue {
             self.observations += 1;
         }
         self.ready.insert(ticket.index, chunk);
-        if last {
+        if last && remainder.is_none() {
             self.in_flight.remove(&ticket.index);
             self.estimates.remove(&ticket.index);
             self.busy_lanes.remove(&ticket.index);
@@ -416,7 +468,7 @@ impl Queue {
             }
         }
         self.advance();
-        None
+        remainder
     }
     fn finish_buffering(&mut self) {
         if let Some(start) = self.buffering_started.take() {
@@ -467,7 +519,7 @@ impl Queue {
         }
         self.start_waiting();
     }
-    // Storage backpressure can start the buffered prefix before head start is met.
+    // Capacity pressure can start the buffered prefix before head start is met.
     fn start_waiting(&mut self) {
         self.state = PlaybackState::Playing;
         self.finish_buffering();
@@ -656,89 +708,265 @@ mod tests {
         assert_short_prefix_progress(3);
     }
     fn assert_short_prefix_progress(lanes: usize) {
-        let mut q = Queue::with_speed(2.0);
+        assert_admission_progress(2.0, 24_000, 1, 480_000, lanes, 24_000);
+    }
+    #[test]
+    fn split_prefix_preserves_samples_and_pause_and_fits_both_budgets() {
+        for speed in [0.5, 1.0, 1.5, 2.0] {
+            for played in [0, 1, 2, 10] {
+                for stored in [0, 1, 2, 5, 10] {
+                    let mut audio = chunk(Ticket { epoch: 7, index: 2 });
+                    audio.pcm.sample_rate = 32;
+                    audio.pcm.samples = (0..31).map(|n| n as f32).collect();
+                    audio.native = (0..(31.0 * speed) as usize)
+                        .map(|n| (100 + n) as f32)
+                        .collect();
+                    audio.plan = SpeedPlan {
+                        requested: speed,
+                        native: 1.0,
+                        stretch: speed,
+                    };
+                    audio.pause_ms = 280;
+                    let pcm = audio.pcm.samples.clone();
+                    let native = audio.native.clone();
+                    let plan = audio.plan;
+                    let pause_samples = crate::edges::pause_samples(audio.pause_ms, speed, 32);
+                    if let Some(prefix) =
+                        audio.take_prefix(f64::from(played) / 32.0, f64::from(stored) / 32.0)
+                    {
+                        assert!(!prefix.pcm.samples.is_empty());
+                        assert!(!audio.pcm.samples.is_empty());
+                        assert!(prefix.seconds() <= f64::from(played) / 32.0);
+                        assert!(prefix.stored_seconds() <= f64::from(stored) / 32.0);
+                        assert_eq!(
+                            prefix.native.len(),
+                            prefix.pcm.samples.len() * native.len() / pcm.len()
+                        );
+                        assert_eq!(
+                            prefix
+                                .pcm
+                                .samples
+                                .iter()
+                                .chain(&audio.pcm.samples)
+                                .copied()
+                                .collect::<Vec<_>>(),
+                            pcm
+                        );
+                        assert_eq!(
+                            prefix
+                                .native
+                                .iter()
+                                .chain(&audio.native)
+                                .copied()
+                                .collect::<Vec<_>>(),
+                            native
+                        );
+                        assert_eq!(prefix.pause_ms, 0);
+                        assert_eq!(audio.pause_ms, 280);
+                        assert_eq!(
+                            crate::edges::pause_samples(prefix.pause_ms, speed, 32)
+                                + crate::edges::pause_samples(audio.pause_ms, speed, 32),
+                            pause_samples
+                        );
+                        assert_eq!(prefix.ticket, audio.ticket);
+                        assert_eq!(prefix.pcm.id, audio.pcm.id);
+                        assert_eq!(prefix.source_start, audio.source_start);
+                        assert_eq!(prefix.source_end, audio.source_end);
+                        assert_eq!(prefix.plan, plan);
+                        assert_eq!(audio.plan, plan);
+                    } else {
+                        assert!(played == 0 || 1 + native.len() / pcm.len() > stored as usize);
+                        assert_eq!(audio.pcm.samples, pcm);
+                        assert_eq!(audio.native, native);
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn two_short_chunks_and_maximum_part_at_one_x_make_progress() {
+        assert_admission_progress(1.0, 48_000, 2, 720_000, 1, 24_000);
+    }
+    #[test]
+    fn maximum_part_at_one_x_makes_progress_with_later_audio_ready() {
+        assert_admission_progress(1.0, 24_000, 1, 720_000, 3, 24_000);
+    }
+    #[test]
+    fn admission_progress_covers_speeds_prefixes_and_part_size_boundaries() {
+        let rate = 32;
+        let mut cases = 0;
+        for speed in [0.5, 1.0, 1.5, 2.0] {
+            let maximum =
+                (30.0_f64.min(60.0 / (1.0 + f64::from(speed))) * f64::from(rate)) as usize;
+            let sizes = BTreeSet::from([
+                1,
+                2,
+                3,
+                rate as usize,
+                5 * rate as usize - 1,
+                5 * rate as usize,
+                5 * rate as usize + 1,
+                maximum / 2,
+                maximum - 1,
+                maximum,
+            ]);
+            for prefix in 1..5 * rate as usize {
+                for pieces in 1..=2.min(prefix) {
+                    for lanes in [1, 3] {
+                        for next in &sizes {
+                            assert_admission_progress(speed, prefix, pieces, *next, lanes, rate);
+                            cases += 1;
+                        }
+                    }
+                }
+            }
+        }
+        println!("checked {cases} admission configurations");
+    }
+    #[test]
+    fn admission_progress_covers_single_sample_and_near_head_start_prefixes() {
+        for speed in [0.5, 1.0, 1.5, 2.0] {
+            let maximum = (30.0_f64.min(60.0 / (1.0 + f64::from(speed))) * 24_000.0) as usize;
+            for prefix in [1, 119_999] {
+                for lanes in [1, 3] {
+                    assert_admission_progress(speed, prefix, 1, maximum, lanes, 24_000);
+                }
+            }
+        }
+    }
+    fn assert_admission_progress(
+        speed: f32,
+        prefix: usize,
+        pieces: usize,
+        next_frames: usize,
+        lanes: usize,
+        rate: u32,
+    ) {
+        let mut q = Queue::with_speed(speed);
         q.set_lanes(lanes);
         q.play();
-        let first = q.request_next().unwrap();
-        let make_audio = |ticket, played_seconds: usize| {
+        let make_audio = |ticket: Ticket, frames: usize| {
             let mut audio = chunk(ticket);
-            audio.pcm.samples = vec![0.25; played_seconds * 24_000];
-            audio.native = vec![0.5; played_seconds * 2 * 24_000];
+            audio.pcm.sample_rate = rate;
+            audio.pcm.samples = (0..frames)
+                .map(|i| (ticket.index * 2_000_000 + i) as f32)
+                .collect();
+            audio.native = (0..(frames as f64 * f64::from(speed)).floor() as usize)
+                .map(|i| (10_000_000 + ticket.index * 2_000_000 + i) as f32)
+                .collect();
             audio.plan = SpeedPlan {
-                requested: 2.0,
+                requested: speed,
                 native: 1.0,
-                stretch: 2.0,
+                stretch: speed,
             };
             audio
         };
-        let first_audio = make_audio(first, 1);
-        let mut expected = vec![(first_audio.pcm.samples.clone(), first_audio.native.clone())];
-        assert!(q.complete_timed(first, Ok(first_audio), 1.0).is_none());
+        let bounds = |queue: &Queue| {
+            assert!(queue.queued_seconds() <= QUEUED_AUDIO_CEILING + 1e-9);
+            assert!(queue.stored_seconds() <= STORED_SECONDS_CEILING + 1e-9);
+        };
+        let mut expected = Vec::new();
+        for part in 0..pieces {
+            let ticket = q.request_next().unwrap();
+            let frames = if part + 1 == pieces {
+                prefix - prefix / pieces * part
+            } else {
+                prefix / pieces
+            };
+            let audio = make_audio(ticket, frames);
+            let elapsed = audio.seconds();
+            expected.push((audio.pcm.samples.clone(), audio.native.clone()));
+            assert!(q.complete_timed(ticket, Ok(audio), elapsed).is_none());
+            bounds(&q);
+        }
         assert_eq!(q.state, PlaybackState::Buffering);
         assert_eq!(q.target_seconds(), 5.0);
-        let second = q.request_next().unwrap();
-        let second_audio = make_audio(second, 20);
-        expected.push((
-            second_audio.pcm.samples.clone(),
-            second_audio.native.clone(),
-        ));
+        let next = q.request_next().unwrap();
+        let audio = make_audio(next, next_frames);
+        expected.push((audio.pcm.samples.clone(), audio.native.clone()));
         if lanes == 3 {
-            let third = q.request_next().unwrap();
-            let later = make_audio(third, 1);
-            expected.push((later.pcm.samples.clone(), later.native.clone()));
-            assert!(q.complete_timed(third, Ok(later), 1.0).is_none());
-            assert!(q.ready.contains_key(&third.index));
-            assert!(q.playing.is_none());
+            let later = q.request_next().unwrap();
+            let ready = make_audio(later, rate as usize);
+            let elapsed = ready.seconds() * 2.0;
+            expected.push((ready.pcm.samples.clone(), ready.native.clone()));
+            assert!(q.complete_timed(later, Ok(ready), elapsed).is_none());
+            assert!(q.ready.contains_key(&later.index));
+            bounds(&q);
         }
-        let assert_retained = |queue: &Queue, pending: Option<&AudioChunk>| {
-            assert!(queue.queued_seconds() <= QUEUED_AUDIO_CEILING);
-            assert!(queue.stored_seconds() <= STORED_SECONDS_CEILING);
-            for audio in queue
-                .waiting
-                .iter()
-                .chain(queue.ready.values())
-                .chain(pending)
-            {
-                let (pcm, native) = &expected[audio.ticket.index];
-                assert_eq!(&audio.pcm.samples, pcm);
-                assert_eq!(&audio.native, native);
+        let mut delivered = vec![0; expected.len()];
+        let conserved = |queue: &Queue, pending: Option<&AudioChunk>, delivered: &[usize]| {
+            bounds(queue);
+            for (index, (pcm, native)) in expected.iter().enumerate() {
+                let retained: Vec<_> = queue
+                    .playing
+                    .iter()
+                    .chain(&queue.waiting)
+                    .chain(queue.ready.values())
+                    .chain(pending)
+                    .filter(|a| a.ticket.index == index)
+                    .collect();
+                let samples: Vec<_> = retained
+                    .iter()
+                    .flat_map(|a| &a.pcm.samples)
+                    .copied()
+                    .collect();
+                assert_eq!(samples, pcm[delivered[index]..]);
+                let samples: Vec<_> = retained.iter().flat_map(|a| &a.native).copied().collect();
+                assert!(samples.len() <= native.len());
+                assert_eq!(samples, native[native.len() - samples.len()..]);
+                if delivered[index] == 0
+                    && queue
+                        .playing
+                        .as_ref()
+                        .is_none_or(|a| a.ticket.index != index)
+                {
+                    assert_eq!(samples, *native);
+                }
             }
         };
-        assert_retained(&q, Some(&second_audio));
-        let mut pending = q.complete_timed(second, Ok(second_audio), 20.0);
+        conserved(&q, Some(&audio), &delivered);
+        let elapsed = audio.seconds();
+        let mut pending = q.complete_timed(next, Ok(audio), elapsed);
+        conserved(&q, pending.as_ref(), &delivered);
         q.source_finished = true;
         for _ in 0..10 {
             if let Some(audio) = pending.take() {
-                pending = q.complete_timed(second, Ok(audio), 20.0);
+                let elapsed = audio.seconds();
+                pending = q.complete_timed(next, Ok(audio), elapsed);
             }
+            conserved(&q, pending.as_ref(), &delivered);
             q.advance();
-            assert_retained(&q, pending.as_ref());
+            conserved(&q, pending.as_ref(), &delivered);
         }
-        assert!(q.playing.is_some(), "completed audio must make progress");
-        let mut delivered = Vec::new();
-        let mut delivered_samples = 0;
-        for _ in 0..10 {
-            if let Some(audio) = pending.take() {
-                pending = q.complete_timed(second, Ok(audio), 20.0);
-            }
-            q.advance();
-            assert_retained(&q, pending.as_ref());
-            if let Some(audio) = &q.playing {
-                assert_eq!(audio.ticket.index, delivered.len());
-                assert_eq!(audio.pcm.samples, expected[audio.ticket.index].0);
-                assert!(audio.native.is_empty());
-                delivered_samples += audio.pcm.samples.len();
-                delivered.push(audio.ticket.index);
-                q.playback_finished();
-                assert_retained(&q, pending.as_ref());
-            }
-        }
-        assert!(pending.is_none());
-        assert_eq!(delivered, (0..expected.len()).collect::<Vec<_>>());
-        assert_eq!(
-            delivered_samples,
-            expected.iter().map(|(pcm, _)| pcm.len()).sum::<usize>()
+        assert!(
+            q.playing.is_some(),
+            "completed audio must make progress: speed={speed}, prefix={prefix}, pieces={pieces}, next={next_frames}, lanes={lanes}"
         );
+        let mut all_samples = Vec::new();
+        for _ in 0..32 {
+            if let Some(audio) = pending.take() {
+                let elapsed = audio.seconds();
+                pending = q.complete_timed(next, Ok(audio), elapsed);
+            }
+            conserved(&q, pending.as_ref(), &delivered);
+            if let Some(audio) = &q.playing {
+                let index = delivered
+                    .iter()
+                    .enumerate()
+                    .find(|(i, n)| **n < expected[*i].0.len())
+                    .unwrap()
+                    .0;
+                assert_eq!(audio.ticket.index, index);
+                assert!(audio.native.is_empty());
+                all_samples.extend_from_slice(&audio.pcm.samples);
+                delivered[index] += audio.pcm.samples.len();
+                q.playback_finished();
+                conserved(&q, pending.as_ref(), &delivered);
+            }
+        }
+        let expected_samples: Vec<_> = expected.iter().flat_map(|(pcm, _)| pcm).copied().collect();
+        assert_eq!(all_samples, expected_samples);
+        assert!(pending.is_none());
         assert_eq!(q.state, PlaybackState::Finished);
         assert_eq!(q.stored_seconds(), 0.0);
     }

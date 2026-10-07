@@ -63,14 +63,16 @@ pub fn replay_with_lanes(
     let mut playback: Option<(Ticket, f64)> = None;
     let mut first_start = None;
     let mut queue_peak = 0.0f64;
-    let mut pending = std::collections::BTreeMap::new();
+    let mut pending = std::collections::BTreeMap::<usize, (Ticket, AudioChunk, f64)>::new();
     loop {
         queue.advance_at(now);
         for index in pending.keys().copied().collect::<Vec<_>>() {
-            if let Some((ticket, audio, elapsed)) = pending.remove(&index)
-                && let Some(audio) = queue.complete_timed(ticket, Ok(audio), elapsed)
-            {
-                pending.insert(index, (ticket, audio, elapsed));
+            if let Some((ticket, audio, elapsed)) = pending.remove(&index) {
+                let frames = audio.pcm.samples.len();
+                if let Some(audio) = queue.complete_timed(ticket, Ok(audio), elapsed) {
+                    let elapsed = elapsed * audio.pcm.samples.len() as f64 / frames as f64;
+                    pending.insert(index, (ticket, audio, elapsed));
+                }
             }
         }
         while queue.next_index < timings.len() {
@@ -139,7 +141,9 @@ pub fn replay_with_lanes(
                 source_start: index as u32,
                 source_end: index as u32 + 1,
             };
+            let frames = audio.pcm.samples.len();
             if let Some(audio) = queue.complete_timed(ticket, Ok(audio), elapsed) {
+                let elapsed = elapsed * audio.pcm.samples.len() as f64 / frames as f64;
                 pending.insert(index, (ticket, audio, elapsed));
             }
         }
@@ -209,6 +213,23 @@ mod tests {
         assert_eq!(result.wall_seconds, 6.0);
         assert_eq!(result.buffering_pauses, 0);
         assert_eq!(result.buffering_seconds, 0.0);
+    }
+    #[test]
+    fn replay_delivers_a_capacity_split_without_losing_played_duration() {
+        let timings: Vec<_> = [1, 1, 30]
+            .into_iter()
+            .map(|seconds| Timing {
+                synthesis_seconds: f64::from(seconds),
+                audio_seconds: f64::from(seconds),
+                samples: seconds as usize * 8000,
+                sample_rate: 8000,
+            })
+            .collect();
+        let result = replay(&timings, 1.0).unwrap();
+        assert_eq!(result.chunks, 3);
+        assert_eq!(result.head_start_wait_seconds, 32.0);
+        assert_eq!(result.wall_seconds, 64.0);
+        assert!(result.queued_audio_high_water_seconds <= 30.0);
     }
     #[test]
     fn measured_timings_replay_adaptive_scheduler_and_slow_producer_refuses_continuity() {
