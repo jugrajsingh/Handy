@@ -7,7 +7,10 @@ use handy_tts_core::{
     },
     protocol::Pcm,
 };
-use rodio::{mixer::Mixer, OutputStream, OutputStreamBuilder, Sink, Source};
+use rodio::{
+    mixer::Mixer, queue::SourcesQueueOutput, source::UniformSourceIterator, OutputStream,
+    OutputStreamBuilder, Sink, Source,
+};
 use std::{
     collections::{BTreeMap, VecDeque},
     sync::{
@@ -62,7 +65,7 @@ impl Iterator for FeedSource {
 impl Source for FeedSource {
     fn current_span_len(&self) -> Option<usize> {
         let format = self.format.lock().unwrap_or_else(|p| p.into_inner());
-        Some(format.spans.front().map(|span| span.remaining).unwrap_or(1))
+        Some(format.spans.front().map(|span| span.remaining).unwrap_or(0))
     }
     fn channels(&self) -> u16 {
         1
@@ -80,6 +83,122 @@ impl Source for FeedSource {
     }
 }
 
+#[derive(Clone, Copy)]
+struct MixerFormat {
+    rate: u32,
+    channels: u16,
+}
+
+#[derive(Clone)]
+struct NativeSource {
+    queue: Arc<Mutex<SourcesQueueOutput>>,
+    format: SharedFormat,
+}
+impl Iterator for NativeSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        if self
+            .format
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .spans
+            .is_empty()
+        {
+            return None;
+        }
+        self.queue.lock().unwrap_or_else(|p| p.into_inner()).next()
+    }
+}
+impl Source for NativeSource {
+    fn current_span_len(&self) -> Option<usize> {
+        let format = self.format.lock().unwrap_or_else(|p| p.into_inner());
+        Some(format.spans.front().map(|span| span.remaining).unwrap_or(0))
+    }
+    fn channels(&self) -> u16 {
+        1
+    }
+    fn sample_rate(&self) -> u32 {
+        let format = self.format.lock().unwrap_or_else(|p| p.into_inner());
+        format
+            .spans
+            .front()
+            .map(|span| span.rate)
+            .unwrap_or(format.rate)
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+struct Conversion {
+    input: NativeSource,
+    converted: Option<UniformSourceIterator<NativeSource>>,
+    idle_phase: u64,
+    idle_channel: u16,
+}
+type SharedConversion = Arc<Mutex<Conversion>>;
+
+struct MixerFeedSource {
+    conversion: SharedConversion,
+    feed: SharedFeed,
+    paused: Arc<AtomicBool>,
+    output: MixerFormat,
+}
+impl Iterator for MixerFeedSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        let mut conversion = self.conversion.lock().unwrap_or_else(|p| p.into_inner());
+        if self.paused.load(Ordering::Acquire) {
+            return Some(0.0);
+        }
+        if conversion.converted.is_none() {
+            conversion.converted = Some(UniformSourceIterator::new(
+                conversion.input.clone(),
+                self.output.channels,
+                self.output.rate,
+            ));
+        }
+        if let Some(sample) = conversion.converted.as_mut().and_then(Iterator::next) {
+            conversion.idle_phase = 0;
+            conversion.idle_channel = 0;
+            return Some(sample);
+        }
+        conversion.converted = None;
+        let mut feed = self.feed.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.paused.load(Ordering::Acquire) && conversion.idle_channel == 0 {
+            let rate = conversion
+                .input
+                .format
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .rate;
+            conversion.idle_phase += u64::from(rate);
+            while conversion.idle_phase >= u64::from(self.output.rate) {
+                feed.pull(&mut [0.0]);
+                conversion.idle_phase -= u64::from(self.output.rate);
+            }
+        }
+        conversion.idle_channel = (conversion.idle_channel + 1) % self.output.channels;
+        Some(0.0)
+    }
+}
+impl Source for MixerFeedSource {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        self.output.channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.output.rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
 pub struct RodioOutput {
     selected: Option<String>,
     stream: Option<OutputStream>,
@@ -87,7 +206,9 @@ pub struct RodioOutput {
     feed: Option<SharedFeed>,
     rate: Option<u32>,
     mixer: Option<Mixer>,
+    mixer_format: Option<MixerFormat>,
     format: Option<SharedFormat>,
+    conversion: Option<SharedConversion>,
     scheduled: BTreeMap<usize, usize>,
     lost: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
@@ -103,7 +224,9 @@ impl Default for RodioOutput {
             feed: None,
             rate: None,
             mixer: None,
+            mixer_format: None,
             format: None,
+            conversion: None,
             scheduled: BTreeMap::new(),
             lost: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
@@ -116,10 +239,12 @@ pub struct PreparedStream {
     selected: Option<String>,
     stream: Option<OutputStream>,
     mixer: Mixer,
+    mixer_format: MixerFormat,
     rate: Option<u32>,
     sink: Option<Arc<Sink>>,
     feed: Option<SharedFeed>,
     format: Option<SharedFormat>,
+    conversion: Option<SharedConversion>,
     lost: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
 }
@@ -130,26 +255,35 @@ impl PreparedStream {
         selected: Option<String>,
         lost: Arc<AtomicBool>,
         rate: Option<u32>,
+        mixer_format: MixerFormat,
     ) -> Self {
         let paused = Arc::new(AtomicBool::new(false));
         let mut prepared = Self {
             selected,
             stream,
             mixer,
+            mixer_format,
             rate,
             sink: None,
             feed: None,
             format: None,
+            conversion: None,
             lost,
             paused,
         };
         if let Some(rate) = rate {
             let feed = Arc::new(Mutex::new(Feed::new(rate)));
-            let (sink, format) =
-                connect_feed(&prepared.mixer, rate, prepared.paused.clone(), feed.clone());
+            let (sink, format, conversion) = connect_feed(
+                &prepared.mixer,
+                rate,
+                mixer_format,
+                prepared.paused.clone(),
+                feed.clone(),
+            );
             prepared.sink = Some(sink);
             prepared.feed = Some(feed);
             prepared.format = Some(format);
+            prepared.conversion = Some(conversion);
         }
         prepared
     }
@@ -158,9 +292,10 @@ impl PreparedStream {
 fn connect_feed(
     mixer: &Mixer,
     rate: u32,
+    output: MixerFormat,
     paused: Arc<AtomicBool>,
     feed: SharedFeed,
-) -> (Arc<Sink>, SharedFormat) {
+) -> (Arc<Sink>, SharedFormat, SharedConversion) {
     let format = Arc::new(Mutex::new(FormatState {
         rate,
         spans: VecDeque::new(),
@@ -168,17 +303,31 @@ fn connect_feed(
     let (sink, mut source) = Sink::new();
     paused.store(true, Ordering::Release);
     sink.append(FeedSource {
-        feed,
+        feed: feed.clone(),
         format: format.clone(),
         block: vec![0.0; 1_024],
         pos: 0,
         paused: paused.clone(),
     });
-    // Prime the queue's format before the mixer constructs its rate converter.
+    // Activate the persistent feed before wrapping the queue's native format.
     let _ = source.next();
-    mixer.add(source);
+    let conversion = Arc::new(Mutex::new(Conversion {
+        input: NativeSource {
+            queue: Arc::new(Mutex::new(source)),
+            format: format.clone(),
+        },
+        converted: None,
+        idle_phase: 0,
+        idle_channel: 0,
+    }));
+    mixer.add(MixerFeedSource {
+        conversion: conversion.clone(),
+        feed,
+        paused: paused.clone(),
+        output,
+    });
     paused.store(false, Ordering::Release);
-    (Arc::new(sink), format)
+    (Arc::new(sink), format, conversion)
 }
 
 impl Output for RodioOutput {
@@ -204,8 +353,10 @@ impl Output for RodioOutput {
         self.sink = prepared.sink;
         self.feed = prepared.feed;
         self.format = prepared.format;
+        self.conversion = prepared.conversion;
         self.rate = prepared.rate;
         self.mixer = Some(prepared.mixer);
+        self.mixer_format = Some(prepared.mixer_format);
         self.stream = prepared.stream;
         self.lost = prepared.lost;
         self.paused = prepared.paused;
@@ -214,11 +365,14 @@ impl Output for RodioOutput {
         let rate = self.rate.ok_or(PlaybackError::Unavailable)?;
         if self.sink.is_none() {
             if let Some(mixer) = self.mixer.clone() {
-                self.attach_mixer(&mixer)?;
+                let output = self.mixer_format.ok_or(PlaybackError::Unavailable)?;
+                self.attach_mixer_format(&mixer, output)?;
             } else {
                 self.open_stream()?;
             }
         }
+        let conversion = self.conversion.as_ref().ok_or(PlaybackError::Unavailable)?;
+        let _conversion = conversion.lock().unwrap_or_else(|p| p.into_inner());
         let format = self.format.as_ref().ok_or(PlaybackError::Unavailable)?;
         let feed = self.feed.as_ref().ok_or(PlaybackError::Unavailable)?;
         let mut feed = feed.lock().unwrap_or_else(|p| p.into_inner());
@@ -270,6 +424,10 @@ impl Output for RodioOutput {
         events
     }
     fn retract_unstarted(&mut self) -> Vec<Segment> {
+        let _conversion = self
+            .conversion
+            .as_ref()
+            .map(|conversion| conversion.lock().unwrap_or_else(|p| p.into_inner()));
         let segments = if let Some(feed) = &self.feed {
             let mut feed = feed.lock().unwrap_or_else(|p| p.into_inner());
             let segments = feed.retract_unstarted();
@@ -315,22 +473,22 @@ impl Output for RodioOutput {
         }
     }
     fn stop(&mut self) {
-        let mut replace = false;
-        if let (Some(feed), Some(rate)) = (&self.feed, self.rate) {
+        if let (Some(conversion), Some(feed), Some(rate)) =
+            (&self.conversion, &self.feed, self.rate)
+        {
+            let mut conversion = conversion.lock().unwrap_or_else(|p| p.into_inner());
             let mut feed = feed.lock().unwrap_or_else(|p| p.into_inner());
             *feed = Feed::new(rate);
             if let Some(format) = &self.format {
                 let mut format = format.lock().unwrap_or_else(|p| p.into_inner());
                 format.spans.clear();
-                replace = format.rate != rate;
+                format.rate = rate;
             }
+            conversion.converted = None;
+            conversion.idle_phase = 0;
+            conversion.idle_channel = 0;
         }
         self.scheduled.clear();
-        if replace {
-            if let (Some(mixer), Some(rate)) = (self.mixer.clone(), self.rate) {
-                self.replace_source(&mixer, rate);
-            }
-        }
         Output::resume(self);
     }
 }
@@ -347,44 +505,40 @@ impl RodioOutput {
         if rate == 0 {
             return Err(PlaybackError::Unavailable);
         }
-        let changed = self.rate != Some(rate);
+        let _conversion = self
+            .conversion
+            .as_ref()
+            .map(|conversion| conversion.lock().unwrap_or_else(|p| p.into_inner()));
         self.rate = Some(rate);
-        let idle = self.format.as_ref().is_some_and(|format| {
-            format
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .spans
-                .is_empty()
-        });
-        if changed && idle {
-            if let Some(mixer) = self.mixer.clone() {
-                self.replace_source(&mixer, rate);
+        if let Some(format) = &self.format {
+            let mut format = format.lock().unwrap_or_else(|p| p.into_inner());
+            if format.spans.is_empty() {
+                format.rate = rate;
             }
         }
         Ok(())
     }
+    #[cfg(test)]
     fn attach_mixer(&mut self, mixer: &Mixer) -> Result<(), PlaybackError> {
         let rate = self.rate.ok_or(PlaybackError::Unavailable)?;
-        self.replace_source(mixer, rate);
-        Ok(())
+        self.attach_mixer_format(mixer, MixerFormat { rate, channels: 1 })
     }
-    fn replace_source(&mut self, mixer: &Mixer, rate: u32) {
-        let was_paused = self.paused.load(Ordering::Acquire);
-        self.paused.store(true, Ordering::Release);
-        let feed = self
-            .feed
-            .clone()
-            .unwrap_or_else(|| Arc::new(Mutex::new(Feed::new(rate))));
-        let paused = Arc::new(AtomicBool::new(false));
-        let (sink, format) = connect_feed(mixer, rate, paused.clone(), feed.clone());
+    fn attach_mixer_format(
+        &mut self,
+        mixer: &Mixer,
+        output: MixerFormat,
+    ) -> Result<(), PlaybackError> {
+        let rate = self.rate.ok_or(PlaybackError::Unavailable)?;
+        let feed = Arc::new(Mutex::new(Feed::new(rate)));
+        let (sink, format, conversion) =
+            connect_feed(mixer, rate, output, self.paused.clone(), feed.clone());
         self.sink = Some(sink);
         self.feed = Some(feed);
         self.format = Some(format);
+        self.conversion = Some(conversion);
         self.mixer = Some(mixer.clone());
-        self.paused = paused;
-        if was_paused {
-            Output::pause(self);
-        }
+        self.mixer_format = Some(output);
+        Ok(())
     }
     #[cfg(test)]
     fn with_mixer(mixer: &Mixer, rate: u32) -> Self {
@@ -400,6 +554,10 @@ impl RodioOutput {
             self.selected.clone(),
             Arc::new(AtomicBool::new(false)),
             self.rate,
+            MixerFormat {
+                rate: self.rate.unwrap(),
+                channels: 1,
+            },
         )
     }
     fn open_stream(&mut self) -> Result<(), PlaybackError> {
@@ -429,12 +587,17 @@ impl RodioOutput {
             .with_error_callback(move |_| signal.store(true, Ordering::Release))
             .open_stream()
             .map_err(|_| PlaybackError::Unavailable)?;
+        let mixer_format = MixerFormat {
+            rate: stream.config().sample_rate(),
+            channels: stream.config().channel_count(),
+        };
         Ok(PreparedStream::new(
             stream.mixer().clone(),
             Some(stream),
             name.map(str::to_owned),
             lost,
             rate,
+            mixer_format,
         ))
     }
 }
@@ -516,6 +679,241 @@ mod tests {
 
     fn pull(output: &mut impl Iterator<Item = f32>, count: usize) -> Vec<f32> {
         (0..count).map(|_| output.next().unwrap()).collect()
+    }
+
+    #[test]
+    fn stop_then_queued_rate_change_preserves_duration() {
+        let (mixer, mut mixed) = rodio::mixer::mixer(1, 24_000);
+        let mut output = RodioOutput::new(24_000).unwrap();
+        output.attach_mixer(&mixer).unwrap();
+        let identity = output.sink.as_ref().unwrap().clone();
+        SegmentOutput::append(&mut output, burst(0, 4_800, 0)).unwrap();
+        pull(&mut mixed, 1_000);
+        SegmentOutput::stop(&mut output);
+        assert!(Arc::ptr_eq(output.sink.as_ref().unwrap(), &identity));
+        let first = burst(1, 240, 0);
+        SegmentOutput::append(&mut output, first.clone()).unwrap();
+        output.set_sample_rate(44_100).unwrap();
+        SegmentOutput::append(&mut output, burst(2, 4_410, 0)).unwrap();
+        let heard = pull(&mut mixed, 2_648);
+        assert_eq!(
+            SegmentOutput::events(&mut output),
+            [
+                OutputEvent::Started(1),
+                OutputEvent::Finished {
+                    index: 1,
+                    delivered: 240
+                },
+                OutputEvent::Started(2),
+                OutputEvent::Finished {
+                    index: 2,
+                    delivered: 4_410
+                },
+                OutputEvent::Underrun,
+            ]
+        );
+        assert_eq!(&heard[..240], first.speech);
+        let frames = heard.iter().rposition(|sample| *sample != 0.0).unwrap() + 1;
+        assert!(frames.abs_diff(2_640) <= 3);
+    }
+
+    #[test]
+    fn partial_stop_preserves_all_rate_pairs_and_append_timings() {
+        for target in [24_000, 44_100, 48_000] {
+            let channels = if target == 48_000 { 2 } else { 1 };
+            let device = MixerFormat {
+                rate: target,
+                channels,
+            };
+            for initial in [24_000, 44_100] {
+                for first in [24_000, 44_100] {
+                    for second in [24_000, 44_100] {
+                        for timing in 0..3 {
+                            let (mixer, mut mixed) = rodio::mixer::mixer(channels, target);
+                            let mut output = RodioOutput::new(initial).unwrap();
+                            output.attach_mixer_format(&mixer, device).unwrap();
+                            let identity = output.sink.as_ref().unwrap().clone();
+                            SegmentOutput::append(&mut output, burst(0, initial as usize / 5, 0))
+                                .unwrap();
+                            pull(&mut mixed, 1_000 * usize::from(channels));
+                            SegmentOutput::stop(&mut output);
+                            assert!(Arc::ptr_eq(output.sink.as_ref().unwrap(), &identity));
+                            if timing == 2 {
+                                assert!(pull(&mut mixed, 300 * usize::from(channels))
+                                    .iter()
+                                    .all(|sample| *sample == 0.0));
+                                SegmentOutput::events(&mut output);
+                            }
+                            let mut heard = Vec::new();
+                            for (index, rate, divisor) in [(1, first, 100), (2, second, 10)] {
+                                output.set_sample_rate(rate).unwrap();
+                                let speech = (0..rate / divisor)
+                                    .map(|n| {
+                                        (std::f32::consts::TAU * 200.0 * (n as f32 + 0.25)
+                                            / rate as f32)
+                                            .sin()
+                                            * 0.25
+                                    })
+                                    .collect();
+                                SegmentOutput::append(
+                                    &mut output,
+                                    Segment {
+                                        epoch: 4,
+                                        index,
+                                        speech,
+                                        pause: 0,
+                                    },
+                                )
+                                .unwrap();
+                                if index == 1 && timing == 1 {
+                                    heard.extend(pull(
+                                        &mut mixed,
+                                        target as usize / 200 * usize::from(channels),
+                                    ));
+                                }
+                            }
+                            let frames = target as usize * 11 / 100;
+                            heard.extend(pull(
+                                &mut mixed,
+                                (frames + 8) * usize::from(channels) - heard.len(),
+                            ));
+                            assert_eq!(
+                                SegmentOutput::events(&mut output),
+                                [
+                                    OutputEvent::Started(1),
+                                    OutputEvent::Finished {
+                                        index: 1,
+                                        delivered: first as usize / 100
+                                    },
+                                    OutputEvent::Started(2),
+                                    OutputEvent::Finished {
+                                        index: 2,
+                                        delivered: second as usize / 10
+                                    },
+                                    OutputEvent::Underrun,
+                                ],
+                                "target={target} initial={initial} rates={first}/{second} timing={timing}"
+                            );
+                            let mono: Vec<_> = heard
+                                .chunks_exact(usize::from(channels))
+                                .map(|frame| {
+                                    assert!(frame.iter().all(|sample| *sample == frame[0]));
+                                    frame[0]
+                                })
+                                .collect();
+                            let played =
+                                mono.iter().rposition(|sample| *sample != 0.0).unwrap() + 1;
+                            assert!(played.abs_diff(frames) <= 3);
+                            assert!(mono[..played].iter().all(|sample| *sample != 0.0));
+                            let crossings = mono[..played]
+                                .windows(2)
+                                .filter(|pair| pair[0] < 0.0 && pair[1] >= 0.0)
+                                .count();
+                            assert!(crossings.abs_diff(22) <= 2);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn retraction_and_reopen_preserve_later_native_rate_boundaries() {
+        for rate in [24_000, 44_100] {
+            let next_rate = if rate == 24_000 { 44_100 } else { 24_000 };
+            let (mixer, mut mixed) = rodio::mixer::mixer(1, rate);
+            let mut output = RodioOutput::new(rate).unwrap();
+            output.attach_mixer(&mixer).unwrap();
+            SegmentOutput::append(&mut output, burst(0, rate as usize / 5, 0)).unwrap();
+            pull(&mut mixed, rate as usize / 10);
+            SegmentOutput::events(&mut output);
+            output.set_sample_rate(next_rate).unwrap();
+            SegmentOutput::append(&mut output, burst(1, next_rate as usize / 100, 0)).unwrap();
+            let retracted = SegmentOutput::retract_unstarted(&mut output);
+            assert_eq!(retracted.len(), 1);
+            assert_eq!(retracted[0].index, 1);
+            SegmentOutput::append(&mut output, burst(2, next_rate as usize / 10, 0)).unwrap();
+            let heard = pull(&mut mixed, rate as usize / 5 + 8);
+            let frames = heard.iter().rposition(|sample| *sample != 0.0).unwrap() + 1;
+            assert!(frames.abs_diff(rate as usize / 5) <= 3);
+            assert_eq!(
+                SegmentOutput::events(&mut output),
+                [
+                    OutputEvent::Finished {
+                        index: 0,
+                        delivered: rate as usize / 5
+                    },
+                    OutputEvent::Started(2),
+                    OutputEvent::Finished {
+                        index: 2,
+                        delivered: next_rate as usize / 10
+                    },
+                    OutputEvent::Underrun,
+                ]
+            );
+            SegmentOutput::append(&mut output, burst(3, next_rate as usize / 10, 0)).unwrap();
+            assert_eq!(SegmentOutput::retract_unstarted(&mut output)[0].index, 3);
+            output.set_sample_rate(rate).unwrap();
+            SegmentOutput::append(&mut output, burst(4, rate as usize / 100, 0)).unwrap();
+            output.set_sample_rate(next_rate).unwrap();
+            SegmentOutput::append(&mut output, burst(5, next_rate as usize / 10, 0)).unwrap();
+            let heard = pull(&mut mixed, rate as usize * 11 / 100 + 8);
+            let frames = heard.iter().rposition(|sample| *sample != 0.0).unwrap() + 1;
+            assert!(frames.abs_diff(rate as usize * 11 / 100) <= 3);
+            assert_eq!(
+                SegmentOutput::events(&mut output),
+                [
+                    OutputEvent::Started(4),
+                    OutputEvent::Finished {
+                        index: 4,
+                        delivered: rate as usize / 100
+                    },
+                    OutputEvent::Started(5),
+                    OutputEvent::Finished {
+                        index: 5,
+                        delivered: next_rate as usize / 10
+                    },
+                    OutputEvent::Underrun,
+                ]
+            );
+            SegmentOutput::append(&mut output, burst(6, next_rate as usize / 5, 0)).unwrap();
+            pull(&mut mixed, rate as usize / 100);
+            let (replacement, mut replaced) = rodio::mixer::mixer(2, 48_000);
+            let prepared = PreparedStream::new(
+                replacement,
+                None,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                output.rate,
+                MixerFormat {
+                    rate: 48_000,
+                    channels: 2,
+                },
+            );
+            SegmentOutput::commit(&mut output, prepared);
+            SegmentOutput::append(&mut output, burst(7, next_rate as usize / 10, 0)).unwrap();
+            output.set_sample_rate(rate).unwrap();
+            SegmentOutput::append(&mut output, burst(8, rate as usize / 100, 0)).unwrap();
+            let heard = pull(&mut replaced, (5_280 + 8) * 2);
+            let frames = heard.iter().rposition(|sample| *sample != 0.0).unwrap() / 2 + 1;
+            assert!(frames.abs_diff(5_280) <= 3);
+            assert_eq!(
+                SegmentOutput::events(&mut output),
+                [
+                    OutputEvent::Started(7),
+                    OutputEvent::Finished {
+                        index: 7,
+                        delivered: next_rate as usize / 10
+                    },
+                    OutputEvent::Started(8),
+                    OutputEvent::Finished {
+                        index: 8,
+                        delivered: rate as usize / 100
+                    },
+                    OutputEvent::Underrun,
+                ]
+            );
+        }
     }
 
     #[test]
