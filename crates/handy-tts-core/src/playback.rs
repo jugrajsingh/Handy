@@ -596,17 +596,14 @@ pub mod segment {
             if !self.is_open && self.replay_at.is_some() {
                 self.open_default()?;
             }
-            self.flush_replay()?;
-            if self.replay_at.is_some() {
-                self.retained.push_back(segment);
-                return Ok(());
-            }
+            self.append_replay()?;
             if self.output.append(segment.clone()).is_err() {
                 self.collect_events();
                 self.begin_replay();
                 self.retained.push_back(segment);
+                self.replay_at = Some(0);
                 self.open_default()?;
-                self.flush_replay()?;
+                self.append_replay()?;
             } else {
                 self.retained.push_back(segment);
             }
@@ -696,6 +693,10 @@ pub mod segment {
             if self.is_paused {
                 return Ok(());
             }
+            self.append_replay()
+        }
+
+        fn append_replay(&mut self) -> Result<(), PlaybackError> {
             while let Some(index) = self.replay_at {
                 if let Some(segment) = self.retained.get(index) {
                     self.output.append(segment.clone())?;
@@ -1370,6 +1371,106 @@ pub mod segment {
                 })
                 .collect();
             assert_eq!(finished, [0, 1, 2]);
+        }
+
+        fn assert_delivered_once_in_order(
+            playback: &mut Playback<Fake>,
+            indexes: &[usize],
+            earlier_samples: u64,
+        ) {
+            let mut expected_samples = Vec::new();
+            let mut expected_events = Vec::new();
+            for &index in indexes {
+                let segment = chunk(index);
+                let scheduled = segment.samples();
+                expected_samples.extend(segment.speech);
+                expected_samples.resize(expected_samples.len() + segment.pause, 0.0);
+                expected_events.push(OutputEvent::Started(index));
+                expected_events.push(OutputEvent::Finished {
+                    index,
+                    delivered: scheduled,
+                });
+            }
+            assert_eq!(
+                playback.output.pull(expected_samples.len()),
+                expected_samples
+            );
+            assert_eq!(playback.events().unwrap(), expected_events);
+            assert_eq!(
+                playback.content_samples(),
+                earlier_samples + expected_samples.len() as u64
+            );
+            assert_eq!(playback.output.feed.underrun_samples(), 0);
+            assert!(playback.events().unwrap().is_empty());
+            assert_eq!(playback.current_index(), None);
+        }
+
+        #[test]
+        fn first_append_failure_replays_the_segment_on_default() {
+            for paused in [false, true] {
+                let mut playback = Playback::new(Fake::default(), None, None).unwrap();
+                if paused {
+                    playback.pause();
+                }
+                playback.output.fail_append = true;
+                assert_eq!(playback.append(chunk(0)), Ok(()));
+                assert_eq!(playback.output.appended, [0]);
+                assert_eq!(playback.output.opened, [None, None]);
+                assert_eq!(playback.output.paused, paused);
+                assert!(playback.take_fallback());
+                assert!(!playback.take_fallback());
+                assert_eq!(playback.append(chunk(1)), Ok(()));
+                assert_eq!(playback.output.appended, [0, 1]);
+                if paused {
+                    assert_eq!(playback.output.pull(132), vec![0.0; 132]);
+                    assert_eq!(playback.content_samples(), 0);
+                    assert!(playback.events().unwrap().is_empty());
+                    playback.resume();
+                }
+                assert_delivered_once_in_order(&mut playback, &[0, 1], 0);
+            }
+        }
+
+        #[test]
+        fn append_failure_after_drained_queue_replays_the_segment_on_default() {
+            for paused in [false, true] {
+                let mut playback = Playback::new(Fake::default(), None, None).unwrap();
+                playback.append(chunk(0)).unwrap();
+                assert_delivered_once_in_order(&mut playback, &[0], 0);
+                assert_eq!(playback.output.pull(32), vec![0.0; 32]);
+                assert_eq!(playback.events().unwrap(), [OutputEvent::Underrun]);
+                assert_eq!(playback.content_samples(), 132);
+                if paused {
+                    playback.pause();
+                }
+                playback.output.fail_append = true;
+                assert_eq!(playback.append(chunk(1)), Ok(()));
+                assert_eq!(playback.output.appended, [0, 1]);
+                assert_eq!(playback.output.opened, [None, None]);
+                assert_eq!(playback.output.paused, paused);
+                assert_eq!(playback.append(chunk(2)), Ok(()));
+                assert_eq!(playback.output.appended, [0, 1, 2]);
+                if paused {
+                    assert_eq!(playback.output.pull(132), vec![0.0; 132]);
+                    assert_eq!(playback.content_samples(), 132);
+                    assert!(playback.events().unwrap().is_empty());
+                    playback.resume();
+                }
+                assert_delivered_once_in_order(&mut playback, &[1, 2], 132);
+            }
+        }
+
+        #[test]
+        fn replacement_append_failure_returns_error_until_retained_segment_is_admitted() {
+            let mut playback = Playback::new(Fake::default(), None, None).unwrap();
+            playback.output.fail_index = Some(0);
+            playback.output.fail_append = true;
+            assert_eq!(playback.append(chunk(0)), Err(PlaybackError::Unavailable));
+            assert!(playback.output.appended.is_empty());
+            assert_eq!(playback.output.opened, [None, None]);
+            assert!(playback.events().unwrap().is_empty());
+            assert_eq!(playback.output.appended, [0]);
+            assert_delivered_once_in_order(&mut playback, &[0], 0);
         }
     }
 }
