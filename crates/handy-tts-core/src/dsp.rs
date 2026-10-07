@@ -10,16 +10,19 @@ pub enum DspError {
     #[error("stretch failed")]
     Stretch,
 }
-pub fn transform(
-    mut pcm: Pcm,
-    speed: f32,
-    pitch: f32,
-    native_speed: bool,
-) -> Result<Pcm, DspError> {
+pub fn transform(pcm: Pcm, speed: f32, pitch: f32, native_speed: bool) -> Result<Pcm, DspError> {
     if !(0.5..=2.0).contains(&speed)
         || !(-6.0..=6.0).contains(&pitch)
         || (speed * 10.0 - (speed * 10.0).round()).abs() > 0.0001
     {
+        return Err(DspError::Controls);
+    }
+    transform_ratio(pcm, if native_speed { 1.0 } else { speed }, pitch)
+}
+
+/// Applies an exact stretch ratio in the supported interval and pitch in one pass.
+pub fn transform_ratio(mut pcm: Pcm, stretch_ratio: f32, pitch: f32) -> Result<Pcm, DspError> {
+    if !(0.5..=2.0).contains(&stretch_ratio) || !(-6.0..=6.0).contains(&pitch) {
         return Err(DspError::Controls);
     }
     if pcm.samples.is_empty()
@@ -28,7 +31,7 @@ pub fn transform(
     {
         return Err(DspError::Pcm);
     }
-    let stretch_speed = if native_speed { 1.0 } else { speed };
+    let stretch_speed = stretch_ratio;
     if stretch_speed == 1.0 && pitch == 0.0 {
         return Ok(pcm);
     }
@@ -57,6 +60,36 @@ pub fn transform(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn exact_ratios_preserve_duration_and_identity_and_reject_invalid_controls() {
+        for ratio in [2.0 / 1.1, 1.5 / 1.3, 0.5, 2.0] {
+            let output = transform_ratio(pcm(), ratio, 0.0).unwrap();
+            assert_eq!(
+                output.samples.len(),
+                (24000.0 / f64::from(ratio)).round() as usize
+            );
+            assert!(output.samples.iter().all(|sample| sample.is_finite()));
+            assert!(output.samples.iter().any(|sample| sample.abs() > 0.01));
+        }
+        let input = pcm();
+        assert_eq!(
+            transform_ratio(input.clone(), 1.0, 0.0).unwrap().samples,
+            input.samples
+        );
+        for ratio in [0.49, 2.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(matches!(
+                transform_ratio(pcm(), ratio, 0.0),
+                Err(DspError::Controls)
+            ));
+        }
+        for pitch in [-6.01, 6.01, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                transform_ratio(pcm(), 1.0, pitch),
+                Err(DspError::Controls)
+            ));
+        }
+        assert!(transform(pcm(), 2.0 / 1.1, 0.0, false).is_err());
+    }
     fn pcm() -> Pcm {
         Pcm {
             id: 1,
