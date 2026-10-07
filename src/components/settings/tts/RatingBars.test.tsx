@@ -68,6 +68,9 @@ const cpu = row(html, "cpu");
 assert.ok(!cpu.includes('data-recommended="true"'));
 assert.ok(!render(true).includes('data-device="npu"'));
 assert.ok(!render(false, ["gpu"]).includes('data-device="gpu"'));
+const unavailableDevices = render(false, ["gpu"]);
+assert.ok(!unavailableDevices.includes('data-device="cpu"'));
+assert.ok(!unavailableDevices.includes('data-device="npu"'));
 const precise = row(
   render(false, ["cpu"], {
     ...rating,
