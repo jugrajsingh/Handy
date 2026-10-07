@@ -1,5 +1,5 @@
 use handy_tts_core::device::Device;
-use handy_tts_core::performance::{Timing, gate, replay};
+use handy_tts_core::performance::{Timing, gate, replay_with_lanes};
 use serde_json::Value;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
@@ -8,6 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .next()
         .ok_or("measured input word count required")?
         .parse()?;
+    let lanes: usize = args.next().map_or(Ok(1), |value| value.parse())?;
     let rows = std::fs::read_to_string(path)?;
     let mut timings = Vec::new();
     let mut rtfs = Vec::new();
@@ -30,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     rtfs.sort_by(f64::total_cmp);
     let median = *rtfs.get(rtfs.len() / 2).ok_or("no timings")?;
-    let result = replay(&timings, 2.0)?;
+    let result = replay_with_lanes(&timings, 2.0, lanes)?;
     let pass = gate(
         "pocket-en",
         Device::Cpu,

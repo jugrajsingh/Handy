@@ -1540,7 +1540,8 @@ for line in sys.stdin:
             }
             fn commit(&mut self, _: ()) {}
             fn play(&mut self, pcm: Pcm, _: u32) -> Result<(), PlaybackError> {
-                self.played.push(pcm.samples[0] as usize);
+                self.played
+                    .push(pcm.samples[pcm.samples.len() / 2] as usize);
                 self.finished = false;
                 Ok(())
             }
@@ -1611,7 +1612,13 @@ for line in sys.stdin:
         let mut now = 0.0;
         let mut draining = false;
         while session.queue.state != PlaybackState::Error && Instant::now() < deadline {
-            session.playback.output.finished = now % 4.0 == 0.0;
+            let hold_preceding = session.queue.failed_index.is_none()
+                && session
+                    .queue
+                    .playing
+                    .as_ref()
+                    .is_some_and(|audio| audio.ticket.index >= 748);
+            session.playback.output.finished = now % 4.0 == 0.0 && !hold_preceding;
             session.tick(now).unwrap();
             draining |= session.queue.failed_index.is_some() && session.queue.playing.is_some();
             assert!(session.queue.queued_seconds() <= 30.0);

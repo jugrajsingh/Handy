@@ -112,7 +112,8 @@ pub struct SessionSnapshot {
 }
 struct Parts {
     ticket: Ticket,
-    samples: VecDeque<Pcm>,
+    samples: VecDeque<(Pcm, Vec<f32>)>,
+    plan: crate::speed::SpeedPlan,
     elapsed_per_second: f64,
 }
 /// Owns incremental text, bounded audio scheduling and output playback.
@@ -264,7 +265,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
     }
     /// Drops audio and invalidates pending requests.
     pub fn stop(&mut self) {
-        if let Some(ticket) = self.queue.in_flight {
+        for ticket in self.queue.in_flight.values().copied() {
             self.worker.cancel(ticket);
         }
         self.playback.stop();
@@ -281,7 +282,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
     }
     /// Stops at the active sentence and rejects stale audio until retry.
     pub fn fail(&mut self, error: String) {
-        if let Some(ticket) = self.queue.in_flight {
+        for ticket in self.queue.in_flight.values().copied() {
             self.worker.cancel(ticket);
         }
         self.playback.stop();
@@ -308,7 +309,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             .prepare_cursor(selection.read_code, index, position)
             .map_err(|_| SelectionError::Controls)?;
         let new_index = pending.as_ref().map_or(index, |text| text.index);
-        let old_ticket = self.queue.in_flight;
+        let old_tickets = self.queue.in_flight.clone();
         let reload = self.selection.model_id != selection.model_id
             || self.selection.voice != selection.voice;
         let output_changed = self.selection.output_device != selection.output_device;
@@ -332,7 +333,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             Ok(())
         })?;
         self.playback.stop();
-        if let Some(ticket) = old_ticket {
+        for ticket in old_tickets.values().copied() {
             self.worker.cancel(ticket);
         }
         if reload {
@@ -342,7 +343,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         }
         self.selection = selection;
         self.queue.speed = self.selection.speed;
-        self.queue.next_index = new_index;
+        self.queue.set_cursor(new_index);
         if self.queue.failed_index.is_some() {
             self.queue.failed_index = Some(new_index);
         }
@@ -367,7 +368,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
     }
     fn received(&mut self, completion: Completion) {
         if completion.ticket.epoch != self.queue.epoch
-            || self.queue.in_flight != Some(completion.ticket)
+            || self.queue.in_flight.get(&completion.ticket.index) != Some(&completion.ticket)
         {
             return;
         }
@@ -379,11 +380,24 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 return;
             }
         };
+        let plan = match self.speed_plan() {
+            Ok(plan) => plan,
+            Err(control_error) => {
+                self.error = Some(control_error);
+                self.queue.complete(completion.ticket, Err(()));
+                return;
+            }
+        };
         let began = (self.dsp_clock)();
-        let pcm = match self.speed_plan().and_then(|plan| {
-            dsp::stretch(pcm, plan.stretch, self.selection.pitch)
-                .map_err(|_| "tts.errors.audio".to_string())
-        }) {
+        let native = crate::edges::trim(pcm.samples, pcm.sample_rate).samples;
+        let pcm = match dsp::stretch(
+            Pcm {
+                samples: native.clone(),
+                ..pcm
+            },
+            plan.stretch,
+            self.selection.pitch,
+        ) {
             Ok(pcm) => pcm,
             Err(_) => {
                 self.error = Some("tts.errors.audio".into());
@@ -393,23 +407,49 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         };
         let elapsed = completion.synthesis_seconds + ((self.dsp_clock)() - began).max(0.0);
         let seconds = pcm.samples.len() as f64 / f64::from(pcm.sample_rate);
-        let limit = (QUEUED_AUDIO_CEILING * f64::from(pcm.sample_rate)) as usize;
+        let pause_seconds = self
+            .metadata
+            .get(&completion.ticket.index)
+            .map_or(0.0, |text| {
+                crate::edges::pause_samples(text.pause_ms, plan.requested, pcm.sample_rate) as f64
+                    / f64::from(pcm.sample_rate)
+            });
+        let part_seconds = (QUEUED_AUDIO_CEILING - pause_seconds)
+            .min(crate::scheduler::STORED_SECONDS_CEILING / (1.0 + f64::from(plan.stretch)));
+        let limit = (part_seconds * f64::from(pcm.sample_rate)).floor() as usize;
+        let output_len = pcm.samples.len();
         let mut data = pcm.samples.into_iter();
+        let mut native_data = native.into_iter();
+        let native_len = native_data.len();
+        let mut consumed = 0;
+        let mut native_consumed = 0;
         let mut samples = VecDeque::new();
         loop {
-            let next: Vec<f32> = data.by_ref().take(limit).collect();
+            let next: Vec<f32> = data.by_ref().take(limit.max(1)).collect();
             if next.is_empty() {
                 break;
             }
-            samples.push_back(Pcm {
-                id: pcm.id,
-                sample_rate: pcm.sample_rate,
-                samples: next,
-            });
+            consumed += next.len();
+            let native_end =
+                (consumed as f64 * native_len as f64 / output_len as f64).round() as usize;
+            let native_part = native_data
+                .by_ref()
+                .take(native_end - native_consumed)
+                .collect();
+            native_consumed = native_end;
+            samples.push_back((
+                Pcm {
+                    id: pcm.id,
+                    sample_rate: pcm.sample_rate,
+                    samples: next,
+                },
+                native_part,
+            ));
         }
         self.parts = Some(Parts {
             ticket: completion.ticket,
             samples,
+            plan,
             elapsed_per_second: elapsed / seconds,
         });
     }
@@ -417,7 +457,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         let Some(mut parts) = self.parts.take() else {
             return;
         };
-        while let Some(pcm) = parts.samples.pop_front() {
+        while let Some((pcm, native)) = parts.samples.pop_front() {
             let seconds = pcm.samples.len() as f64 / f64::from(pcm.sample_rate);
             let Some(text) = self.metadata.get(&parts.ticket.index) else {
                 self.error = Some("tts.errors.text".into());
@@ -426,6 +466,8 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             };
             let last = parts.samples.is_empty();
             let audio = AudioChunk {
+                native,
+                plan: parts.plan,
                 pause_ms: if last { text.pause_ms } else { 0 },
                 ticket: parts.ticket,
                 pcm,
@@ -438,7 +480,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 seconds * parts.elapsed_per_second,
                 last,
             ) {
-                parts.samples.push_front(audio.pcm);
+                parts.samples.push_front((audio.pcm, audio.native));
                 self.parts = Some(parts);
                 return;
             }
@@ -450,6 +492,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             return Err("tts.errors.clock".into());
         }
         self.now = now;
+        self.queue.advance_at(now);
         if self.queue.state == PlaybackState::Playing && self.output_ticket.is_some() {
             match self
                 .playback
@@ -471,7 +514,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             self.received(completion);
         }
         self.admit_parts();
-        if self.queue.in_flight.is_none()
+        if self.queue.in_flight.is_empty()
             && self.parts.is_none()
             && matches!(
                 self.queue.state,
@@ -501,7 +544,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                     }
                 }
                 None => {
-                    self.queue.in_flight = None;
+                    self.queue.in_flight.remove(&ticket.index);
                     self.queue.source_finished = true;
                     self.queue.advance();
                 }
@@ -528,7 +571,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             .as_ref()
             .map(|c| c.ticket.index)
             .or_else(|| self.queue.waiting.front().map(|c| c.ticket.index))
-            .or_else(|| self.queue.in_flight.map(|t| t.index))
+            .or_else(|| self.queue.in_flight.keys().next().copied())
             .or(self.queue.failed_index)
             .unwrap_or(self.queue.next_index);
         self.metadata.retain(|index, _| *index >= min);
@@ -943,7 +986,7 @@ mod tests {
             let old_selection = s.selection.clone();
             let old_deadline = s.playback.output.deadline;
             let old_ticket = s.queue.playing.as_ref().unwrap().ticket;
-            let old_pending = s.queue.in_flight;
+            let old_pending = s.queue.in_flight.clone();
             let old_waiting: Vec<_> = s.queue.waiting.iter().map(|c| c.ticket).collect();
             let prepared = s.playback.output.prepared.clone();
             let commits = s.playback.output.commits.clone();
@@ -1040,7 +1083,7 @@ mod tests {
             let epoch = s.queue.epoch;
             let ticket = s.queue.playing.as_ref().unwrap().ticket;
             let waiting: Vec<_> = s.queue.waiting.iter().map(|c| c.ticket).collect();
-            let in_flight = s.queue.in_flight;
+            let in_flight = s.queue.in_flight.clone();
             let old_output = (
                 s.playback.output.deadline,
                 s.playback.output.paused,
@@ -1097,7 +1140,8 @@ mod tests {
         step(&mut s, 0.0);
         step(&mut s, 0.2);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert!((s.queue.measured_rtf - 0.7).abs() < 1e-12);
+        let played_seconds = s.queue.playing.as_ref().unwrap().seconds();
+        assert!((s.queue.rtf_played - 0.35 / played_seconds).abs() < 1e-12);
     }
     #[test]
     fn fix2_paused_selection_plays_all_waiting_sentences_before_failure() {
@@ -1110,7 +1154,7 @@ mod tests {
         for _ in 0..200 {
             step(&mut s, now);
             now += 0.1;
-            if s.queue.in_flight.is_some_and(|t| t.index == 2) {
+            if s.queue.in_flight.contains_key(&2) {
                 break;
             }
         }
@@ -1243,7 +1287,7 @@ mod tests {
         step(&mut s, 0.0);
         s.metadata.clear();
         step(&mut s, 0.2);
-        assert!(s.queue.in_flight.is_none());
+        assert!(s.queue.in_flight.is_empty());
         assert_eq!(s.queue.state, PlaybackState::Error);
         assert!(s.snapshot().error.is_some());
     }
@@ -1311,14 +1355,14 @@ mod tests {
             step(&mut s, f64::from(i) * 0.1);
         }
         let current = s.queue.playing.as_ref().unwrap().ticket;
-        let old = s.queue.in_flight;
+        let old = s.queue.in_flight.clone();
         s.fail("tts.errors.audio".into());
         assert_eq!(s.queue.failed_index, Some(current.index));
         assert!(s.queue.playing.is_none());
         assert!(s.parts.is_none());
         assert!(s.output_ticket.is_none());
-        if let Some(ticket) = old {
-            assert!(s.worker.cancelled.contains(&ticket));
+        for ticket in old.values() {
+            assert!(s.worker.cancelled.contains(ticket));
         }
         s.play().unwrap();
         step(&mut s, 2.0);
@@ -1654,12 +1698,12 @@ mod tests {
             step(&mut s, i as f64 * 0.1);
         }
         let current = s.queue.playing.as_ref().unwrap().ticket.index;
-        let old = s.queue.in_flight;
+        let old = s.queue.in_flight.clone();
         let mut chosen = selection();
         chosen.voice = "M1".into();
         let changed = s.select(chosen.clone(), true, |_| Ok(())).unwrap();
         assert_eq!(changed.sentence_index, current);
-        if let Some(ticket) = old {
+        for ticket in old.values().copied() {
             s.received(Completion {
                 ticket,
                 result: Ok(Pcm {
@@ -1693,8 +1737,8 @@ mod tests {
         step(&mut s, 0.2);
         assert!(s.queue.playing.as_ref().unwrap().seconds() <= 30.0);
         assert!(s.parts.is_some());
-        assert!(s.queue.in_flight.is_some());
-        let old = s.queue.in_flight.unwrap();
+        assert!(!s.queue.in_flight.is_empty());
+        let old = *s.queue.in_flight.values().next().unwrap();
         s.stop();
         s.received(Completion {
             ticket: old,

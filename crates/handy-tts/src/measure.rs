@@ -24,7 +24,7 @@ fn first_audio_latency(
             .request_next()
             .context("first audio scheduler stalled")?;
         let Some(chunk) = cursor.next_chunk()? else {
-            queue.in_flight = None;
+            queue.in_flight.remove(&ticket.index);
             queue.source_finished = true;
             queue.advance();
             ensure!(
@@ -39,9 +39,19 @@ fn first_audio_latency(
             !pcm.samples.is_empty() && pcm.samples.iter().all(|v| v.is_finite()),
             "measurement returned invalid audio"
         );
+        let pcm = Pcm {
+            samples: handy_tts_core::edges::trim(pcm.samples, pcm.sample_rate).samples,
+            ..pcm
+        };
         let deferred = queue.complete_timed(
             ticket,
             Ok(AudioChunk {
+                native: pcm.samples.clone(),
+                plan: handy_tts_core::speed::SpeedPlan {
+                    requested: 1.0,
+                    native: 1.0,
+                    stretch: 1.0,
+                },
                 ticket,
                 pcm,
                 source_start: chunk.source_start,
@@ -325,7 +335,7 @@ The final sentence takes a very long time to synthesize.";
 
         #[test]
         fn short_first_chunk_waits_for_the_adaptive_scheduler_target() {
-            let (seconds, calls) = measure(DOCUMENT, 800, 0.2);
+            let (seconds, calls) = measure(DOCUMENT.trim_start_matches("# "), 80, 0.2);
             assert!((seconds - 0.3).abs() < 1e-9);
             assert_eq!(calls.len(), 2);
         }

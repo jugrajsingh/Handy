@@ -69,6 +69,12 @@ mod tests {
         queue.next_index = 4;
         queue.playing = Some(AudioChunk {
             pause_ms: 0,
+            native: vec![0.0; 8000],
+            plan: crate::speed::SpeedPlan {
+                requested: 1.0,
+                native: 1.0,
+                stretch: 1.0,
+            },
             ticket: Ticket { epoch: 0, index: 2 },
             pcm: Pcm {
                 id: 1,

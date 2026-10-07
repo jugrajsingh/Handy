@@ -67,6 +67,12 @@ mod tests {
             q.epoch = 4;
             q.playing = Some(AudioChunk {
                 pause_ms: 0,
+                native: vec![0.0; 24000],
+                plan: crate::speed::SpeedPlan {
+                    requested: 1.0,
+                    native: 1.0,
+                    stretch: 1.0,
+                },
                 ticket: Ticket { epoch: 4, index: 7 },
                 pcm: Pcm {
                     id: 7,

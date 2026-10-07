@@ -31,6 +31,17 @@ pub enum PerformanceError {
 }
 /// Replays measured chunk timings through the production queue.
 pub fn replay(timings: &[Timing], speed: f32) -> Result<Replay, PerformanceError> {
+    replay_with_lanes(timings, speed, 1)
+}
+/// Replays concurrent synthesis completions through the production queue.
+pub fn replay_with_lanes(
+    timings: &[Timing],
+    speed: f32,
+    lanes: usize,
+) -> Result<Replay, PerformanceError> {
+    if !(1..=3).contains(&lanes) {
+        return Err(PerformanceError::Invalid);
+    }
     if timings.is_empty()
         || !(0.5..=2.0).contains(&speed)
         || timings.iter().any(|t| {
@@ -45,79 +56,96 @@ pub fn replay(timings: &[Timing], speed: f32) -> Result<Replay, PerformanceError
         return Err(PerformanceError::Invalid);
     }
     let mut queue = Queue::with_speed(speed);
+    queue.set_lanes(lanes);
     queue.play();
     let mut now = 0.0;
-    let mut generation: Option<(Ticket, f64)> = None;
+    let mut generation = std::collections::BTreeMap::<usize, (Ticket, f64)>::new();
     let mut playback: Option<(Ticket, f64)> = None;
     let mut first_start = None;
-    let mut buffering_started = None;
-    let mut buffering_seconds = 0.0;
     let mut queue_peak = 0.0f64;
-    let mut pending = None;
+    let mut pending = std::collections::BTreeMap::new();
     loop {
-        if let Some((ticket, audio, elapsed)) = pending.take()
-            && let Some(audio) = queue.complete_timed(ticket, Ok(audio), elapsed)
-        {
-            pending = Some((ticket, audio, elapsed));
-        }
-        if generation.is_none() && pending.is_none() {
-            if queue.next_index == timings.len() {
-                queue.source_finished = true;
-                queue.advance();
-            } else if let Some(ticket) = queue.request_next() {
-                generation = Some((ticket, now + timings[ticket.index].synthesis_seconds));
+        queue.advance_at(now);
+        for index in pending.keys().copied().collect::<Vec<_>>() {
+            if let Some((ticket, audio, elapsed)) = pending.remove(&index)
+                && let Some(audio) = queue.complete_timed(ticket, Ok(audio), elapsed)
+            {
+                pending.insert(index, (ticket, audio, elapsed));
             }
+        }
+        while queue.next_index < timings.len() {
+            let Some(ticket) = queue.request_next() else {
+                break;
+            };
+            generation.insert(
+                ticket.index,
+                (ticket, now + timings[ticket.index].synthesis_seconds),
+            );
+        }
+        if queue.next_index == timings.len() {
+            queue.source_finished = true;
+            queue.advance();
         }
         if let Some(audio) = &queue.playing
             && playback.is_none()
         {
             playback = Some((audio.ticket, now + audio.seconds()));
             first_start.get_or_insert(now);
-            if let Some(start) = buffering_started.take() {
-                buffering_seconds += now - start;
-            }
         }
         queue_peak = queue_peak.max(queue.queued_seconds());
         if queue.state == PlaybackState::Finished {
             break;
         }
-        let next = match (generation, playback) {
-            (Some((_, a)), Some((_, b))) => a.min(b),
-            (Some((_, a)), None) | (None, Some((_, a))) => a,
-            (None, None) => return Err(PerformanceError::Stalled),
-        };
-        now = next;
-        if playback.is_some_and(|(_, end)| end <= now + 1e-9) {
-            playback = None;
-            queue.playback_finished();
-            if queue.state == PlaybackState::Buffering {
-                buffering_started = Some(now);
-            }
+        if queue.state == PlaybackState::Error {
+            return Err(PerformanceError::Invalid);
         }
-        if let Some((ticket, end)) = generation
-            && end <= now + 1e-9
-        {
-            generation = None;
+        let next = generation
+            .values()
+            .map(|(_, end)| *end)
+            .chain(playback.iter().map(|(_, end)| *end))
+            .min_by(f64::total_cmp)
+            .ok_or(PerformanceError::Stalled)?;
+        now = next;
+        queue.advance_at(now);
+        let completed: Vec<_> = generation
+            .iter()
+            .filter(|(_, (_, end))| *end <= now + 1e-9)
+            .map(|(index, _)| *index)
+            .collect();
+        for index in completed {
+            let Some((ticket, _)) = generation.remove(&index) else {
+                continue;
+            };
             let Timing {
                 synthesis_seconds: elapsed,
-                audio_seconds: _,
                 samples,
                 sample_rate,
-            } = timings[ticket.index];
+                ..
+            } = timings[index];
             let audio = AudioChunk {
                 pause_ms: 0,
                 ticket,
                 pcm: Pcm {
-                    id: ticket.index as u64,
+                    id: index as u64,
                     sample_rate,
                     samples: vec![0.0; samples],
                 },
-                source_start: ticket.index as u32,
-                source_end: ticket.index as u32 + 1,
+                native: vec![0.0; (samples as f64 * f64::from(speed)).round() as usize],
+                plan: crate::speed::SpeedPlan {
+                    requested: speed,
+                    native: 1.0,
+                    stretch: speed,
+                },
+                source_start: index as u32,
+                source_end: index as u32 + 1,
             };
             if let Some(audio) = queue.complete_timed(ticket, Ok(audio), elapsed) {
-                pending = Some((ticket, audio, elapsed));
+                pending.insert(index, (ticket, audio, elapsed));
             }
+        }
+        if playback.is_some_and(|(_, end)| end <= now + 1e-9) {
+            playback = None;
+            queue.playback_finished();
         }
     }
     Ok(Replay {
@@ -125,7 +153,7 @@ pub fn replay(timings: &[Timing], speed: f32) -> Result<Replay, PerformanceError
         speed,
         head_start_wait_seconds: first_start.unwrap_or(0.0),
         buffering_pauses: queue.buffering_pauses,
-        buffering_seconds,
+        buffering_seconds: queue.buffering_seconds,
         queued_audio_high_water_seconds: queue_peak,
         wall_seconds: now,
     })
@@ -163,6 +191,24 @@ mod tests {
             assert!(!gate(model, Device::Cpu, Device::Npu, 0.1, 0, 0));
             assert!(!gate(model, Device::Npu, Device::Npu, 0.331, 0, 0));
         }
+    }
+    #[test]
+    fn parallel_replay_waits_for_the_prefix_and_delivers_every_chunk() {
+        let timings: Vec<_> = [3.0, 0.1, 0.2]
+            .into_iter()
+            .map(|synthesis_seconds| Timing {
+                synthesis_seconds,
+                audio_seconds: 1.0,
+                samples: 8000,
+                sample_rate: 8000,
+            })
+            .collect();
+        let result = replay_with_lanes(&timings, 2.0, 3).unwrap();
+        assert_eq!(result.chunks, 3);
+        assert_eq!(result.head_start_wait_seconds, 3.0);
+        assert_eq!(result.wall_seconds, 6.0);
+        assert_eq!(result.buffering_pauses, 0);
+        assert_eq!(result.buffering_seconds, 0.0);
     }
     #[test]
     fn measured_timings_replay_adaptive_scheduler_and_slow_producer_refuses_continuity() {
