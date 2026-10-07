@@ -346,3 +346,73 @@ if (!process.argv[2] || process.argv[2] === "repeated")
 if (!process.argv[2] || process.argv[2] === "draft")
   await draftAcknowledgements();
 if (!process.argv[2] || process.argv[2] === "ordering") await editBeforePlay();
+
+// Window and field handlers share the adapter actions and consume each key once.
+{
+  const { routePopupKey } = await import("./actions");
+  const view: PopupView = {
+    ...initial,
+    epoch: 0,
+    state: "playing",
+    text: "Copied text",
+  };
+  const calls: string[] = [];
+  const adapter = createPopupAdapter(
+    () => view,
+    () => {},
+    {
+      play: async () => {
+        calls.push("play");
+      },
+      pause: async () => {
+        calls.push("pause");
+      },
+      stop: async () => {},
+      replaceText: async () => {},
+      close: async () => {
+        calls.push("close");
+      },
+      error: () => {},
+    },
+  );
+  const key = (name: string, ctrlKey = false) => ({
+    key: name,
+    ctrlKey,
+    defaultPrevented: false,
+    preventDefault() {
+      this.defaultPrevented = true;
+    },
+  });
+  const enter = key("Enter", true);
+  routePopupKey(enter, adapter);
+  routePopupKey(enter, adapter);
+  await Promise.resolve();
+  assert.deepEqual(
+    calls,
+    ["pause"],
+    "Ctrl+Enter from the window pauses once without a field click",
+  );
+  routePopupKey(key("Enter"), adapter);
+  assert.deepEqual(calls, ["pause"], "plain Enter remains an editing key");
+  const escape = key("Escape");
+  routePopupKey(escape, adapter);
+  routePopupKey(escape, adapter);
+  await Promise.resolve();
+  assert.deepEqual(
+    calls,
+    ["pause", "close"],
+    "window Escape closes once without a field click",
+  );
+  assert.equal(escape.defaultPrevented, true);
+  adapter.event({
+    snapshot: view,
+    text: view.text,
+    client_revision: null,
+    visible: true,
+    document_id: 1,
+  });
+  routePopupKey(key("Escape"), adapter);
+  await Promise.resolve();
+  assert.deepEqual(calls, ["pause", "close", "close"], "keys work on reopen");
+  console.log("popup window key routing assertions passed");
+}

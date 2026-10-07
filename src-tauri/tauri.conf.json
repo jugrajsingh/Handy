@@ -70,7 +70,8 @@
         "recommends": [
           "intel-compute-runtime",
           "intel-level-zero",
-          "oneapi-level-zero"
+          "oneapi-level-zero",
+          "wl-clipboard"
         ]
       },
       "appimage": {

@@ -560,14 +560,26 @@ where
     }
 }
 
+pub(crate) fn start_after_read_aloud(
+    stop: impl FnOnce() -> Result<(), crate::tts::TtsError>,
+    record: impl FnOnce() -> bool,
+) -> bool {
+    if let Err(error) = stop() {
+        log::warn!("Read-aloud stop failed during dictation: {error}");
+    }
+    record()
+}
 impl TranscribeAction {
     fn start_recording(&self, app: &AppHandle, binding_id: &str) -> bool {
-        if let Some(service) = app.try_state::<Arc<crate::tts::service::TtsService>>() {
-            if let Err(error) = service.dictation_start(binding_id) {
-                log::error!("Read-aloud stop acknowledgment failed: {error}");
-                return false;
-            }
-        }
+        start_after_read_aloud(
+            || {
+                app.try_state::<Arc<crate::tts::service::TtsService>>()
+                    .map_or(Ok(()), |service| service.dictation_start(binding_id))
+            },
+            || self.start_recording_after_read_aloud(app, binding_id),
+        )
+    }
+    fn start_recording_after_read_aloud(&self, app: &AppHandle, binding_id: &str) -> bool {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 

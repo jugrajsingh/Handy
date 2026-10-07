@@ -76,8 +76,19 @@ pub struct WorkerBackend {
     control: WorkerControl,
     replies: Option<mpsc::Receiver<Result<Reply, TtsError>>>,
     abandoned: std::collections::BTreeSet<u64>,
+    #[cfg(test)]
+    synthesis_timeout: Option<Duration>,
 }
 impl WorkerBackend {
+    #[cfg(test)]
+    pub(super) fn with_synthesis_timeout(timeout: Duration) -> Self {
+        Self {
+            control: WorkerControl::default(),
+            replies: None,
+            abandoned: std::collections::BTreeSet::new(),
+            synthesis_timeout: Some(timeout),
+        }
+    }
     pub fn control(&self) -> WorkerControl {
         self.control.clone()
     }
@@ -232,7 +243,11 @@ impl WorkerBackend {
             .map_err(|_| TtsError::Worker)?
     }
     pub fn synthesize(&mut self, id: u64, text: &str, speed: Option<f32>) -> Result<Pcm, TtsError> {
-        self.synthesize_with_timeout(id, text, speed, Duration::from_secs(60))
+        #[cfg(test)]
+        let timeout = self.synthesis_timeout.unwrap_or(Duration::from_secs(60));
+        #[cfg(not(test))]
+        let timeout = Duration::from_secs(60);
+        self.synthesize_with_timeout(id, text, speed, timeout)
     }
     fn synthesize_with_timeout(
         &mut self,
@@ -259,8 +274,7 @@ impl WorkerBackend {
             let reply = match result {
                 Ok(reply) => reply,
                 Err(error) => {
-                    self.abandoned.insert(id);
-                    self.control.cancel(id);
+                    self.stop();
                     return Err(error);
                 }
             };
@@ -347,7 +361,7 @@ impl Transport for WorkerBackend {
 mod tests {
     use super::*;
     #[test]
-    fn timed_out_reply_is_drained_before_retry_and_worker_stays_alive() {
+    fn cancelled_reply_is_drained_before_retry_and_worker_stays_alive() {
         use handy_tts_core::device::Device;
         use std::io::{Read, Write};
         use std::os::unix::{fs::PermissionsExt, net::UnixListener};
@@ -391,8 +405,15 @@ for line in sys.stdin:
             })
             .unwrap();
         let child = backend.control.child.lock().unwrap().as_ref().unwrap().id();
-        let timeout = backend.synthesize_with_timeout(1, "A", None, Duration::from_millis(50));
-        assert!(matches!(timeout, Err(TtsError::Worker)));
+        backend
+            .send(&Request::Synthesize {
+                id: 1,
+                text: "A".into(),
+                speed: None,
+            })
+            .unwrap();
+        backend.abandoned.insert(1);
+        backend.control.cancel(1);
         let (mut gate, _) = listener.accept().unwrap();
         gate.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut signal = [0];

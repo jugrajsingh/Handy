@@ -5,6 +5,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useTranslation } from "react-i18next";
 import { commands, type SessionSnapshot, type Result } from "@/bindings";
 import { createPopupAdapter, type PopupEvent } from "./adapter";
+import { routePopupKey } from "./actions";
 import { ReadAloudPopup } from "./ReadAloudPopup";
 import "@/i18n";
 import "@/App.css";
@@ -62,6 +63,11 @@ function PopupApp() {
       ),
     [],
   );
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => routePopupKey(event, actions);
+    window.addEventListener("keydown", keydown);
+    return () => window.removeEventListener("keydown", keydown);
+  }, [actions]);
   useEffect(() => {
     void getCurrentWindow().setTitle(t("tts.title"));
   }, [t]);

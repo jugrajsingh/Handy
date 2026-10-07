@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import type { SessionSnapshot } from "@/bindings";
+import { routePopupKey } from "./actions";
 import { highlightedText, progressPresentation } from "./presentation";
 export interface PopupProps {
   text: string;
@@ -38,16 +39,7 @@ export function ReadAloudPopup({
     <section
       className="h-screen rounded-xl bg-background p-3 text-text"
       aria-label={t("tts.title")}
-      onKeyDown={(event) => {
-        if (event.key === "Escape") {
-          event.preventDefault();
-          close();
-        }
-        if (event.key === "Enter" && event.ctrlKey) {
-          event.preventDefault();
-          toggle();
-        }
-      }}
+      onKeyDown={(event) => routePopupKey(event, { close, toggle })}
     >
       <textarea
         aria-label={t("tts.textLabel")}

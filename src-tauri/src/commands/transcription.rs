@@ -5,7 +5,7 @@ use crate::settings::{get_settings, write_settings, ModelUnloadTimeout};
 use serde::Serialize;
 use specta::Type;
 use std::sync::Arc;
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 #[derive(Serialize, Type)]
 pub struct ModelLoadStatus {
@@ -19,6 +19,9 @@ pub fn set_model_unload_timeout(app: AppHandle, timeout: ModelUnloadTimeout) {
     let mut settings = get_settings(&app);
     settings.model_unload_timeout = timeout;
     write_settings(&app, settings);
+    if let Some(manager) = app.try_state::<std::sync::Arc<crate::tts::TtsManager>>() {
+        manager.wake_idle();
+    }
 }
 
 /// The language transcription on `model_id` will use, for the picker.

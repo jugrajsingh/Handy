@@ -176,14 +176,16 @@ pub fn set_selection(
     settings.tts_output_device = chosen.output_device.clone();
     settings.tts_read_code_blocks = chosen.read_code;
     let app = app.clone();
-    ready.session.select_and_wait(
+    let result = ready.session.select_and_wait(
         chosen,
         download::is_downloaded(&ready.root, entry),
         Box::new(move |_| {
             crate::settings::write_settings_checked(&app, settings)
                 .map_err(|_| handy_tts_core::selection::SelectionError::Persist)
         }),
-    )
+    );
+    service.refresh_tray();
+    result
 }
 #[tauri::command]
 #[specta::specta]
@@ -283,6 +285,7 @@ pub async fn download_tts_model(
             })
             .map(|_| ())
             .map_err(|e| e.to_string());
+        service.refresh_tray();
         if result.is_ok() {
             super::preparation::prepare(
                 &ready,
@@ -335,7 +338,9 @@ pub async fn delete_tts_model(
             ready.manager.selected();
         }
         let entry = catalog::entry(&model_id).map_err(|e| e.to_string())?;
-        download::delete(&ready.root, entry).map_err(|e| e.to_string())
+        let result = download::delete(&ready.root, entry).map_err(|e| e.to_string());
+        service.refresh_tray();
+        result
     })
     .await
 }

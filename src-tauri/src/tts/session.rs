@@ -88,6 +88,9 @@ impl Worker for ManagerWorker {
     fn selection_changed(&mut self) {
         self.manager.selected();
     }
+    fn retry_failed_selection(&mut self) {
+        self.manager.retry_failed_selection();
+    }
 }
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 pub struct SessionView {
@@ -149,6 +152,15 @@ fn apply_selection<W: Worker, O: handy_tts_core::playback::Output>(
     let success = result.is_ok();
     let _ = done.send(result.map(|_| ()).map_err(|error| error.to_string()));
     success
+}
+fn reading_active(state: PlaybackState) -> bool {
+    matches!(
+        state,
+        PlaybackState::Playing
+            | PlaybackState::Paused
+            | PlaybackState::Buffering
+            | PlaybackState::Starting
+    )
 }
 pub struct ReadAloudSession {
     tx: mpsc::SyncSender<SessionCommand>,
@@ -251,7 +263,13 @@ impl ReadAloudSession {
                 }
                 let mut text_sent = false;
                 loop {
-                    let message = rx.recv_timeout(Duration::from_millis(20));
+                    let message = if !visible && !reading_active(session.queue.state) {
+                        rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                    } else {
+                        rx.recv_timeout(Duration::from_millis(20))
+                    };
+                    let commanded = message.is_ok();
+                    let was_visible = visible;
                     match message {
                         Ok(SessionCommand::PauseAcknowledged(done)) => {
                             session.pause();
@@ -322,16 +340,11 @@ impl ReadAloudSession {
                     {
                         snapshot.state = PlaybackState::Starting;
                     }
-                    working.store(
-                        matches!(
-                            snapshot.state,
-                            PlaybackState::Playing
-                                | PlaybackState::Paused
-                                | PlaybackState::Buffering
-                                | PlaybackState::Starting
-                        ),
-                        Ordering::Release,
-                    );
+                    if working.swap(reading_active(snapshot.state), Ordering::AcqRel)
+                        != reading_active(snapshot.state)
+                    {
+                        status_manager.wake_idle();
+                    }
                     let mut current = cached.lock().unwrap_or_else(|p| p.into_inner());
                     if current.text != source {
                         current.text = source.clone();
@@ -340,7 +353,9 @@ impl ReadAloudSession {
                     current.client_revision = client_revision;
                     current.document_id = document_id;
                     current.snapshot = snapshot;
-                    if last_emit.elapsed() >= Duration::from_millis(200) {
+                    if (visible || was_visible)
+                        && (commanded || last_emit.elapsed() >= Duration::from_millis(200))
+                    {
                         emit(current.event(if text_sent {
                             None
                         } else {
@@ -591,6 +606,166 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("session did not reach {state:?}");
+    }
+    #[test]
+    fn blocked_stop_acknowledgement_still_starts_recording() {
+        let reading = actor(Arc::new(Mutex::new(SharedAudio::default())));
+        let (entered, wait_entered) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel();
+        let (done, selected) = mpsc::channel();
+        reading
+            .send(SessionCommand::Select {
+                selection: selection(),
+                downloaded: true,
+                persist: Box::new(move |_| {
+                    entered.send(()).unwrap();
+                    wait_release.recv().unwrap();
+                    Ok(())
+                }),
+                done,
+            })
+            .unwrap();
+        wait_entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let began = Instant::now();
+        let mut started = false;
+        let mut handed_off = false;
+        let result = crate::actions::start_after_read_aloud(
+            || {
+                super::super::service::dictation_start_with(
+                    || Ok(()),
+                    || reading.stop_and_wait(),
+                    || handed_off = true,
+                )
+            },
+            || {
+                started = true;
+                true
+            },
+        );
+        release.send(()).unwrap();
+        selected
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert!(reading.shutdown());
+        assert!(began.elapsed() >= Duration::from_millis(500));
+        assert!(
+            result && started && handed_off,
+            "a blocked TTS stop must still hand off and start recording"
+        );
+    }
+    #[test]
+    fn failed_preview_cancellation_still_starts_recording_and_interrupts_reading() {
+        let reading = actor(Arc::new(Mutex::new(SharedAudio::default())));
+        let coordinator = handy_tts_core::preview::PreviewCoordinator::default();
+        let cancelled = coordinator
+            .begin(
+                reading.as_ref(),
+                Arc::new(|| Err("preview did not stop".into())),
+            )
+            .unwrap();
+        let mut stopped = false;
+        let mut handed_off = false;
+        let mut started = false;
+        let result = crate::actions::start_after_read_aloud(
+            || {
+                super::super::service::dictation_start_with(
+                    || coordinator.cancel(),
+                    || {
+                        stopped = true;
+                        reading.stop_and_wait()
+                    },
+                    || handed_off = true,
+                )
+            },
+            || {
+                started = true;
+                true
+            },
+        );
+        assert!(cancelled.load(Ordering::Acquire));
+        assert!(
+            result && stopped && handed_off && started,
+            "preview failure cannot veto dictation or skip the reading interrupt"
+        );
+        assert!(
+            crate::actions::start_after_read_aloud(|| Err(TtsError::Worker), || true),
+            "recording must also ignore a service error"
+        );
+        assert!(reading.shutdown());
+    }
+    #[test]
+    fn hidden_idle_session_neither_polls_nor_emits_and_resumes_on_open_and_play() {
+        #[derive(Clone)]
+        struct CountingEngine(Arc<std::sync::atomic::AtomicUsize>);
+        impl Worker for CountingEngine {
+            fn request(&mut self, _: Ticket, _: &str, _: &Selection) -> Result<(), String> {
+                Ok(())
+            }
+            fn poll(&mut self) -> Option<Completion> {
+                self.0.fetch_add(1, Ordering::AcqRel);
+                None
+            }
+            fn cancel(&mut self, _: Ticket) {}
+            fn selection_changed(&mut self) {}
+        }
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (emitted, events) = mpsc::channel();
+        let reading = ReadAloudSession::spawn_with(
+            manager(),
+            CountingEngine(polls.clone()),
+            Audio::default,
+            selection(),
+            None,
+            Arc::new(move |event| {
+                emitted.send(event).unwrap();
+            }),
+        );
+        assert!(
+            events.recv_timeout(Duration::from_millis(650)).is_err(),
+            "hidden idle session must not emit"
+        );
+        assert_eq!(
+            polls.load(Ordering::Acquire),
+            0,
+            "hidden idle session must not poll"
+        );
+        reading.stop_and_wait().unwrap();
+        assert!(
+            events.recv_timeout(Duration::from_millis(250)).is_err(),
+            "a hidden idle command must not emit state"
+        );
+        reading
+            .send(SessionCommand::Replace {
+                text: "Open again".into(),
+                autoplay: false,
+                client_revision: None,
+            })
+            .unwrap();
+        assert!(events.recv_timeout(Duration::from_secs(2)).unwrap().visible);
+        reading.send(SessionCommand::Close).unwrap();
+        loop {
+            if !events.recv_timeout(Duration::from_secs(2)).unwrap().visible {
+                break;
+            }
+        }
+        let stopped = polls.load(Ordering::Acquire);
+        assert!(
+            events.recv_timeout(Duration::from_millis(650)).is_err(),
+            "closed idle session must stop emitting"
+        );
+        assert_eq!(
+            polls.load(Ordering::Acquire),
+            stopped,
+            "closed idle session must stop polling"
+        );
+        reading.send(SessionCommand::Play).unwrap();
+        wait_for_state(&reading, PlaybackState::Buffering);
+        assert!(
+            polls.load(Ordering::Acquire) > stopped,
+            "Play resumes worker polling"
+        );
+        assert!(reading.shutdown());
     }
     #[test]
     fn replacement_revision_is_echoed_in_text_and_snapshot_events() {

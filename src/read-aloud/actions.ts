@@ -138,3 +138,26 @@ export function createPopupActions(
     },
   };
 }
+
+export interface PopupKey {
+  key: string;
+  ctrlKey: boolean;
+  defaultPrevented: boolean;
+  preventDefault: () => void;
+}
+export function routePopupKey(
+  event: PopupKey,
+  actions: {
+    close: () => void | Promise<void>;
+    toggle: () => void | Promise<void>;
+  },
+) {
+  if (event.defaultPrevented) return;
+  if (event.key === "Escape") {
+    event.preventDefault();
+    void actions.close();
+  } else if (event.key === "Enter" && event.ctrlKey) {
+    event.preventDefault();
+    void actions.toggle();
+  }
+}

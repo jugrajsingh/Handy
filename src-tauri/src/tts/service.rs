@@ -12,7 +12,10 @@ use handy_tts_core::{
 };
 use std::{
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
 };
 use tauri::{Emitter, Manager};
 #[derive(Clone)]
@@ -27,6 +30,8 @@ pub struct Ready {
 pub struct TtsService {
     app: tauri::AppHandle,
     ready: Mutex<Result<Ready, String>>,
+    refused_shortcut: AtomicBool,
+    tray_refresh: mpsc::SyncSender<()>,
     referee: Mutex<Referee>,
     binding: Mutex<String>,
     pub fence: Arc<PasteFence>,
@@ -76,10 +81,49 @@ impl Drop for PreviewCompletion {
         wake.notify_all();
     }
 }
+pub(crate) fn dictation_start_with(
+    cancel_preview: impl FnOnce() -> Result<(), String>,
+    stop_reading: impl FnOnce() -> Result<(), super::TtsError>,
+    begin: impl FnOnce(),
+) -> Result<(), super::TtsError> {
+    if let Err(error) = cancel_preview() {
+        log::warn!("Read-aloud preview stop failed during dictation: {error}");
+    }
+    if let Err(error) = stop_reading() {
+        log::warn!("Read-aloud stop acknowledgment failed during dictation: {error}");
+    }
+    begin();
+    Ok(())
+}
+fn read_shortcut_with(
+    referee: &mut Referee,
+    ready: Result<(), String>,
+    refused: &AtomicBool,
+    log: impl FnOnce(&str),
+) -> Vec<Effect> {
+    if let Err(error) = ready {
+        if !refused.swap(true, Ordering::AcqRel) {
+            log(&error);
+        }
+        return Vec::new();
+    }
+    refused.store(false, Ordering::Release);
+    referee.apply(Event::ReadShortcut)
+}
+fn run_tray_refreshes(events: mpsc::Receiver<()>, mut refresh: impl FnMut() -> bool) {
+    while events.recv().is_ok() {
+        if !refresh() {
+            break;
+        }
+    }
+}
 impl TtsService {
     pub fn initialize(app: &tauri::AppHandle) -> Arc<Self> {
+        let (tray_refresh, refreshes) = mpsc::sync_channel(1);
         let service = Arc::new(Self {
             app: app.clone(),
+            refused_shortcut: AtomicBool::new(false),
+            tray_refresh,
             ready: Mutex::new(Err("tts.errors.starting".into())),
             referee: Mutex::new(Referee::default()),
             binding: Mutex::new("transcribe".into()),
@@ -98,43 +142,16 @@ impl TtsService {
         std::thread::spawn(move || {
             let result = started.boot();
             *started.ready.lock().unwrap_or_else(|p| p.into_inner()) = result;
+            started.refresh_tray();
             let weak = Arc::downgrade(&started);
             drop(started);
-            while let Some(service) = weak.upgrade() {
-                if let Ok(ready) = service.ready() {
-                    let settings = crate::settings::get_settings(&service.app);
-                    let downloaded = handy_tts_core::catalog::entries()
-                        .map(|entries| {
-                            entries
-                                .iter()
-                                .filter(|entry| {
-                                    handy_tts_core::download::is_downloaded(&ready.root, entry)
-                                })
-                                .map(|entry| (entry.id.to_owned(), entry.name.to_owned()))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
-                    let desired = handy_tts_core::tray::tts_menu(
-                        &downloaded,
-                        Some(&settings.tts_model_id),
-                        ready.manager.status(),
-                    );
-                    let changed = {
-                        let mut cached = service.tray.lock().unwrap_or_else(|p| p.into_inner());
-                        if *cached == desired {
-                            false
-                        } else {
-                            *cached = desired;
-                            true
-                        }
-                    };
-                    if changed {
-                        crate::tray::update_tray_menu(&service.app);
-                    }
-                }
-                drop(service);
-                std::thread::sleep(std::time::Duration::from_millis(500));
-            }
+            run_tray_refreshes(refreshes, || {
+                let Some(service) = weak.upgrade() else {
+                    return false;
+                };
+                service.update_tray_snapshot();
+                true
+            });
         });
         service
     }
@@ -243,13 +260,26 @@ impl TtsService {
         manager.spawn_idle(self.app.clone(), session.busy.clone());
         let app = self.app.clone();
         let position = settings.overlay_position;
-        self.app
+        let (created, wait) = mpsc::channel();
+        let created = self
+            .app
             .run_on_main_thread(move || {
-                if let Err(error) = window::create(&app, position) {
-                    log::error!("{error}");
-                }
+                let _ = created.send(window::create(&app, position));
             })
-            .map_err(|_| "tts.errors.window".to_string())?;
+            .map_err(|_| "tts.errors.window".to_string())
+            .and_then(|()| {
+                wait.recv_timeout(std::time::Duration::from_secs(30))
+                    .unwrap_or_else(|_| Err("tts.errors.window".into()))
+            });
+        if let Err(error) = created {
+            session.shutdown();
+            manager.unload();
+            return Err(error);
+        }
+        let refresh = self.tray_refresh.clone();
+        manager.on_status_change(Arc::new(move || {
+            let _ = refresh.try_send(());
+        }));
         self.app.manage(manager.clone());
         self.app.manage(session.clone());
         Ok(Ready {
@@ -346,7 +376,43 @@ impl TtsService {
             });
         })
     }
-    /// Returns the tray snapshot sampled on the service thread.
+    /// Queues a tray refresh after download or selection changes.
+    pub fn refresh_tray(&self) {
+        let _ = self.tray_refresh.try_send(());
+    }
+    fn update_tray_snapshot(&self) {
+        let Ok(ready) = self.ready() else {
+            return;
+        };
+        let settings = crate::settings::get_settings(&self.app);
+        let downloaded = handy_tts_core::catalog::entries()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter(|entry| handy_tts_core::download::is_downloaded(&ready.root, entry))
+                    .map(|entry| (entry.id.to_owned(), entry.name.to_owned()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let desired = handy_tts_core::tray::tts_menu(
+            &downloaded,
+            Some(&settings.tts_model_id),
+            ready.manager.status(),
+        );
+        let changed = {
+            let mut cached = self.tray.lock().unwrap_or_else(|p| p.into_inner());
+            if *cached == desired {
+                false
+            } else {
+                *cached = desired;
+                true
+            }
+        };
+        if changed {
+            crate::tray::update_tray_menu(&self.app);
+        }
+    }
+    /// Returns the tray snapshot updated by download, selection and status events.
     pub fn tray_snapshot(&self) -> handy_tts_core::tray::TtsMenu {
         self.tray.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
@@ -416,11 +482,15 @@ impl TtsService {
         }
     }
     pub fn read_shortcut(self: &Arc<Self>) {
-        let effects = self
-            .referee
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .apply(Event::ReadShortcut);
+        let effects = read_shortcut_with(
+            &mut self.referee.lock().unwrap_or_else(|p| p.into_inner()),
+            self.ready().map(|_| ()),
+            &self.refused_shortcut,
+            |error| log::warn!("Read-aloud shortcut refused before readiness: {error}"),
+        );
+        if effects.is_empty() {
+            return;
+        }
         if let Some(Effect::Capture { ticket }) = effects.first() {
             let ticket = *ticket;
             if !self.fence.reserve_capture() {
@@ -475,18 +545,23 @@ impl TtsService {
         }
     }
     pub fn dictation_start(&self, binding: &str) -> Result<(), super::TtsError> {
-        self.cancel_preview().map_err(|_| super::TtsError::Worker)?;
-        if let Ok(ready) = self.ready() {
-            ready.session.stop_and_wait()?;
-        }
-        self.pipeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .begin();
-        *self.binding.lock().unwrap_or_else(|p| p.into_inner()) = binding.into();
-        self.apply(Event::DictationStart);
-        Ok(())
+        dictation_start_with(
+            || self.cancel_preview(),
+            || {
+                self.ready()
+                    .map_or(Ok(()), |ready| ready.session.stop_and_wait())
+            },
+            || {
+                self.pipeline
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .begin();
+                *self.binding.lock().unwrap_or_else(|p| p.into_inner()) = binding.into();
+                self.apply(Event::DictationStart);
+            },
+        )
     }
+
     pub fn generation(&self) -> u64 {
         self.pipeline
             .lock()
@@ -546,5 +621,69 @@ impl TtsService {
 impl handy_tts_core::preview::ReadingControl for ReadAloudSession {
     fn pause_for_preview(&self) -> Result<(), String> {
         self.pause_and_wait().map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn tray_refresh_waits_for_events_without_periodic_model_scans() {
+        let (refresh, events) = mpsc::channel();
+        let (scanned, scans) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            run_tray_refreshes(events, || {
+                scanned.send(()).unwrap();
+                true
+            })
+        });
+        assert!(
+            scans
+                .recv_timeout(std::time::Duration::from_millis(650))
+                .is_err(),
+            "idle tray must not scan models"
+        );
+        for _ in 0..2 {
+            refresh.send(()).unwrap();
+            scans
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            assert!(
+                scans
+                    .recv_timeout(std::time::Duration::from_millis(650))
+                    .is_err(),
+                "tray scans must be driven by events"
+            );
+        }
+        drop(refresh);
+        worker.join().unwrap();
+    }
+    #[test]
+    fn early_shortcut_leaves_referee_unchanged_and_logs_once_until_ready() {
+        for dictating in [false, true] {
+            let mut referee = Referee::default();
+            if dictating {
+                referee.apply(Event::DictationStart);
+            }
+            let before = format!("{referee:?}");
+            let refused = AtomicBool::new(false);
+            let mut logs = 0;
+            for _ in 0..2 {
+                assert!(read_shortcut_with(
+                    &mut referee,
+                    Err("tts.errors.starting".into()),
+                    &refused,
+                    |_| logs += 1
+                )
+                .is_empty());
+                assert_eq!(format!("{referee:?}"), before);
+            }
+            assert_eq!(logs, 1);
+            assert!(matches!(
+                read_shortcut_with(&mut referee, Ok(()), &refused, |_| logs += 1).as_slice(),
+                [Effect::Capture { .. }]
+            ));
+            assert!(!refused.load(Ordering::Acquire));
+        }
     }
 }

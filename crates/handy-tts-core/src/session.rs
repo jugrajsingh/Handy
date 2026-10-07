@@ -91,6 +91,8 @@ pub trait Worker {
     fn poll(&mut self) -> Option<Completion>;
     fn cancel(&mut self, ticket: Ticket);
     fn selection_changed(&mut self);
+    /// Clears a failed worker latch after an explicit selection.
+    fn retry_failed_selection(&mut self) {}
 }
 /// Playback progress and errors suitable for frontend events.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, specta::Type)]
@@ -329,6 +331,8 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         }
         if reload {
             self.worker.selection_changed();
+        } else {
+            self.worker.retry_failed_selection();
         }
         self.selection = selection;
         self.queue.speed = self.selection.speed;

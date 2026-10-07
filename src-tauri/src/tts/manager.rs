@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, TryLockError,
+        mpsc, Arc, Mutex, TryLockError,
     },
     time::{Duration, Instant},
 };
@@ -54,6 +54,12 @@ struct Inner<B: Transport> {
     config: ManagerConfig,
     last_failure: Option<(Instant, TtsError)>,
 }
+struct IdleWake<'a>(&'a mpsc::SyncSender<()>);
+impl Drop for IdleWake<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(());
+    }
+}
 pub struct TtsManager<B: Transport = WorkerBackend> {
     inner: Mutex<Inner<B>>,
     control: B::Control,
@@ -64,6 +70,9 @@ pub struct TtsManager<B: Transport = WorkerBackend> {
     interruption: AtomicU64,
     activity: AtomicU64,
     invalid: Arc<Mutex<BTreeMap<String, Vec<Device>>>>,
+    idle_wake: mpsc::SyncSender<()>,
+    idle_events: Mutex<Option<mpsc::Receiver<()>>>,
+    status_changed: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 impl TtsManager {
     pub fn fork(&self) -> Result<Arc<Self>, TtsError> {
@@ -103,6 +112,7 @@ impl<B: Transport> TtsManager<B> {
             .ratings
             .validate(&["pocket-en", "supertonic-3", "kokoro-82m-int8"])?;
         let control = backend.control();
+        let (idle_wake, idle_events) = mpsc::sync_channel(1);
         Ok(Arc::new(Self {
             inner: Mutex::new(Inner {
                 backend,
@@ -112,6 +122,9 @@ impl<B: Transport> TtsManager<B> {
                 last_failure: None,
             }),
             control,
+            idle_wake,
+            idle_events: Mutex::new(Some(idle_events)),
+            status_changed: Mutex::new(None),
             checks,
             started: Instant::now(),
             cancelled_id: std::sync::atomic::AtomicU64::new(0),
@@ -182,6 +195,27 @@ impl<B: Transport> TtsManager<B> {
             cached.ready = None;
             cached.fallback_from = None;
         }
+        drop(cached);
+        self.wake_idle();
+        if let Some(notify) = self
+            .status_changed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+        {
+            notify();
+        }
+    }
+    /// Installs the notification used to refresh the tray after status changes.
+    pub fn on_status_change(&self, notify: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .status_changed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(notify);
+    }
+    /// Wakes the idle monitor to reschedule its unload deadline.
+    pub fn wake_idle(&self) {
+        let _ = self.idle_wake.try_send(());
     }
     pub fn downloaded(&self, id: &str) -> bool {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -227,6 +261,12 @@ impl<B: Transport> TtsManager<B> {
         inner.last_failure = None;
         self.publish(State::Unloaded, Preparation::Idle);
     }
+    /// Clears Failed after selection while retaining a healthy loaded worker.
+    pub fn retry_failed_selection(&self) {
+        if self.status() == State::Failed {
+            self.selected();
+        }
+    }
     pub fn set_run_on(&self, model: &str, choice: RunOn) -> Result<(), TtsError> {
         catalog::entry(model).map_err(|_| TtsError::Model)?;
         let active = {
@@ -249,6 +289,7 @@ impl<B: Transport> TtsManager<B> {
         cancelled: impl Fn() -> bool,
         discard_cancelled_ready: bool,
     ) -> Result<(), TtsError> {
+        let _idle_wake = IdleWake(&self.idle_wake);
         let generation = self.interruption.load(Ordering::Acquire);
         self.activity.fetch_add(1, Ordering::AcqRel);
         let interrupted = || cancelled() || self.interruption.load(Ordering::Acquire) != generation;
@@ -275,6 +316,7 @@ impl<B: Transport> TtsManager<B> {
                 && inner.backend.alive()
             {
                 inner.lifecycle.touch(self.started.elapsed());
+                self.wake_idle();
                 if interrupted() {
                     if discard_cancelled_ready {
                         inner.backend.stop();
@@ -435,6 +477,7 @@ impl<B: Transport> TtsManager<B> {
         std::thread::spawn(move || manager.ensure(&selection))
     }
     pub fn synthesize(&self, selection: &Selection, id: u64, text: &str) -> Result<Pcm, TtsError> {
+        let _idle_wake = IdleWake(&self.idle_wake);
         for attempt in 0..2 {
             if self.cancelled_id.load(std::sync::atomic::Ordering::Acquire) == id {
                 return Err(TtsError::Cancelled);
@@ -467,6 +510,7 @@ impl<B: Transport> TtsManager<B> {
                     },
                 )
             };
+            self.wake_idle();
             if self.cancelled_id.load(std::sync::atomic::Ordering::Acquire) == id {
                 return Err(TtsError::Cancelled);
             }
@@ -476,10 +520,13 @@ impl<B: Transport> TtsManager<B> {
                 .unwrap_or_else(|p| p.into_inner())
                 .backend
                 .alive();
-            if result.is_ok() || attempt == 1 || alive {
+            if result.is_ok() || alive {
                 return result;
             }
             self.unload();
+            if attempt == 1 {
+                return result;
+            }
         }
         Err(TtsError::Worker)
     }
@@ -493,8 +540,9 @@ impl<B: Transport> TtsManager<B> {
                 Err(TryLockError::Poisoned(error)) => error.into_inner(),
                 Err(TryLockError::WouldBlock) => return,
             };
+            let was_busy = inner.lifecycle.busy;
             inner.lifecycle.busy = busy();
-            if inner.lifecycle.busy {
+            if was_busy || inner.lifecycle.busy {
                 inner.lifecycle.touch(self.started.elapsed());
             }
             if !inner
@@ -530,23 +578,68 @@ impl<B: Transport> TtsManager<B> {
         inner.lifecycle.stopped();
         self.publish(State::Unloaded, Preparation::Idle);
     }
+    fn idle_delay(&self, timeout: UnloadAfter, busy: bool) -> Option<Duration> {
+        let inner = match self.inner.try_lock() {
+            Ok(inner) => inner,
+            Err(TryLockError::Poisoned(error)) => error.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        if inner.lifecycle.state != State::Ready || busy {
+            return None;
+        }
+        match timeout {
+            UnloadAfter::Never => None,
+            UnloadAfter::Immediately => Some(Duration::ZERO),
+            UnloadAfter::Idle(limit) => Some(
+                limit.saturating_sub(
+                    self.started
+                        .elapsed()
+                        .saturating_sub(inner.lifecycle.last_used),
+                ),
+            ),
+        }
+    }
     pub fn spawn_idle(
         self: &Arc<Self>,
         app: tauri::AppHandle,
         busy: Arc<std::sync::atomic::AtomicBool>,
     ) {
+        self.spawn_idle_with(
+            move || super::unload_after(crate::settings::get_settings(&app).model_unload_timeout),
+            busy,
+        );
+    }
+    fn spawn_idle_with(
+        self: &Arc<Self>,
+        timeout: impl Fn() -> UnloadAfter + Send + 'static,
+        busy: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let Some(events) = self
+            .idle_events
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        else {
+            return;
+        };
         let manager = Arc::downgrade(self);
         std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_secs(1));
             let Some(manager) = manager.upgrade() else {
                 break;
             };
-            let settings = crate::settings::get_settings(&app);
-            manager.idle_with(
-                super::unload_after(settings.model_unload_timeout),
-                || busy.load(Ordering::Acquire),
-                || {},
-            );
+            let timeout = timeout();
+            manager.idle_with(timeout, || busy.load(Ordering::Acquire), || {});
+            let delay = manager.idle_delay(timeout, busy.load(Ordering::Acquire));
+            drop(manager);
+            let result = match delay {
+                Some(delay) => events.recv_timeout(delay),
+                None => events
+                    .recv()
+                    .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            };
+            if matches!(result, Err(mpsc::RecvTimeoutError::Disconnected)) {
+                break;
+            }
         });
     }
 }
@@ -563,6 +656,7 @@ mod tests {
         fail_npu: bool,
         memory_at_load: bool,
         start_gate: Option<Arc<std::sync::Barrier>>,
+        alive_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     }
     #[derive(Clone, Default)]
     struct FakeControl {
@@ -616,6 +710,11 @@ mod tests {
             })
         }
         fn alive(&mut self) -> bool {
+            let gate = self.trace.lock().unwrap().alive_gate.take();
+            if let Some((entered, release)) = gate {
+                entered.wait();
+                release.wait();
+            }
             self.control.alive.load(Ordering::Acquire)
         }
         fn stop(&mut self) {
@@ -782,6 +881,266 @@ for line in sys.stdin:
             assert!(!parent.npu_driver_too_old("supertonic-3"));
             assert_eq!(child.status(), State::Unloaded);
         }
+    }
+    #[test]
+    fn synthesis_deadline_reaps_worker_and_play_reloads_even_with_never_unload() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture =
+            tempfile::tempdir_in(std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap()).unwrap();
+        let binary = fixture.path().join("wedged-worker.py");
+        std::fs::write(&binary, r#"#!/usr/bin/python3
+import json, os, pathlib, struct, sys, time
+root = None
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['type'] == 'load':
+        root = pathlib.Path(request['model_dir']).parent
+        with (root / 'starts').open('a') as trace:
+            trace.write(str(os.getpid()) + '\n')
+        print(json.dumps({'id': 0, 'status': 'ready', 'device': 'cpu', 'placement': {'main': 'cpu'}, 'samples': 0}), flush=True)
+    elif request['type'] == 'synthesize':
+        if not (root / 'allow-retry').exists():
+            while True:
+                time.sleep(60)
+        print(json.dumps({'id': request['id'], 'status': 'ok', 'sample_rate': 24000, 'samples': 1}), flush=True)
+        sys.stdout.buffer.write(struct.pack('<f', 0.25))
+        sys.stdout.buffer.flush()
+"#).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut config = config(RunOn::Cpu);
+        config.root = fixture.path().into();
+        config.binary = binary;
+        config.cache = fixture.path().join("cache");
+        config.home = fixture.path().join("home");
+        let manager = TtsManager::with_backend(
+            config,
+            WorkerBackend::with_synthesis_timeout(Duration::from_millis(100)),
+            Checks {
+                memory: enough,
+                downloaded: |_, _| true,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            manager.synthesize(&selection(), 1, "Wedged"),
+            Err(TtsError::Worker)
+        ));
+        let starts = std::fs::read_to_string(fixture.path().join("starts")).unwrap();
+        let pids = starts.lines().collect::<Vec<_>>();
+        assert_eq!(
+            pids.len(),
+            2,
+            "deadline triggers exactly one automatic retry"
+        );
+        for pid in &pids {
+            assert!(
+                !Path::new(&format!("/proc/{pid}")).exists(),
+                "deadline must kill and reap every wedged worker"
+            );
+        }
+        assert_eq!(manager.status(), State::Unloaded);
+        manager.idle(UnloadAfter::Never, false);
+        std::fs::write(fixture.path().join("allow-retry"), []).unwrap();
+        let pcm = manager.synthesize(&selection(), 2, "Next Play").unwrap();
+        assert_eq!(pcm.samples, [0.25]);
+        assert_eq!(
+            std::fs::read_to_string(fixture.path().join("starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            3
+        );
+        manager.unload();
+    }
+    #[test]
+    fn same_model_selection_clears_failed_and_allows_play_retry() {
+        use handy_tts_core::{
+            playback::{Output, PlaybackError, Poll},
+            scheduler::Ticket,
+            session::{Session, Worker},
+        };
+        struct Speaker;
+        impl Output for Speaker {
+            type Prepared = ();
+            fn names(&self) -> Result<Vec<String>, PlaybackError> {
+                Ok(vec![])
+            }
+            fn open(&mut self, _: Option<&str>) -> Result<(), PlaybackError> {
+                Ok(())
+            }
+            fn prepare(&mut self, _: Option<&str>) -> Result<(), PlaybackError> {
+                Ok(())
+            }
+            fn commit(&mut self, _: ()) {}
+            fn play(&mut self, _: Pcm, _: u32) -> Result<(), PlaybackError> {
+                Ok(())
+            }
+            fn poll(&mut self) -> Poll {
+                Poll::Playing
+            }
+            fn pause(&mut self) {}
+            fn resume(&mut self) {}
+            fn stop(&mut self) {}
+        }
+        struct Engine(Arc<TtsManager<Fake>>);
+        impl Worker for Engine {
+            fn request(&mut self, _: Ticket, _: &str, _: &Selection) -> Result<(), String> {
+                Ok(())
+            }
+            fn poll(&mut self) -> Option<handy_tts_core::session::Completion> {
+                None
+            }
+            fn cancel(&mut self, _: Ticket) {}
+            fn selection_changed(&mut self) {
+                self.0.selected();
+            }
+            fn retry_failed_selection(&mut self) {
+                self.0.retry_failed_selection();
+            }
+        }
+        let trace = Arc::new(Mutex::new(Trace {
+            fail_all: true,
+            ..Trace::default()
+        }));
+        let manager = manager(RunOn::Cpu, trace.clone(), enough);
+        assert!(manager.ensure(&selection()).is_err());
+        assert!(manager.ensure(&selection()).is_err());
+        assert_eq!(manager.status(), State::Failed);
+        let mut session = Session::new(
+            "Read again",
+            selection(),
+            Engine(manager.clone()),
+            Speaker,
+            None,
+        )
+        .unwrap();
+        session.select(selection(), true, |_| Ok(())).unwrap();
+        assert_eq!(
+            manager.status(),
+            State::Unloaded,
+            "explicit same-model selection clears Failed"
+        );
+        trace.lock().unwrap().fail_all = false;
+        manager.ensure(&selection()).unwrap();
+        assert_eq!(manager.status(), State::Ready);
+        session.select(selection(), true, |_| Ok(())).unwrap();
+        assert_eq!(
+            manager.status(),
+            State::Ready,
+            "same selection keeps a healthy worker loaded"
+        );
+    }
+    fn idle_after_unlock(synthesis: bool) {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let manager = manager(RunOn::Cpu, trace.clone(), enough);
+        let (sampled, samples) = mpsc::channel();
+        let weak = Arc::downgrade(&manager);
+        manager.spawn_idle_with(
+            move || {
+                sampled.send(weak.upgrade().unwrap().status()).unwrap();
+                UnloadAfter::Idle(Duration::from_millis(100))
+            },
+            Arc::new(AtomicBool::new(false)),
+        );
+        samples.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (entered, ready) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel();
+        let wait_release = Mutex::new(wait_release);
+        let weak = Arc::downgrade(&manager);
+        manager.on_status_change(Arc::new(move || {
+            if weak.upgrade().unwrap().status() == State::Ready {
+                entered.send(()).unwrap();
+                wait_release.lock().unwrap().recv().unwrap();
+            }
+        }));
+        let loading = manager.clone();
+        let load = std::thread::spawn(move || {
+            if synthesis {
+                loading
+                    .synthesize(&selection(), 77, "Cancelled")
+                    .map(|_| ())
+            } else {
+                loading.ensure(&selection())
+            }
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        let alive_entered = Arc::new(std::sync::Barrier::new(2));
+        let alive_release = Arc::new(std::sync::Barrier::new(2));
+        if synthesis {
+            trace.lock().unwrap().alive_gate = Some((alive_entered.clone(), alive_release.clone()));
+            release.send(()).unwrap();
+            alive_entered.wait();
+        }
+        loop {
+            if samples.recv_timeout(Duration::from_secs(2)).unwrap() == State::Ready {
+                break;
+            }
+        }
+        assert!(matches!(
+            manager.inner.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        while samples.recv_timeout(Duration::from_millis(650)).is_ok() {}
+        if synthesis {
+            alive_release.wait();
+        } else {
+            release.send(()).unwrap();
+        }
+        assert_eq!(load.join().unwrap(), Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while manager.status() != State::Unloaded && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            manager.status(),
+            State::Unloaded,
+            "unlocking the worker must reschedule its idle deadline"
+        );
+        while samples.recv_timeout(Duration::from_millis(650)).is_ok() {}
+    }
+    #[test]
+    fn idle_monitor_reschedules_readiness_after_unlock() {
+        idle_after_unlock(false);
+    }
+    #[test]
+    fn idle_monitor_reschedules_synthesis_completion_after_unlock() {
+        idle_after_unlock(true);
+    }
+    #[test]
+    fn idle_monitor_sleeps_until_activity_and_uses_one_unload_deadline() {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let manager = manager(RunOn::Cpu, trace.clone(), enough);
+        let (sampled, samples) = mpsc::channel();
+        let busy = Arc::new(AtomicBool::new(false));
+        manager.spawn_idle_with(
+            move || {
+                sampled.send(()).unwrap();
+                UnloadAfter::Idle(Duration::from_millis(100))
+            },
+            busy.clone(),
+        );
+        samples.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(
+            samples.recv_timeout(Duration::from_millis(1200)).is_err(),
+            "unloaded manager must not poll settings"
+        );
+        busy.store(true, Ordering::Release);
+        manager.ensure(&selection()).unwrap();
+        manager.wake_idle();
+        samples.recv_timeout(Duration::from_secs(2)).unwrap();
+        busy.store(false, Ordering::Release);
+        manager.wake_idle();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while manager.status() != State::Unloaded && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(manager.status(), State::Unloaded);
+        assert_eq!(trace.lock().unwrap().stopped, 1);
+        while samples.try_recv().is_ok() {}
+        assert!(
+            samples.recv_timeout(Duration::from_millis(1200)).is_err(),
+            "unloaded monitor resumes blocking after its deadline"
+        );
     }
     #[test]
     fn npu_transport_failure_does_not_reject_the_driver() {
