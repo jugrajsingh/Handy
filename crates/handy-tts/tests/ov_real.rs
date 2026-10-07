@@ -256,7 +256,11 @@ fn real_encoder_zero_padding_and_output_crop_preserve_the_original_token_length(
         )
         .unwrap();
     let (shape, values) = output.at(0).unwrap().try_extract_tensor::<f32>().unwrap();
-    assert_eq!(shape.as_ref(), [1, 256, 4]);
+    assert_eq!(
+        shape.as_ref(),
+        [1, 256, 4],
+        "encoder output crop must preserve original token length"
+    );
     assert!(values.iter().all(|v| v.is_finite()));
     assert!(values.iter().any(|v| v.abs() > 0.01));
     println!(
