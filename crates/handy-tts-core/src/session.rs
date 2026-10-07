@@ -129,6 +129,7 @@ pub struct Session<'a, W: Worker, O: Output> {
     pub playback: Playback<O>,
     pub queue: Queue,
     selection: Selection,
+    native_window: fn(&str) -> Result<crate::speed::NativeWindow, String>,
     metadata: BTreeMap<usize, TextChunk>,
     parts: Option<Parts>,
     output_ticket: Option<Ticket>,
@@ -166,6 +167,11 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             playback,
             queue: Queue::with_speed(selection.speed),
             selection,
+            native_window: |id| {
+                crate::catalog::entry(id)
+                    .map(|entry| entry.native_speed)
+                    .map_err(|error| error.to_string())
+            },
             metadata: BTreeMap::new(),
             parts: None,
             output_ticket: None,
@@ -355,6 +361,10 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             .then(|| "tts.errors.notDownloaded".into());
         Ok(changed)
     }
+    fn speed_plan(&self) -> Result<crate::speed::SpeedPlan, String> {
+        let window = (self.native_window)(&self.selection.model_id)?;
+        crate::speed::plan(self.selection.speed, window).map_err(|_| "tts.errors.audio".into())
+    }
     fn received(&mut self, completion: Completion) {
         if completion.ticket.epoch != self.queue.epoch
             || self.queue.in_flight != Some(completion.ticket)
@@ -370,12 +380,10 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             }
         };
         let began = (self.dsp_clock)();
-        let pcm = match dsp::transform(
-            pcm,
-            self.selection.speed,
-            self.selection.pitch,
-            self.selection.model_id != "pocket-en",
-        ) {
+        let pcm = match self.speed_plan().and_then(|plan| {
+            dsp::transform_ratio(pcm, plan.stretch, self.selection.pitch)
+                .map_err(|_| "tts.errors.audio".to_string())
+        }) {
             Ok(pcm) => pcm,
             Err(_) => {
                 self.error = Some("tts.errors.audio".into());
@@ -481,7 +489,11 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             match next {
                 Some(mut text) => {
                     text.index = ticket.index;
-                    let result = self.worker.request(ticket, &text.text, &self.selection);
+                    let result = self.speed_plan().and_then(|plan| {
+                        let mut native_selection = self.selection.clone();
+                        native_selection.speed = plan.native;
+                        self.worker.request(ticket, &text.text, &native_selection)
+                    });
                     self.metadata.insert(ticket.index, text);
                     if let Err(error) = result {
                         self.error = Some(error);
@@ -612,14 +624,21 @@ mod tests {
         rtf: f64,
         pending: Option<(f64, Completion)>,
         requested: Vec<Ticket>,
+        native_speeds: Vec<Option<f32>>,
         cancelled: Vec<Ticket>,
         fail_once: Option<usize>,
         seconds: f64,
         selections: usize,
     }
     impl Worker for FakeWorker {
-        fn request(&mut self, ticket: Ticket, _: &str, _: &Selection) -> Result<(), String> {
+        fn request(
+            &mut self,
+            ticket: Ticket,
+            _: &str,
+            selection: &Selection,
+        ) -> Result<(), String> {
             self.requested.push(ticket);
+            self.native_speeds.push(Some(selection.speed));
             let result = if self.fail_once == Some(ticket.index) {
                 self.fail_once = None;
                 Err("tts.errors.worker".into())
@@ -773,6 +792,42 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+    #[test]
+    fn session_requests_native_speed_from_plan() {
+        for (id, window, expected) in [
+            (
+                "pocket-en",
+                crate::speed::NativeWindow { min: 1.0, max: 1.0 },
+                1.0,
+            ),
+            (
+                "supertonic-3",
+                crate::speed::NativeWindow { min: 1.0, max: 1.3 },
+                1.3,
+            ),
+        ] {
+            let mut s = session(
+                "Every word in this sentence must reach the listener completely.",
+                0.0,
+            );
+            s.selection.model_id = id.into();
+            s.native_window = |id| {
+                Ok(crate::speed::NativeWindow {
+                    min: 1.0,
+                    max: if id == "pocket-en" { 1.0 } else { 1.3 },
+                })
+            };
+            assert_eq!((s.native_window)(id).unwrap(), window);
+            s.play().unwrap();
+            step(&mut s, 0.0);
+            assert_eq!(s.worker.native_speeds, [Some(expected)]);
+            step(&mut s, 0.1);
+            assert_eq!(
+                s.playback.output.sample_counts,
+                [(8000.0 / (2.0 / expected)).round() as usize]
+            );
+        }
     }
     #[test]
     fn fix1_idle_output_failure_does_not_block_stop_and_recovers_on_play() {
@@ -942,7 +997,7 @@ mod tests {
         let mut s = session(&source, 0.1);
         s.playback.output.names.push("Headphones".into());
         s.play().unwrap();
-        for i in 0..12 {
+        for i in 0..5 {
             step(&mut s, f64::from(i) * 0.1);
         }
         let prepared = s.playback.output.prepared.clone();
@@ -966,7 +1021,7 @@ mod tests {
         assert_eq!(changed.epoch, before.0 + 1);
         assert_eq!(changed.sentence_index, 0);
         assert_eq!(s.selection, chosen);
-        for i in 12..17 {
+        for i in 5..10 {
             step(&mut s, f64::from(i) * 0.1);
         }
         assert_eq!(s.playback.output.played, [1, 1]);
@@ -1467,7 +1522,7 @@ mod tests {
     #[test]
     fn split_audio_pauses_once_and_output_change_reopens_without_worker_reload() {
         let mut s = session("# A heading which has a structural pause after it.", 0.01);
-        s.worker.seconds = 65.0;
+        s.worker.seconds = 130.0;
         s.play().unwrap();
         for step in 0..2000 {
             let now = f64::from(step) * 0.05;
@@ -1632,10 +1687,10 @@ mod tests {
         let source =
             "This single sentence produces an unusually long audio result in the fake worker.";
         let mut s = session(source, 0.001);
-        s.worker.seconds = 65.0;
+        s.worker.seconds = 130.0;
         s.play().unwrap();
         step(&mut s, 0.0);
-        step(&mut s, 0.1);
+        step(&mut s, 0.2);
         assert!(s.queue.playing.as_ref().unwrap().seconds() <= 30.0);
         assert!(s.parts.is_some());
         assert!(s.queue.in_flight.is_some());

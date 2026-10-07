@@ -24,7 +24,7 @@ pub struct ModelEntry {
     pub card: &'static str,
     pub default_voice: &'static str,
     pub threads: usize,
-    pub native_speed: bool,
+    pub native_speed: crate::speed::NativeWindow,
     pub files: Vec<ModelFile>,
     pub voices: Vec<String>,
     pub bytes: u64,
@@ -47,7 +47,16 @@ pub fn valid_path(path: &str) -> bool {
 }
 /// Validates a pinned file manifest and assembles the supported model entries.
 pub fn parse_catalog(json: &str) -> Result<Vec<ModelEntry>, CatalogError> {
-    let files: Vec<ModelFile> = serde_json::from_str(json).map_err(|_| CatalogError::Invalid)?;
+    #[derive(Deserialize)]
+    struct Manifest {
+        native_speed: std::collections::BTreeMap<String, crate::speed::NativeWindow>,
+        files: Vec<ModelFile>,
+    }
+    let manifest: Manifest = serde_json::from_str(json).map_err(|_| CatalogError::Invalid)?;
+    if manifest.native_speed.len() != 3 {
+        return Err(CatalogError::Invalid);
+    }
+    let files = manifest.files;
     let mut entries = Vec::new();
     for (id, name, license, attribution, card, default_voice, threads) in [
         (
@@ -78,6 +87,13 @@ pub fn parse_catalog(json: &str) -> Result<Vec<ModelEntry>, CatalogError> {
             4,
         ),
     ] {
+        let native_speed = *manifest.native_speed.get(id).ok_or(CatalogError::Invalid)?;
+        if !native_speed.valid()
+            || (id == "pocket-en"
+                && native_speed != (crate::speed::NativeWindow { min: 1.0, max: 1.0 }))
+        {
+            return Err(CatalogError::Invalid);
+        }
         let model_files: Vec<_> = files
             .iter()
             .filter(|file| file.model_id == id)
@@ -126,7 +142,7 @@ pub fn parse_catalog(json: &str) -> Result<Vec<ModelEntry>, CatalogError> {
             attribution,
             card,
             default_voice,
-            native_speed: id != "pocket-en",
+            native_speed,
             threads,
             files: model_files,
             voices,
@@ -160,6 +176,16 @@ pub fn entry(id: &str) -> Result<&'static ModelEntry, CatalogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn pocket_window_other_than_unity_is_rejected() {
+        let mut json: serde_json::Value =
+            serde_json::from_str(include_str!("models.json")).unwrap();
+        json["native_speed"]["pocket-en"] = serde_json::json!({"min": 1.0, "max": 1.1});
+        assert_eq!(
+            parse_catalog(&json.to_string()).unwrap_err(),
+            CatalogError::Invalid
+        );
+    }
     #[test]
     fn pinned_catalog_has_exact_totals_voices_and_safe_paths() {
         for (id, count, size, voices) in [

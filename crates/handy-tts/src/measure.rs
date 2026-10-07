@@ -118,7 +118,7 @@ pub fn run(
     crate::runtime::synthesize_bounded(
         engine.as_mut(),
         &chunks[0],
-        model.native_speed.then_some(1.0),
+        Some(1.0),
         &AtomicBool::new(false),
     )?;
     let mut first_audio = Vec::new();
@@ -130,7 +130,7 @@ pub fn run(
                 let samples = crate::runtime::synthesize_bounded(
                     engine.as_mut(),
                     text,
-                    model.native_speed.then_some(1.0),
+                    Some(1.0),
                     &AtomicBool::new(false),
                 )?;
                 dsp::transform(
@@ -141,7 +141,7 @@ pub fn run(
                     },
                     1.0,
                     0.0,
-                    model.native_speed,
+                    false,
                 )
                 .map_err(Into::into)
             },
@@ -155,21 +155,20 @@ pub fn run(
     }
     let mut one = Vec::new();
     let mut two = Vec::new();
-    let native = model.native_speed;
+
     for speed in [1.0, 2.0] {
         for (index, text) in chunks.iter().enumerate() {
             let began = Instant::now();
-            let samples =
-                engine.synthesize(text, native.then_some(speed), &AtomicBool::new(false))?;
-            let pcm = dsp::transform(
+            let plan = handy_tts_core::speed::plan(speed, model.native_speed)?;
+            let samples = engine.synthesize(text, Some(plan.native), &AtomicBool::new(false))?;
+            let pcm = dsp::transform_ratio(
                 Pcm {
                     id: index as u64 + 1,
                     sample_rate: engine.sample_rate(),
                     samples,
                 },
-                speed,
+                plan.stretch,
                 0.0,
-                native,
             )?;
             let seconds = began.elapsed().as_secs_f64();
             let audio_seconds = pcm.samples.len() as f64 / f64::from(pcm.sample_rate);

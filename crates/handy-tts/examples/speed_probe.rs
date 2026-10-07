@@ -386,7 +386,7 @@ fn main() -> Result<()> {
     let args = arguments()?;
     let model = catalog::entry(&args.model)?;
     ensure!(
-        model.native_speed || args.native == [1.0],
+        model.id != "pocket-en" || args.native == [1.0],
         "Pocket has no native speed control"
     );
     fs::create_dir_all(&args.out).context("create probe output")?;

@@ -519,11 +519,16 @@ impl<B: Transport> TtsManager<B> {
                 inner.backend.synthesize(
                     id,
                     text,
-                    if selection.model_id == "pocket-en" {
-                        None
-                    } else {
-                        Some(selection.speed)
-                    },
+                    Some(
+                        handy_tts_core::speed::plan(
+                            selection.speed,
+                            handy_tts_core::catalog::entry(&selection.model_id)
+                                .map_err(|_| TtsError::Worker)?
+                                .native_speed,
+                        )
+                        .map_err(|_| TtsError::Worker)?
+                        .native,
+                    ),
                 )
             };
             self.wake_idle();
@@ -1427,7 +1432,18 @@ for line in sys.stdin:
         s.pitch = 6.0;
         m.synthesize(&s, 2, "Two.").unwrap();
         assert_eq!(trace.lock().unwrap().starts, [Device::Cpu]);
-        assert_eq!(trace.lock().unwrap().speeds, [Some(1.0), Some(2.0)]);
+        assert_eq!(trace.lock().unwrap().speeds, [Some(1.0), Some(1.0)]);
+    }
+    #[test]
+    fn pocket_requests_explicit_unity_native_speed_at_two_times() {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let m = manager(RunOn::Cpu, trace.clone(), enough);
+        let mut s = selection();
+        s.model_id = "pocket-en".into();
+        s.voice = "alba".into();
+        s.speed = 2.0;
+        m.synthesize(&s, 1, "Every word.").unwrap();
+        assert_eq!(trace.lock().unwrap().speeds, [Some(1.0)]);
     }
     #[test]
     fn changing_an_inactive_model_device_preserves_the_loaded_worker() {

@@ -30,6 +30,21 @@ fn ort_session(path: &Path, threads: usize) -> Result<Session> {
         .with_context(|| format!("load ONNX graph {}", path.display()))
 }
 
+/// Dispatches a validated native speed before any model inference.
+pub(crate) fn synth_native(
+    model: &str,
+    speed: Option<f32>,
+    synthesize: impl FnOnce(f32) -> Result<Vec<f32>>,
+) -> Result<Vec<f32>> {
+    let native = speed.unwrap_or(1.0);
+    anyhow::ensure!((0.5..=2.0).contains(&native), "invalid speed");
+    anyhow::ensure!(
+        model != "pocket-en" || native == 1.0,
+        "Pocket requires native speed 1.0"
+    );
+    synthesize(native)
+}
+
 pub enum Engine {
     Pocket(Box<pocket::Pocket>),
     Supertonic(Box<supertonic::Supertonic>),
@@ -52,9 +67,13 @@ impl Engine {
     }
     pub fn synth(&mut self, text: &str, speed: Option<f32>) -> Result<Vec<f32>> {
         match self {
-            Self::Pocket(e) => e.synth(text, 1.0),
-            Self::Supertonic(e) => e.synth(text, speed.unwrap_or(1.0)),
-            Self::Kokoro(e) => e.synth(text, speed.unwrap_or(1.0)),
+            Self::Pocket(e) => synth_native("pocket-en", speed, |native| e.synth(text, native)),
+            Self::Supertonic(e) => {
+                synth_native("supertonic-3", speed, |native| e.synth(text, native))
+            }
+            Self::Kokoro(e) => {
+                synth_native("kokoro-82m-int8", speed, |native| e.synth(text, native))
+            }
         }
     }
     pub fn voice(&mut self, root: &Path, voice: &str) -> Result<()> {

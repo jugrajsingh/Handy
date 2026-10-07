@@ -17,6 +17,7 @@ pub mod scheduler;
 pub mod selection;
 pub mod selection_options;
 pub mod session;
+pub mod speed;
 pub mod text;
 pub mod tray;
 pub mod worker_env;

@@ -418,6 +418,38 @@ pub fn parse_model(args: impl Iterator<Item = String>) -> Result<String> {
 mod tests {
     use super::*;
     #[test]
+    fn pocket_engine_refuses_native_speed_other_than_one() {
+        let mut calls = 0;
+        for speed in [Some(0.5), Some(2.0), Some(f32::NAN)] {
+            assert!(
+                crate::synth_native("pocket-en", speed, |_| {
+                    calls += 1;
+                    Ok(vec![0.25])
+                })
+                .is_err()
+            );
+        }
+        assert_eq!(calls, 0);
+        for speed in [None, Some(1.0)] {
+            assert_eq!(
+                crate::synth_native("pocket-en", speed, |native| {
+                    assert_eq!(native, 1.0);
+                    Ok(vec![0.25])
+                })
+                .unwrap(),
+                [0.25]
+            );
+        }
+        assert_eq!(
+            crate::synth_native("supertonic-3", Some(1.3), |native| Ok(vec![native])).unwrap(),
+            [1.3]
+        );
+        assert_eq!(
+            crate::synth_native("kokoro-82m-int8", Some(1.1), |native| Ok(vec![native])).unwrap(),
+            [1.1]
+        );
+    }
+    #[test]
     fn only_npu_compile_rejection_has_the_driver_failure_header() {
         use handy_tts_core::device::Device;
         for (device, compile_rejected, expected) in [
