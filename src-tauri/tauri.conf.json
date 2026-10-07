@@ -64,8 +64,14 @@
         },
         "files": {
           "/usr/lib/Handy": "transcribe-libs",
-          "/usr/lib/Handy/llm": "llm-bin"
-        }
+          "/usr/lib/Handy/llm": "llm-bin",
+          "/usr/lib/Handy/tts": "tts-bin"
+        },
+        "recommends": [
+          "intel-compute-runtime",
+          "intel-level-zero",
+          "oneapi-level-zero"
+        ]
       },
       "appimage": {
         "bundleMediaFramework": true,
