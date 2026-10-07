@@ -34,7 +34,11 @@ fn speeds(value: &str) -> Result<Vec<f32>> {
 }
 
 fn arguments() -> Result<Args> {
-    let mut args = std::env::args().skip(1);
+    parse_arguments(std::env::args().skip(1))
+}
+
+fn parse_arguments(args: impl IntoIterator<Item = String>) -> Result<Args> {
+    let mut args = args.into_iter().peekable();
     let mut values = std::collections::BTreeMap::new();
     let mut texts = Vec::new();
     let mut paragraph = false;
@@ -63,12 +67,16 @@ fn arguments() -> Result<Args> {
             .contains(&key.as_str()),
             "unknown option {key}"
         );
-        let value = args
-            .next()
-            .with_context(|| format!("missing value for {key}"))?;
         if key == "--text" {
-            texts.push(PathBuf::from(value));
+            let before = texts.len();
+            while let Some(value) = args.next_if(|value| !value.starts_with("--")) {
+                texts.push(PathBuf::from(value));
+            }
+            ensure!(texts.len() > before, "missing value for {key}");
         } else {
+            let value = args
+                .next()
+                .with_context(|| format!("missing value for {key}"))?;
             ensure!(values.insert(key, value).is_none(), "duplicate option");
         }
     }
@@ -167,6 +175,18 @@ fn frame_count(samples: usize, stride: usize) -> usize {
     samples.div_ceil(stride)
 }
 
+fn queue_capacity_split<'a>(pending: &mut Vec<&'a str>, part: &'a str) -> Result<()> {
+    let split = part
+        .char_indices()
+        .filter(|(i, ch)| *i > 0 && ch.is_whitespace() && !part[*i..].trim().is_empty())
+        .min_by_key(|(i, _)| i.abs_diff(part.len() / 2))
+        .map(|(i, _)| i)
+        .context("NPU chunk cannot split")?;
+    pending.push(part[split..].trim_start());
+    pending.push(part[..split].trim_end());
+    Ok(())
+}
+
 fn hybrid_ratio(requested: f32, native: f32) -> Option<f32> {
     let ratio = requested / native;
     (0.5..=2.0).contains(&ratio).then_some(ratio)
@@ -238,17 +258,8 @@ impl Probe {
                     if self.args.device == Device::Npu
                         && error.is::<handy_tts::padding::StaticCapacity>() =>
                 {
-                    let split = part
-                        .char_indices()
-                        .filter(|(i, ch)| {
-                            *i > 0 && ch.is_whitespace() && !part[*i..].trim().is_empty()
-                        })
-                        .min_by_key(|(i, _)| i.abs_diff(part.len() / 2))
-                        .map(|(i, _)| i)
-                        .context("NPU chunk cannot split")?;
+                    queue_capacity_split(&mut pending, part)?;
                     self.record(json!({"kind":"static_split", "document":document, "chunk_index":index, "text":part, "native_speed":native, "seconds":seconds}))?;
-                    pending.push(part[split..].trim_start());
-                    pending.push(part[..split].trim_end());
                     continue;
                 }
                 Err(error) => return Err(error).context("synthesize probe chunk"),
@@ -435,18 +446,81 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).unwrap();
+        }
+    }
+
+    #[test]
+    fn parses_step_three_multifile_text_and_repeated_flags() {
+        let argv = [
+            "--model",
+            "supertonic-3",
+            "--root",
+            "/models/supertonic3",
+            "--device",
+            "gpu",
+            "--cache",
+            "/src/.superpowers/scratch/read-aloud-streaming/ov-cache",
+            "--text",
+            "/src/crates/handy-tts-core/tests/fixtures/speech/owner-2x.txt",
+            "/src/crates/handy-tts-core/tests/fixtures/text/01-heading.txt",
+            "/src/crates/handy-tts-core/tests/fixtures/text/06-long-doc.txt",
+            "--max-words",
+            "500",
+            "--native",
+            "0.5,0.6,0.7,0.8,0.9,1.0,1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,2.0",
+            "--stretch",
+            "1.5,2.0",
+            "--out",
+            "/src/.superpowers/scratch/read-aloud-streaming/sweep",
+        ];
+        let parsed = parse_arguments(argv.map(str::to_owned)).unwrap();
+        assert_eq!(parsed.model, "supertonic-3");
+        assert_eq!(parsed.root, PathBuf::from(argv[3]));
+        assert_eq!(parsed.device, Device::Gpu);
+        assert_eq!(parsed.cache, PathBuf::from(argv[7]));
+        assert_eq!(
+            parsed.texts,
+            argv[9..12].iter().map(PathBuf::from).collect::<Vec<_>>()
+        );
+        assert_eq!(parsed.max_words, 500);
+        assert_eq!(
+            parsed.native,
+            (5..=20).map(|i| i as f32 / 10.0).collect::<Vec<_>>()
+        );
+        assert_eq!(parsed.stretch, [1.5, 2.0]);
+        assert_eq!(parsed.out, PathBuf::from(argv[19]));
+        assert!(parsed.repeat && !parsed.paragraph);
+        let mut repeated = argv.to_vec();
+        repeated.insert(11, "--text");
+        repeated.insert(10, "--text");
+        assert_eq!(
+            parse_arguments(repeated.into_iter().map(str::to_owned))
+                .unwrap()
+                .texts,
+            parsed.texts
+        );
+        let missing_text = argv[..9]
+            .iter()
+            .chain(argv[12..].iter())
+            .map(|value| (*value).to_owned());
+        assert!(
+            parse_arguments(missing_text)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("missing value for --text")
+        );
+    }
     #[test]
     fn composed_probe_records_chunks_repeats_and_exact_hybrid_audio() {
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
         };
-        struct Scratch(PathBuf);
-        impl Drop for Scratch {
-            fn drop(&mut self) {
-                fs::remove_dir_all(&self.0).unwrap();
-            }
-        }
         struct Fake(Arc<AtomicUsize>);
         impl SynthEngine for Fake {
             fn synthesize(
@@ -549,6 +623,136 @@ mod tests {
                 .count(),
             1
         );
+    }
+    #[test]
+    fn capacity_split_preserves_both_halves_for_stack_order() {
+        let source = "Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima mike november oscar papa.";
+        let mut pending = vec!["existing"];
+        queue_capacity_split(&mut pending, source).unwrap();
+        let left = pending.pop().unwrap();
+        let right = pending.pop().unwrap();
+        assert_eq!(format!("{left} {right}"), source);
+        assert_eq!(pending, ["existing"]);
+        assert!(queue_capacity_split(&mut Vec::new(), "unsplittable").is_err());
+    }
+    #[test]
+    fn npu_capacity_splits_preserve_all_text_and_pcm_in_order() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct BoundedNpu(Vec<String>);
+        impl SynthEngine for BoundedNpu {
+            fn synthesize(
+                &mut self,
+                text: &str,
+                _: Option<f32>,
+                _: &AtomicBool,
+            ) -> Result<Vec<f32>> {
+                if text.split_whitespace().count() > 2 {
+                    return Err(anyhow::Error::new(handy_tts::padding::StaticCapacity)
+                        .context("fake bounded NPU"));
+                }
+                Ok(text
+                    .split_whitespace()
+                    .flat_map(|word| {
+                        let position = self.0.iter().position(|expected| expected == word).unwrap();
+                        std::iter::repeat_n((position + 1) as f32 / 32.0, 16)
+                    })
+                    .collect())
+            }
+            fn sample_rate(&self) -> u32 {
+                24000
+            }
+        }
+        struct Failure(Arc<AtomicUsize>);
+        impl SynthEngine for Failure {
+            fn synthesize(&mut self, _: &str, _: Option<f32>, _: &AtomicBool) -> Result<Vec<f32>> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                bail!("ordinary engine failure")
+            }
+            fn sample_rate(&self) -> u32 {
+                24000
+            }
+        }
+        let source = "Ant bat cat dog eel fox gum hat ink jet key log map nut owl pig.";
+        let root = PathBuf::from(std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap());
+        let scratch = Scratch(root.join(format!("s2-npu-probe-{}", std::process::id())));
+        fs::create_dir(&scratch.0).unwrap();
+        let input = scratch.0.join("npu.txt");
+        fs::write(&input, source).unwrap();
+        let mut cursor = TextCursor::new(source, false).unwrap();
+        let prepared = cursor.next_chunk().unwrap().unwrap().text;
+        assert!(cursor.next_chunk().unwrap().is_none());
+        let words: Vec<_> = prepared.split_whitespace().map(str::to_owned).collect();
+        let log_path = scratch.0.join("probe.jsonl");
+        let mut probe = Probe {
+            args: Args {
+                model: "supertonic-3".into(),
+                root: scratch.0.clone(),
+                device: Device::Npu,
+                cache: scratch.0.clone(),
+                texts: vec![input.clone()],
+                native: vec![1.0],
+                stretch: vec![],
+                out: scratch.0.clone(),
+                max_words: usize::MAX,
+                paragraph: false,
+                repeat: false,
+            },
+            engine: Box::new(BoundedNpu(words.clone())),
+            stride: Some(100),
+            seen: BTreeSet::new(),
+            log: fs::File::create(&log_path).unwrap(),
+        };
+        probe.document(&input).unwrap();
+        let rows: Vec<serde_json::Value> = fs::read_to_string(&log_path)
+            .unwrap()
+            .lines()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect();
+        let successful: Vec<_> = rows
+            .iter()
+            .filter(|row| row["kind"] == "synthesis")
+            .collect();
+        let actual_words: Vec<_> = successful
+            .iter()
+            .flat_map(|row| row["text"].as_str().unwrap().split_whitespace())
+            .collect();
+        assert_eq!(actual_words, words);
+        assert!(
+            successful
+                .iter()
+                .all(|row| row["text"].as_str().unwrap().split_whitespace().count() <= 2)
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row["kind"] == "static_split")
+                .count(),
+            7
+        );
+        let audio = fs::read(scratch.0.join("supertonic-3-npu-npu-native1.0.wav")).unwrap();
+        let actual_pcm: Vec<_> = audio[44..]
+            .chunks_exact(2)
+            .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+            .collect();
+        let expected_pcm: Vec<_> = (0..words.len())
+            .flat_map(|position| {
+                std::iter::repeat_n(
+                    (((position + 1) as f32 / 32.0) * 32767.0).round() as i16,
+                    16,
+                )
+            })
+            .collect();
+        assert_eq!(actual_pcm, expected_pcm);
+
+        let before = fs::read(&log_path).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        probe.engine = Box::new(Failure(Arc::clone(&calls)));
+        let error = probe.document(&input).unwrap_err();
+        assert_eq!(error.root_cause().to_string(), "ordinary engine failure");
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(fs::read(&log_path).unwrap(), before);
     }
     #[test]
     fn max_words_preserves_markdown_and_paragraph_selection() {
