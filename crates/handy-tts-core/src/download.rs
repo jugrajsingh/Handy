@@ -1255,33 +1255,37 @@ mod tests {
     }
     #[test]
     fn blocking_timeout_is_per_read_and_stalls_are_bounded() {
+        let read_timeout = Duration::from_millis(1500);
         let header = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\n";
         let mut chunks = vec![(Duration::ZERO, header.into())];
         chunks.extend(
             "public"
                 .chars()
-                .map(|c| (Duration::from_millis(100), c.to_string())),
+                .map(|c| (Duration::from_millis(400), c.to_string())),
         );
         let server = TestServer::start_chunks(vec![chunks]);
         let root = root("slow-stream");
         let entry = public_fixture();
-        let transport = HttpTransport::build(&server.base, Duration::from_millis(350)).unwrap();
+        let transport = HttpTransport::build(&server.base, read_timeout).unwrap();
+        let streaming_started = std::time::Instant::now();
         downloader_without_environment()
             .download(&root, &entry, &transport, &AtomicBool::new(false), |_| {})
             .unwrap();
+        assert!(streaming_started.elapsed() > read_timeout);
         server.finish();
         assert!(is_downloaded(&root, &entry));
         fs::remove_dir_all(root).unwrap();
 
         let server = TestServer::start_chunks(vec![vec![
             (Duration::ZERO, header.into()),
-            (Duration::from_millis(700), "public".into()),
+            (Duration::from_millis(3500), "public".into()),
         ]]);
-        let transport = HttpTransport::build(&server.base, Duration::from_millis(350)).unwrap();
+        let transport = HttpTransport::build(&server.base, read_timeout).unwrap();
         let mut response = transport.get(&entry.files[0], 0, None).unwrap();
         let started = std::time::Instant::now();
         assert!(response.body.read(&mut [0; 6]).is_err());
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() >= read_timeout / 2);
+        assert!(started.elapsed() < Duration::from_secs(4));
         server.finish();
     }
 }
