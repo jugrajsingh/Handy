@@ -305,6 +305,11 @@ impl<B: Transport> TtsManager<B> {
         }
         let entry = catalog::entry(&selection.model_id).map_err(|_| TtsError::Model)?;
         if !(self.checks.downloaded)(&inner.config.root, entry) {
+            log::warn!(
+                "TTS worker start refused: {}: {}",
+                entry.id,
+                TtsError::NotDownloaded
+            );
             return Err(TtsError::NotDownloaded);
         }
         if !entry.voices.contains(&selection.voice) {
@@ -378,6 +383,7 @@ impl<B: Transport> TtsManager<B> {
             );
             let root = config.root.join(entry.id);
             let cache = config.cache.join(entry.id).join(format!("{device:?}"));
+            log::info!("TTS worker starting: {} on {device:?}", entry.id);
             let result = inner.backend.start(&LoadSpec {
                 binary: &config.binary,
                 root: &root,
@@ -396,6 +402,11 @@ impl<B: Transport> TtsManager<B> {
             }
             match result {
                 Err(TtsError::Memory) => {
+                    log::warn!(
+                        "TTS worker start failed: {}: {}",
+                        entry.id,
+                        TtsError::Memory
+                    );
                     inner.backend.stop();
                     inner.key = None;
                     inner.lifecycle.stopped();
@@ -410,6 +421,7 @@ impl<B: Transport> TtsManager<B> {
                     return Err(TtsError::Memory);
                 }
                 Ok(ready) if ready.device == device && !ready.placement.is_empty() => {
+                    log::info!("TTS worker ready: {} on {device:?}", entry.id);
                     inner.lifecycle.ready(self.started.elapsed());
                     inner.key = Some(WorkerKey {
                         model: selection.model_id.clone(),
@@ -435,6 +447,10 @@ impl<B: Transport> TtsManager<B> {
                 }
                 outcome => {
                     last = outcome.err().unwrap_or(TtsError::Protocol);
+                    log::warn!(
+                        "TTS worker start failed: {} on {device:?}: {last}",
+                        entry.id
+                    );
                     inner.backend.stop();
                     inner.key = None;
                     if interrupted() {
@@ -803,6 +819,92 @@ mod tests {
     }
     fn enough() -> Result<u64, TtsError> {
         Ok(handy_tts_core::memory::MIN_AVAILABLE_BYTES)
+    }
+    #[test]
+    fn missing_startup_default_reports_not_downloaded_without_starting_worker() {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let model = TtsManager::with_backend(
+            config(RunOn::Cpu),
+            Fake {
+                control: FakeControl::default(),
+                trace: trace.clone(),
+            },
+            Checks {
+                memory: enough,
+                downloaded: |_, _| false,
+            },
+        )
+        .unwrap();
+        let settings = crate::settings::get_default_settings();
+        assert_eq!(
+            model.ensure(&super::super::service::selection(&settings)),
+            Err(TtsError::NotDownloaded)
+        );
+        assert!(trace.lock().unwrap().starts.is_empty());
+    }
+    #[test]
+    fn worker_start_and_failure_are_logged_without_credentials() {
+        struct Logs(Mutex<Vec<String>>);
+        impl log::Log for Logs {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push(format!("{} {}", record.level(), record.args()));
+            }
+            fn flush(&self) {}
+        }
+        static LOGS: Logs = Logs(Mutex::new(Vec::new()));
+        log::set_logger(&LOGS).unwrap();
+        log::set_max_level(log::LevelFilter::Info);
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        trace.lock().unwrap().fail_all = true;
+        let model = manager(RunOn::Cpu, trace, enough);
+        assert!(model.ensure(&selection()).is_err());
+        let reading = super::super::session::tests::selection_actor();
+        super::super::commands::select_with_store(
+            selection(),
+            true,
+            &reading,
+            crate::settings::get_default_settings,
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            super::super::commands::select_with_store(
+                selection(),
+                false,
+                &reading,
+                crate::settings::get_default_settings,
+                |_| Ok(())
+            ),
+            Err("tts.errors.notDownloaded".into())
+        );
+        assert!(reading.shutdown());
+        let logs = LOGS.0.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("INFO TTS selection saved: supertonic-3")),
+            "selection success is logged"
+        );
+        assert!(
+            logs.iter().any(|line| line
+                .contains("WARN TTS selection failed: supertonic-3: tts.errors.notDownloaded")),
+            "selection failure is logged"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("INFO TTS worker starting: supertonic-3")),
+            "worker start is logged"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("WARN TTS worker start failed: supertonic-3")),
+            "worker failure is logged"
+        );
     }
     #[test]
     fn interrupted_npu_start_is_cancelled_without_failure_retry_or_driver_rejection() {

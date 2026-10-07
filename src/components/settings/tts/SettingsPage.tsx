@@ -5,6 +5,7 @@ import { commands, type Selection, type TtsModelInfo } from "@/bindings";
 import { useSettings } from "@/hooks/useSettings";
 import { unwrapTts } from "./ModelsPage";
 import { selectionEntries } from "./actions";
+import { ModelSelect } from "./ModelSelect";
 export function SettingsPage() {
   const { t } = useTranslation();
   const {
@@ -48,6 +49,7 @@ export function SettingsPage() {
         },
         refresh: refreshSettingsChecked,
         error: setError,
+        clearError: () => setError(null),
         display: setDraft,
       }),
     [refreshSettingsChecked],
@@ -78,28 +80,16 @@ export function SettingsPage() {
     <section className="w-full max-w-3xl flex flex-col gap-4">
       <h2>{t("tts.settingsTitle")}</h2>
       {error && <p role="alert">{t(error)}</p>}
-      <label>
-        {t("tts.model")}
-        <select
-          value={id}
-          onChange={(event) => {
-            const next = models.find((row) => row.id === event.target.value);
-            if (next)
-              change({
-                model_id: next.id,
-                voice: settings?.tts_voice?.[next.id] ?? next.default_voice,
-              });
-          }}
-        >
-          {models
-            .filter((row) => row.downloaded)
-            .map((row) => (
-              <option key={row.id} value={row.id}>
-                {row.display_name}
-              </option>
-            ))}
-        </select>
-      </label>
+      <ModelSelect
+        models={models}
+        value={id}
+        change={(next) =>
+          change({
+            model_id: next.id,
+            voice: settings?.tts_voice?.[next.id] ?? next.default_voice,
+          })
+        }
+      />
       <label>
         {t("tts.voice")}
         <select

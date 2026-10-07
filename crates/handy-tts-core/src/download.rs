@@ -55,6 +55,10 @@ impl Credentials {
             Some(value)
         };
     }
+    /// Reports only the memory token presence for settings controls.
+    pub fn session_configured(&self) -> bool {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+    }
     /// Reports whether a session token or an enabled HF_TOKEN is available.
     pub fn configured(&self) -> bool {
         self.token().is_some()
@@ -295,6 +299,22 @@ pub struct Downloader {
 impl Downloader {
     /// Downloads and verifies every file before marking a model available.
     pub fn download(
+        &self,
+        root: &Path,
+        entry: &ModelEntry,
+        transport: &dyn Transport,
+        cancel: &AtomicBool,
+        progress: impl Fn(Progress),
+    ) -> Result<PathBuf, DownloadError> {
+        log::info!("TTS download started: {}", entry.id);
+        let result = self.download_inner(root, entry, transport, cancel, progress);
+        match &result {
+            Ok(_) => log::info!("TTS download completed: {}", entry.id),
+            Err(error) => log::warn!("TTS download failed: {}: {error}", entry.id),
+        }
+        result
+    }
+    fn download_inner(
         &self,
         root: &Path,
         entry: &ModelEntry,
@@ -580,7 +600,58 @@ mod tests {
             format!("{error} {error:?}"),
             "tts.errors.download Transport"
         );
+        let root = root("logging");
+        let downloader = Downloader {
+            credentials: Credentials::memory_only(),
+        };
+        let mut entry = fixture();
+        entry.files.remove(0);
+        entry.bytes = entry.files[0].bytes;
+        assert_eq!(
+            downloader
+                .download(
+                    &root,
+                    &entry,
+                    &RefuseTransport,
+                    &AtomicBool::new(false),
+                    |_| {}
+                )
+                .unwrap_err(),
+            DownloadError::TokenRequired
+        );
+        downloader
+            .credentials
+            .set("hf_fixture_secret_never_log".into());
+        downloader
+            .download(
+                &root,
+                &entry,
+                &MemoryTransport {
+                    body: b"voice".to_vec(),
+                    offset: 0,
+                    status: 200,
+                },
+                &AtomicBool::new(false),
+                |_| {},
+            )
+            .unwrap();
         let logs = LOGGER.0.lock().unwrap();
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("TTS download completed: pocket-en")),
+            "download completion is logged"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line.contains("TTS download started: pocket-en")),
+            "download start is logged"
+        );
+        assert!(
+            logs.iter()
+                .any(|line| line
+                    .contains("TTS download failed: pocket-en: tts.errors.tokenRequired")),
+            "download failure is logged"
+        );
         assert!(logs.iter().any(|line| line.contains("capture-probe")));
         assert!(
             !logs
@@ -1067,6 +1138,20 @@ mod tests {
             "manifest order must not change its identity"
         );
         fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn session_presence_excludes_environment_fallback_and_clear_removes_it() {
+        let credentials = Credentials::default();
+        assert!(
+            credentials
+                .token_with(|| Some("hf_fixture_environment".into()))
+                .is_some()
+        );
+        assert!(!credentials.session_configured());
+        credentials.set("hf_fixture_memory".into());
+        assert!(credentials.session_configured());
+        credentials.set("  ".into());
+        assert!(!credentials.session_configured());
     }
     #[test]
     fn credentials_trim_memory_and_environment_seam_without_reading_environment() {

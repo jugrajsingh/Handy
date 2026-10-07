@@ -54,7 +54,7 @@ assert.equal(missing.canUse, false);
 missing.use();
 assert.deepEqual(trace, []);
 missing.download();
-assert.deepEqual(trace, ["download:pocket-en"]);
+assert.deepEqual(trace, [], "Pocket requires a session token before Download");
 trace.length = 0;
 const busy = rowActions(
   { id: "pocket-en", downloaded: true },
@@ -158,6 +158,7 @@ const downloadRow = () =>
       delete: () => {},
       download: (id) => void downloads.download(id),
     },
+    true,
   );
 assert.equal(
   downloadRow().isDownloading,
@@ -270,6 +271,11 @@ assert.equal(
   "tts.errors.download",
   "download errors survive navigation",
 );
+assert.equal(
+  downloads.snapshot().errors["pocket-en"],
+  "tts.errors.download",
+  "download error is assigned to the failed card",
+);
 assert.deepEqual(
   downloads.snapshot().progress,
   {},
@@ -313,3 +319,51 @@ assert.deepEqual(afterFailure[1], {
   read_code: true,
 });
 assert.deepEqual(saveErrors, ["tts.errors.selection"]);
+
+const rollback: TtsSelection[] = [];
+const rollbackEditor = selectionEntries({
+  select: async () => {
+    throw new Error("tts.errors.notDownloaded");
+  },
+  refresh: async () => {},
+  error: () => {},
+  display: (value) => rollback.push(value),
+});
+rollbackEditor.sync(selected);
+await rollbackEditor.edit({ model_id: "supertonic-3", voice: "F1" }, selected);
+assert.deepEqual(
+  rollback[rollback.length - 1],
+  selected,
+  "failed selection restores the saved model",
+);
+
+const tokenReadyRow = rowActions(
+  { id: "pocket-en", downloaded: false },
+  { selectedId: "other", downloadId: null, deletingId: null },
+  callbacks,
+  true,
+);
+tokenReadyRow.download();
+assert.deepEqual(
+  trace,
+  ["download:pocket-en"],
+  "Pocket downloads once the token is ready",
+);
+
+const committed = { ...selected, model_id: "supertonic-3", voice: "F1" };
+const afterRefreshError: TtsSelection[] = [];
+const refreshFailure = selectionEntries({
+  select: async () => {},
+  refresh: async () => {
+    throw new Error("fixture refresh");
+  },
+  error: () => {},
+  display: (value) => afterRefreshError.push(value),
+});
+refreshFailure.sync(selected);
+await refreshFailure.settings(committed);
+assert.deepEqual(
+  afterRefreshError[afterRefreshError.length - 1],
+  committed,
+  "refresh failure keeps the model already committed by the backend",
+);

@@ -160,31 +160,61 @@ pub fn set_selection(
     service: &TtsService,
     chosen: Selection,
 ) -> Result<(), String> {
-    let chosen = clamp_selection(chosen).map_err(|e| e.to_string())?;
+    let chosen = clamp_selection(chosen).map_err(|e| {
+        log::warn!("TTS selection refused: {e}");
+        e.to_string()
+    })?;
     let entry = catalog::entry(&chosen.model_id).map_err(|e| e.to_string())?;
     if !entry.voices.contains(&chosen.voice) {
+        log::warn!("TTS selection refused: tts.errors.invalidVoice");
         return Err("tts.errors.invalidVoice".into());
     }
     let ready = service.ready()?;
-    let mut settings = crate::settings::get_settings(app);
-    settings.tts_model_id = chosen.model_id.clone();
-    settings
-        .tts_voice
-        .insert(chosen.model_id.clone(), chosen.voice.clone());
-    settings.tts_speed = chosen.speed;
-    settings.tts_pitch_semitones = chosen.pitch;
-    settings.tts_output_device = chosen.output_device.clone();
-    settings.tts_read_code_blocks = chosen.read_code;
     let app = app.clone();
-    let result = ready.session.select_and_wait(
+    let reader = app.clone();
+    let result = select_with_store(
         chosen,
         download::is_downloaded(&ready.root, entry),
-        Box::new(move |_| {
-            crate::settings::write_settings_checked(&app, settings)
-                .map_err(|_| handy_tts_core::selection::SelectionError::Persist)
-        }),
+        &ready.session,
+        move || crate::settings::get_settings(&reader),
+        move |settings| crate::settings::write_settings_checked(&app, settings),
     );
     service.refresh_tray();
+    result
+}
+pub(super) fn select_with_store(
+    chosen: Selection,
+    downloaded: bool,
+    session: &super::session::ReadAloudSession,
+    read: impl FnOnce() -> crate::settings::AppSettings + Send + 'static,
+    write: impl FnOnce(crate::settings::AppSettings) -> Result<(), String> + Send + 'static,
+) -> Result<(), String> {
+    let model = chosen.model_id.clone();
+    log::info!("TTS selection requested: {model}");
+    let result = if !downloaded {
+        Err("tts.errors.notDownloaded".into())
+    } else {
+        session.select_and_wait(
+            chosen,
+            downloaded,
+            Box::new(move |chosen| {
+                let mut settings = read();
+                settings.tts_model_id = chosen.model_id.clone();
+                settings
+                    .tts_voice
+                    .insert(chosen.model_id.clone(), chosen.voice.clone());
+                settings.tts_speed = chosen.speed;
+                settings.tts_pitch_semitones = chosen.pitch;
+                settings.tts_output_device = chosen.output_device.clone();
+                settings.tts_read_code_blocks = chosen.read_code;
+                write(settings).map_err(|_| handy_tts_core::selection::SelectionError::Persist)
+            }),
+        )
+    };
+    match &result {
+        Ok(()) => log::info!("TTS selection saved: {model}"),
+        Err(error) => log::warn!("TTS selection failed: {model}: {error}"),
+    }
     result
 }
 #[tauri::command]
@@ -353,7 +383,7 @@ pub async fn set_tts_hf_token(
     let service = service.inner().clone();
     blocking(move || {
         service.downloader.credentials.set(token);
-        Ok(service.downloader.credentials.configured())
+        Ok(service.downloader.credentials.session_configured())
     })
     .await
 }
@@ -421,6 +451,24 @@ impl Drop for DownloadOwnership<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(flavor = "current_thread")]
+    async fn selection_prepare_and_commit_leave_ui_responsive() {
+        let (release, busy) = std::sync::mpsc::channel();
+        let invoking = std::thread::current().id();
+        let job = blocking(move || {
+            assert_ne!(std::thread::current().id(), invoking);
+            let _ = busy.recv_timeout(std::time::Duration::from_secs(2));
+            Ok(())
+        });
+        tokio::pin!(job);
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+            _ = &mut job => panic!("selection prepare blocked the UI heartbeat"),
+        }
+        release.send(()).unwrap();
+        assert!(job.await.is_ok());
+    }
+
     #[test]
     fn download_snapshot_tracks_backend_ownership_until_job_settles() {
         let map = std::sync::Mutex::new(std::collections::BTreeMap::new());

@@ -25,6 +25,7 @@ import { AccelerationSelector } from "../AccelerationSelector";
 import { LazyStreamClose } from "../LazyStreamClose";
 import { AirPodsMode } from "../AirPodsMode";
 import { FillerWordRemoval } from "../FillerWordRemoval";
+import { HfTokenSetting } from "../tts/HfTokenSetting";
 import { VadBackendSelector } from "../VadBackendSelector";
 
 export const AdvancedSettings: React.FC = () => {
@@ -41,6 +42,7 @@ export const AdvancedSettings: React.FC = () => {
         <ShowOverlay descriptionMode="tooltip" grouped={true} />
         <ModelUnloadTimeoutSetting descriptionMode="tooltip" grouped={true} />
         <ExperimentalToggle descriptionMode="tooltip" grouped={true} />
+        <HfTokenSetting />
       </SettingsGroup>
 
       <SettingsGroup title={t("settings.advanced.groups.output")}>

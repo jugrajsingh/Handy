@@ -39,8 +39,15 @@ pub fn get_app_dir_path(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 #[specta::specta]
-pub fn get_app_settings(app: AppHandle) -> Result<AppSettings, String> {
-    Ok(get_settings(&app))
+pub async fn get_app_settings(app: AppHandle) -> Result<AppSettings, String> {
+    read_app_settings(move || get_settings(&app)).await
+}
+async fn read_app_settings(
+    read: impl FnOnce() -> AppSettings + Send + 'static,
+) -> Result<AppSettings, String> {
+    tauri::async_runtime::spawn_blocking(read)
+        .await
+        .map_err(|_| "Failed to read settings on a worker thread".to_owned())
 }
 
 #[tauri::command]
@@ -204,4 +211,36 @@ pub fn complete_onboarding(app: AppHandle) -> Result<(), String> {
     settings.onboarding_completed = true;
     crate::settings::write_settings(&app, settings);
     Ok(())
+}
+
+#[cfg(test)]
+mod settings_read_tests {
+    #[tokio::test(flavor = "current_thread")]
+    async fn selection_refresh_keeps_event_loop_responsive_while_store_is_busy() {
+        let (release, store_busy) = std::sync::mpsc::channel();
+        let read = super::read_app_settings(move || {
+            let _ = store_busy.recv_timeout(std::time::Duration::from_secs(2));
+            crate::settings::get_default_settings()
+        });
+        tokio::pin!(read);
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+            _ = &mut read => panic!("busy store read prevented the event-loop heartbeat"),
+        }
+        release.send(()).unwrap();
+        assert!(read.await.is_ok());
+    }
+    #[test]
+    fn settings_refresh_never_waits_for_store_on_the_invoking_thread() {
+        let invoking = std::thread::current().id();
+        let result = tauri::async_runtime::block_on(super::read_app_settings(move || {
+            assert_ne!(
+                std::thread::current().id(),
+                invoking,
+                "store reads must leave the UI thread"
+            );
+            crate::settings::get_default_settings()
+        }));
+        assert!(result.is_ok());
+    }
 }

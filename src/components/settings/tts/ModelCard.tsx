@@ -49,6 +49,7 @@ export interface ModelCardProps {
   tokenSet?: boolean;
   setToken?: () => void;
   tokenEntry?: ReactNode;
+  downloadError?: string;
 }
 export function applyModelUse(
   row: Pick<ReturnType<typeof rowActions>, "canUse" | "use">,
@@ -66,9 +67,10 @@ export function ModelCard({
   tokenSet = false,
   setToken,
   tokenEntry,
+  downloadError,
 }: ModelCardProps) {
   const { t } = useTranslation();
-  const row = rowActions(model, state, actions);
+  const row = rowActions(model, state, actions, tokenSet);
   const rating = completeRating(model);
   const invalidNpu =
     model.npu_driver_too_old ||
@@ -210,6 +212,11 @@ export function ModelCard({
           </div>
         )}
         {needsToken && tokenEntry}
+        {downloadError && (
+          <p role="alert" className="w-full text-sm text-logo-primary">
+            {t(downloadError)}
+          </p>
+        )}
         {downloadProgress && row.isDownloading && (
           <progress
             className="w-full h-1.5 accent-logo-primary"

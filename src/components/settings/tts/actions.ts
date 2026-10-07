@@ -10,13 +10,14 @@ export interface SelectionDependencies {
   select: (selection: TtsSelection) => Promise<void>;
   refresh: () => Promise<void>;
   error: (key: string) => void;
+  clearError?: () => void;
   display?: (selection: TtsSelection) => void;
 }
 export function selectionEntries(dependencies: SelectionDependencies) {
   let pending: Promise<void> | null = null;
   let queued: TtsSelection | null = null;
   let desired: TtsSelection | null = null;
-  let failed = false;
+  let confirmed: TtsSelection | null = null;
   const drain = async () => {
     try {
       while (queued !== null) {
@@ -24,11 +25,19 @@ export function selectionEntries(dependencies: SelectionDependencies) {
         queued = null;
         try {
           await dependencies.select(selection);
+          confirmed = { ...selection };
           await dependencies.refresh();
-          failed = false;
-        } catch {
-          failed = true;
-          dependencies.error("tts.errors.selection");
+          dependencies.clearError?.();
+        } catch (reason) {
+          if (!queued && confirmed) {
+            desired = { ...confirmed };
+            dependencies.display?.(desired);
+          }
+          dependencies.error(
+            reason instanceof Error && reason.message.startsWith("tts.errors.")
+              ? reason.message
+              : "tts.errors.selection",
+          );
         }
       }
     } finally {
@@ -48,7 +57,8 @@ export function selectionEntries(dependencies: SelectionDependencies) {
     edit: (patch: Partial<TtsSelection>, fallback: TtsSelection) =>
       choose({ ...(desired ?? fallback), ...patch }),
     sync: (selection: TtsSelection) => {
-      if (pending || failed) return;
+      if (pending) return;
+      confirmed = { ...selection };
       desired = { ...selection };
       dependencies.display?.(desired);
     },
@@ -72,10 +82,12 @@ export function rowActions(
   model: TtsRowModel,
   state: TtsRowState,
   callbacks: TtsRowCallbacks,
+  tokenSet = false,
 ) {
   const busy = state.downloadId !== null || state.deletingId !== null;
   const canUse = !busy && model.downloaded && model.id !== state.selectedId;
-  const canDownload = !busy && !model.downloaded;
+  const canDownload =
+    !busy && !model.downloaded && (model.id !== "pocket-en" || tokenSet);
   const canDelete = !busy && model.downloaded;
   return {
     canUse,
@@ -104,6 +116,7 @@ export interface DownloadSnapshot {
   active: readonly string[];
   progress: Record<string, TtsDownloadProgress>;
   error: string | null;
+  errors: Record<string, string>;
 }
 export interface DownloadDependencies {
   query: () => Promise<readonly string[]>;
@@ -112,7 +125,12 @@ export interface DownloadDependencies {
   cancel: (id: string) => Promise<void>;
 }
 export function downloadController(dependencies: DownloadDependencies) {
-  let state: DownloadSnapshot = { active: [], progress: {}, error: null };
+  let state: DownloadSnapshot = {
+    active: [],
+    progress: {},
+    error: null,
+    errors: {},
+  };
   const subscribers = new Set<() => void>();
   const jobs = new Set<string>();
   const finished = new Set<string>();
@@ -123,13 +141,15 @@ export function downloadController(dependencies: DownloadDependencies) {
     revision++;
     subscribers.forEach((listener) => listener());
   };
-  const error = (reason: unknown) => {
+  const error = (reason: unknown, id?: string) => {
+    const key =
+      reason instanceof Error && reason.message.startsWith("tts.errors.")
+        ? reason.message
+        : "tts.errors.generic";
     publish({
       ...state,
-      error:
-        reason instanceof Error && reason.message.startsWith("tts.errors.")
-          ? reason.message
-          : "tts.errors.generic",
+      error: key,
+      errors: id ? { ...state.errors, [id]: key } : state.errors,
     });
   };
   const refresh = async () => {
@@ -180,11 +200,13 @@ export function downloadController(dependencies: DownloadDependencies) {
       if (state.active.length > 0) return;
       jobs.add(id);
       finished.delete(id);
-      publish({ ...state, active: [id], progress: {}, error: null });
+      const errors = { ...state.errors };
+      delete errors[id];
+      publish({ ...state, active: [id], progress: {}, error: null, errors });
       try {
         await dependencies.download(id);
       } catch (reason) {
-        error(reason);
+        error(reason, id);
       } finally {
         jobs.delete(id);
         finished.add(id);

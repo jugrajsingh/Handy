@@ -38,6 +38,9 @@ impl ManagerWorker {
                 let result = engine
                     .synthesize(&job.selection, job.id, &job.text)
                     .map_err(|e| e.to_string());
+                if let Err(error) = &result {
+                    log::error!("TTS synthesis failed: {}: {error}", job.selection.model_id);
+                }
                 if results
                     .send(Completion {
                         ticket: job.ticket,
@@ -431,7 +434,7 @@ impl ReadAloudSession {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use handy_tts_core::{
         playback::{Output, PlaybackError, Poll},
@@ -597,6 +600,9 @@ mod tests {
             Arc::new(|_| {}),
         )
     }
+    pub(in crate::tts) fn selection_actor() -> Arc<ReadAloudSession> {
+        actor(Arc::new(Mutex::new(SharedAudio::default())))
+    }
     fn wait_for_state(reading: &ReadAloudSession, state: PlaybackState) -> SessionView {
         for _ in 0..100 {
             let view = reading.snapshot();
@@ -606,6 +612,90 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("session did not reach {state:?}");
+    }
+    mod model_selection {
+        use super::*;
+        #[test]
+        fn missing_model_returns_visible_error_without_persisting() {
+            let reading = actor(Arc::new(Mutex::new(SharedAudio::default())));
+            let result = super::super::super::commands::select_with_store(
+                selection(),
+                false,
+                &reading,
+                crate::settings::get_default_settings,
+                |_| panic!("incomplete model must not persist"),
+            );
+            assert_eq!(result, Err("tts.errors.notDownloaded".into()));
+            assert!(reading.shutdown());
+        }
+        #[test]
+        fn settings_command_persists_downloaded_model_and_read_path_uses_it_after_restart() {
+            let reading = actor(Arc::new(Mutex::new(SharedAudio::default())));
+            let scratch =
+                std::path::PathBuf::from(std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap());
+            let path = scratch.join(format!("bug1-settings-{}.json", std::process::id()));
+            let persisted = path.clone();
+            super::super::super::commands::select_with_store(
+                selection(),
+                true,
+                &reading,
+                crate::settings::get_default_settings,
+                move |settings| {
+                    std::fs::write(persisted, serde_json::to_vec(&settings).unwrap())
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .unwrap();
+            let stored = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            let settings = crate::settings::load_settings_with(Some(stored), |_| {});
+            assert_eq!(settings.tts_model_id, "supertonic-3");
+            assert_eq!(
+                super::super::super::service::selection(&settings),
+                selection()
+            );
+            let (chosen, requests) = mpsc::channel();
+            #[derive(Clone)]
+            struct ReadEngine(mpsc::Sender<Selection>);
+            impl Worker for ReadEngine {
+                fn request(
+                    &mut self,
+                    _: Ticket,
+                    _: &str,
+                    selection: &Selection,
+                ) -> Result<(), String> {
+                    self.0.send(selection.clone()).unwrap();
+                    Ok(())
+                }
+                fn poll(&mut self) -> Option<Completion> {
+                    None
+                }
+                fn cancel(&mut self, _: Ticket) {}
+                fn selection_changed(&mut self) {}
+            }
+            let restarted = ReadAloudSession::spawn_with(
+                manager(),
+                ReadEngine(chosen.clone()),
+                Audio::default,
+                super::super::super::service::selection(&settings),
+                None,
+                Arc::new(|_| {}),
+            );
+            restarted
+                .send(SessionCommand::Replace {
+                    text: "Read the selected model.".into(),
+                    client_revision: None,
+                    autoplay: true,
+                })
+                .unwrap();
+            assert_eq!(
+                requests.recv_timeout(Duration::from_secs(3)).unwrap(),
+                selection()
+            );
+            restarted.pause_and_wait().unwrap();
+            assert!(restarted.shutdown());
+            assert!(reading.shutdown());
+            std::fs::remove_file(path).unwrap();
+        }
     }
     #[test]
     fn blocked_stop_acknowledgement_still_starts_recording() {

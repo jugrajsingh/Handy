@@ -1,4 +1,3 @@
-import { Button } from "@/components/ui/Button";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -12,6 +11,9 @@ import { ModelCard, type DownloadProgress } from "./ModelCard";
 import { useSettings } from "@/hooks/useSettings";
 import { useSettingsStore } from "@/stores/settingsStore";
 import { downloadController } from "./actions";
+import { groupModels } from "./token";
+import { tokenCardProps } from "./TokenField";
+import { useToken } from "./useToken";
 export function unwrapTts<T>(result: Result<T, string>): T {
   if (result.status === "error") throw new Error(result.error);
   return result.data;
@@ -34,7 +36,6 @@ const downloads = downloadController({
     unwrapTts(await commands.cancelTtsDownload(id));
   },
 });
-let sessionTokenSet = false;
 export function ModelsPage() {
   const { t } = useTranslation();
   const { refreshSettingsChecked } = useSettings();
@@ -46,9 +47,8 @@ export function ModelsPage() {
   );
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [token, setToken] = useState("");
-  const [tokenSet, setTokenSet] = useState(sessionTokenSet);
-  const [showToken, setShowToken] = useState(false);
+  const token = useToken();
+  const groups = groupModels(models, downloadState.active);
   const refresh = async () => {
     setModels(unwrapTts(await commands.getTtsModels()));
   };
@@ -109,77 +109,35 @@ export function ModelsPage() {
           <h2 className="text-sm font-medium text-text/60">
             {t(downloaded ? "tts.downloaded" : "tts.availableToDownload")}
           </h2>
-          {models
-            .filter(
-              (model) =>
-                (model.downloaded &&
-                  !downloadState.active.includes(model.id) &&
-                  !model.downloading) === downloaded,
-            )
-            .map((model) => (
-              <ModelCard
-                key={model.id}
-                model={model}
-                downloadProgress={downloadState.progress[model.id]}
-                available={available}
-                state={{
-                  selectedId: models.find((row) => row.active)?.id ?? "",
-                  downloadId: downloadState.active.includes(model.id)
-                    ? model.id
-                    : (downloadState.active[0] ?? null),
-                  deletingId,
-                }}
-                actions={{
-                  use: (id) => void run(commands.setTtsModel(id)),
-                  download: (id) => void downloads.download(id),
-                  delete: (id) => {
-                    setDeletingId(id);
-                    void run(commands.deleteTtsModel(id)).finally(() =>
-                      setDeletingId(null),
-                    );
-                  },
-                }}
-                runOn={(id, value) => void run(commands.setTtsRunOn(id, value))}
-                cancel={(id) => void downloads.cancel(id)}
-                tokenSet={tokenSet}
-                setToken={() => setShowToken((visible) => !visible)}
-                tokenEntry={
-                  showToken && (
-                    <form
-                      className="w-full text-xs text-text/50 space-y-2"
-                      onSubmit={(event) => {
-                        event.preventDefault();
-                        void run(commands.setTtsHfToken(token)).then(
-                          (saved) => {
-                            if (saved) {
-                              sessionTokenSet = token.trim().length > 0;
-                              setTokenSet(sessionTokenSet);
-                              setToken("");
-                              setShowToken(false);
-                            }
-                          },
-                        );
-                      }}
-                    >
-                      <label className="flex items-center gap-2">
-                        {t("tts.token")}
-                        <input
-                          type="password"
-                          autoComplete="off"
-                          value={token}
-                          onChange={(event) => setToken(event.target.value)}
-                          className="rounded-lg border border-mid-gray/20 bg-background px-2 py-1 text-text"
-                        />
-                      </label>
-                      <p>{t("tts.tokenHelp")}</p>
-                      <Button variant="primary-soft" size="sm" type="submit">
-                        {t("tts.saveToken")}
-                      </Button>
-                    </form>
-                  )
-                }
-              />
-            ))}
+          {(downloaded ? groups.downloaded : groups.available).map((model) => (
+            <ModelCard
+              key={model.id}
+              model={model}
+              downloadProgress={downloadState.progress[model.id]}
+              available={available}
+              state={{
+                selectedId: models.find((row) => row.active)?.id ?? "",
+                downloadId: downloadState.active.includes(model.id)
+                  ? model.id
+                  : (downloadState.active[0] ?? null),
+                deletingId,
+              }}
+              actions={{
+                use: (id) => void run(commands.setTtsModel(id)),
+                download: (id) => void downloads.download(id),
+                delete: (id) => {
+                  setDeletingId(id);
+                  void run(commands.deleteTtsModel(id)).finally(() =>
+                    setDeletingId(null),
+                  );
+                },
+              }}
+              runOn={(id, value) => void run(commands.setTtsRunOn(id, value))}
+              cancel={(id) => void downloads.cancel(id)}
+              {...tokenCardProps(token)}
+              downloadError={downloadState.errors[model.id]}
+            />
+          ))}
         </div>
       ))}
     </section>

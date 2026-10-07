@@ -7,6 +7,8 @@ import english from "../../../i18n/locales/en/translation.json";
 import type { DeviceRating, TtsModelInfo } from "../../../bindings";
 import { ModelCard, completeRating, applyModelUse } from "./ModelCard";
 import { rowActions } from "./actions";
+import { TokenField, tokenCardProps } from "./TokenField";
+import { tokenEntry, createTokenPresence } from "./token";
 const i18n = i18next.createInstance();
 await i18n.init({ lng: "en", resources: { en: { translation: english } } });
 const rating: DeviceRating = {
@@ -56,6 +58,8 @@ function render(
   downloadId: string | null = null,
   downloadedBytes?: number,
   tokenSet = false,
+  tokenForm?: React.ReactNode,
+  downloadError?: string,
 ) {
   return renderToStaticMarkup(
     <I18nextProvider i18n={i18n}>
@@ -77,6 +81,8 @@ function render(
         cancel={() => {}}
         tokenSet={tokenSet}
         setToken={() => {}}
+        tokenEntry={tokenForm}
+        downloadError={downloadError}
       />
     </I18nextProvider>,
   );
@@ -132,7 +138,7 @@ for (const [downloaded, selectedId, downloadId, deletingId] of [
 }
 const missing = render({ ...model, downloaded: false, active: false }, "other");
 assert.ok(!missing.includes(">Use</button>"));
-assert.ok(!button(missing, "Download296 MB").includes("disabled"));
+assert.ok(button(missing, "Download296 MB").includes("disabled"));
 assert.ok(!missing.includes("<select"));
 assert.ok(missing.includes('data-token-chip="required"'));
 assert.ok(missing.includes('data-badge="recommended"'));
@@ -211,3 +217,44 @@ assert.ok(invalidDriver.includes("NPU driver too old"));
 console.log(
   "Card states: active preparing, available Pocket without/with token, available Supertonic, downloaded inactive, downloading, progress, invalid NPU passed",
 );
+
+const tokenActions = tokenEntry(createTokenPresence(), async () => true);
+tokenCardProps({
+  entry: tokenActions,
+  state: tokenActions.snapshot(),
+  present: false,
+}).setToken();
+assert.equal(
+  tokenActions.snapshot().expanded,
+  true,
+  "Models page Set token callback opens the entry",
+);
+const field = render(
+  { ...model, downloaded: false },
+  "other",
+  null,
+  undefined,
+  false,
+  <TokenField state={tokenActions.snapshot()} actions={tokenActions} />,
+  "tts.errors.tokenRequired",
+);
+const tokenForm = field.match(
+  /<form[^>]*data-tts-token-field[^>]*>(.*?)<\/form>/,
+)?.[1];
+assert.ok(
+  tokenForm?.includes('type="password"'),
+  "card token entry defaults to password",
+);
+assert.ok(
+  tokenForm?.includes(english.tts.tokenHelp),
+  "card explains memory-only Pocket token",
+);
+assert.ok(tokenForm?.includes("Clear token"));
+assert.ok(tokenForm?.includes("Show token"));
+assert.ok(
+  field
+    .match(/<p role="alert"[^>]*>(.*?)<\/p>/)?.[1]
+    .includes(english.tts.errors.tokenRequired),
+  "gated download error appears on its card",
+);
+console.log("token entry and access error render within the Pocket card");

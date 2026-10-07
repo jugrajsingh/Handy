@@ -4,6 +4,7 @@ default-members = ["src-tauri"]
 resolver = "2"
 
 [workspace.dependencies]
+log = "0.4.25"
 specta = { version = "=2.0.0-rc.22", features = ["derive"] }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
