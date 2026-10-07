@@ -61,18 +61,36 @@ const html = render(false);
 assert.ok(!html.includes('data-device="gpu"'));
 const npu = row(html, "npu");
 assert.ok(npu.includes('data-recommended="true"'));
-assert.ok(npu.includes('value="80"'));
-assert.ok(npu.includes("4 times real time"));
-assert.ok(npu.includes("cached load: 2 s"));
+assert.ok(npu.includes('aria-valuenow="80"'));
+assert.ok(npu.includes("4.0x faster than real time"));
+assert.ok(npu.includes("loads in 2.0 s"));
 const cpu = row(html, "cpu");
 assert.ok(!cpu.includes('data-recommended="true"'));
-const invalid = row(render(true), "npu");
-assert.ok(invalid.includes("NPU driver too old"));
-assert.ok(!invalid.includes("<meter"));
-assert.ok(!invalid.includes('data-recommended="true"'));
-const unsupported = row(render(false, ["gpu"]), "gpu");
-assert.ok(unsupported.includes("Not supported"));
-assert.ok(!unsupported.includes("<meter"));
+assert.ok(!render(true).includes('data-device="npu"'));
+assert.ok(!render(false, ["gpu"]).includes('data-device="gpu"'));
+const precise = row(
+  render(false, ["cpu"], {
+    ...rating,
+    devices: {
+      ...rating.devices,
+      cpu: {
+        ...supported,
+        first_audio_p95_s: 1.987654321,
+        rtf_1x: 0.263157894,
+        load_s_cached: 0.456789,
+      },
+    },
+  }),
+  "cpu",
+);
+assert.ok(
+  precise.includes(
+    'title="First audio 2.0 s, 3.8x faster than real time, loads in 0.5 s"',
+  ),
+);
+assert.ok(precise.includes('aria-label="Recommended"'));
+assert.ok(precise.includes("w-24 text-end"));
+assert.ok(!precise.includes("placement"));
 const kokoroRating = shippedRatings.models["kokoro-82m-int8"] as ModelRating;
 const kokoro = row(
   render(false, ["cpu"], kokoroRating, "kokoro-82m-int8"),
@@ -80,12 +98,12 @@ const kokoro = row(
 );
 assert.ok(
   kokoro.includes(
-    `First audio: ${kokoroRating.devices.cpu.first_audio_p95_s} s`,
+    `First audio ${kokoroRating.devices.cpu.first_audio_p95_s?.toFixed(1)} s`,
   ),
 );
 assert.ok(
   kokoro.includes(
-    `value="${(kokoroRating.devices.cpu.speed_score ?? 0) * 10}"`,
+    `aria-valuenow="${(kokoroRating.devices.cpu.speed_score ?? 0) * 10}"`,
   ),
 );
 console.log("TTS row-scoped rating render assertions passed");

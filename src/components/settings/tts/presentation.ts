@@ -20,7 +20,6 @@ export interface DeviceRow {
   fill: number;
   supported: boolean;
   recommended: boolean;
-  stateKey: string | null;
   tooltip: Record<string, number | string>;
 }
 export function barFill(score: number | null): number {
@@ -43,26 +42,19 @@ export function deviceRows(
         fill: supported ? barFill(row.speed_score) : 0,
         supported,
         recommended: supported && row.recommended,
-        stateKey: supported
-          ? null
-          : device === "npu" && invalidNpu
-            ? "tts.errors.npuDriverTooOld"
-            : "tts.ratings.notSupported",
         tooltip: supported
           ? {
-              firstAudio: row.first_audio_p95_s ?? 0,
-              faster:
-                row.rtf_1x !== null && row.rtf_1x > 0 ? 1 / row.rtf_1x : 0,
-              rtf2x: row.rtf_2x ?? 0,
-              cold: row.load_s_cold ?? 0,
-              cached: row.load_s_cached ?? 0,
-              placement: Object.entries(row.placement)
-                .map(([graph, target]) => `${graph}: ${target.toUpperCase()}`)
-                .join(", "),
+              firstAudio: (row.first_audio_p95_s ?? 0).toFixed(1),
+              faster: (row.rtf_1x !== null && row.rtf_1x > 0
+                ? 1 / row.rtf_1x
+                : 0
+              ).toFixed(1),
+              load: (row.load_s_cached ?? 0).toFixed(1),
             }
           : {},
       };
-    });
+    })
+    .filter((row) => row.supported);
 }
 export function runOnChoices(available: readonly TtsDevice[]): TtsRunOn[] {
   return ["auto", ...available];

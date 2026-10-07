@@ -50,38 +50,43 @@ export function RunOnControl({
   change,
 }: RunOnControlProps) {
   const { t } = useTranslation();
-  const choices = runOnChoices(available);
+  const choices = runOnChoices(available).filter(
+    (device) => device === "auto" || rating.devices[device].supported,
+  );
   return (
-    <div>
-      <label>
-        {t("tts.runOn")}
-        <select
-          value={value}
-          disabled={!downloaded}
-          onChange={(event) => {
-            applyRunOnChoice(
-              { downloaded, invalidNpu, available, rating, change },
-              event.target.value,
-            );
-          }}
-        >
-          {choices.map((device) => (
-            <option
-              key={device}
-              value={device}
-              disabled={
-                device !== "auto" &&
-                (!rating.devices[device].supported ||
-                  (device === "npu" && invalidNpu))
-              }
-            >
-              {t(`tts.devices.${device}`)}
-            </option>
-          ))}
-        </select>
-      </label>
+    <div className="text-xs text-text/50">
+      {downloaded && (
+        <label className="flex items-center gap-1.5">
+          {t("tts.runOn")}
+          <select
+            className="rounded-lg border border-mid-gray/20 bg-background px-2 py-1 text-xs text-text focus:outline-none focus:border-logo-primary"
+            value={value}
+            disabled={!downloaded}
+            onChange={(event) => {
+              applyRunOnChoice(
+                { downloaded, invalidNpu, available, rating, change },
+                event.target.value,
+              );
+            }}
+          >
+            {choices.map((device) => (
+              <option
+                key={device}
+                value={device}
+                disabled={
+                  device !== "auto" &&
+                  (!rating.devices[device].supported ||
+                    (device === "npu" && invalidNpu))
+                }
+              >
+                {t(`tts.devices.${device}`)}
+              </option>
+            ))}
+          </select>
+        </label>
+      )}
       {preparation.state === "preparing" && (
-        <div role="status">
+        <div role="status" className="flex items-center gap-2 mt-1">
           <span>
             {t("tts.preparing", {
               device: t(`tts.devices.${preparation.device}`),
@@ -89,6 +94,7 @@ export function RunOnControl({
             })}
           </span>
           <progress
+            className="w-16 h-1.5 accent-logo-primary"
             max={Math.max(1, preparation.total)}
             value={Math.max(
               0,
@@ -96,6 +102,9 @@ export function RunOnControl({
             )}
           />
         </div>
+      )}
+      {invalidNpu && preparation.state !== "failed" && (
+        <span role="alert">{t("tts.errors.npuDriverTooOld")}</span>
       )}
       {preparation.state === "failed" && (
         <span role="alert">{t(preparation.error)}</span>

@@ -55,6 +55,7 @@ function render(
   selectedId: string,
   downloadId: string | null = null,
   downloadedBytes?: number,
+  tokenSet = false,
 ) {
   return renderToStaticMarkup(
     <I18nextProvider i18n={i18n}>
@@ -69,22 +70,29 @@ function render(
                 total_bytes: value.size_bytes,
               }
         }
-        available={["cpu", "npu"]}
+        available={["cpu", "gpu", "npu"]}
         state={{ selectedId, downloadId, deletingId: null }}
         actions={{ use: () => {}, download: () => {}, delete: () => {} }}
         runOn={() => {}}
         cancel={() => {}}
+        tokenSet={tokenSet}
+        setToken={() => {}}
       />
     </I18nextProvider>,
   );
 }
 function button(html: string, label: string) {
-  const found = html.match(new RegExp(`<button([^>]*)>${label}</button>`));
+  const found = [...html.matchAll(/<button([^>]*)>(.*?)<\/button>/g)].find(
+    (match) => match[2].replace(/<[^>]*>/g, "") === label,
+  );
   assert.ok(found, html);
-  return found[1];
+  return found[1].replace(/class="[^"]*"/g, "");
 }
 const active = render(model, "pocket-en");
-assert.ok(button(active, "Active").includes("disabled"));
+assert.ok(active.includes('data-badge="active"'));
+assert.ok(!active.includes("data-token-chip"));
+assert.ok(!active.includes('data-badge="recommended"'));
+assert.ok(active.includes("border-logo-primary/50 bg-logo-primary/10"));
 assert.ok(!button(active, "Delete").includes("disabled"));
 assert.ok(active.includes('data-tts-model="pocket-en"'));
 assert.ok(active.includes(english.tts.description["pocket-en"]));
@@ -92,7 +100,7 @@ assert.ok(active.includes(i18n.t("tts.voiceCount", { count: 1 })));
 assert.ok(!active.includes('data-device="gpu"'));
 assert.ok(active.includes('value="1"'));
 assert.ok(active.includes('max="4"'));
-const preparing = active.match(/<div role="status">(.*?)<\/div>/);
+const preparing = active.match(/<div role="status"[^>]*>(.*?)<\/div>/);
 assert.ok(preparing, "Preparing status row");
 assert.ok(preparing[1].includes("Preparing for NPU: decoder"));
 assert.ok(preparing[1].includes('value="1"'));
@@ -123,15 +131,47 @@ for (const [downloaded, selectedId, downloadId, deletingId] of [
   );
 }
 const missing = render({ ...model, downloaded: false, active: false }, "other");
-assert.ok(button(missing, "Use").includes("disabled"));
-assert.ok(!button(missing, "Download").includes("disabled"));
-assert.ok(missing.match(/<select[^>]*disabled/));
+assert.ok(!missing.includes(">Use</button>"));
+assert.ok(!button(missing, "Download296 MB").includes("disabled"));
+assert.ok(!missing.includes("<select"));
+assert.ok(missing.includes('data-token-chip="required"'));
+assert.ok(missing.includes('data-badge="recommended"'));
+assert.ok(!button(missing, "Set token").includes("disabled"));
+const tokenReady = render(
+  { ...model, downloaded: false, active: false },
+  "other",
+  null,
+  undefined,
+  true,
+);
+assert.ok(tokenReady.includes('data-token-chip="set"'));
+assert.ok(!button(tokenReady, "Download296 MB").includes("disabled"));
+const supertonic = render(
+  { ...model, id: "supertonic-3", downloaded: false, active: false },
+  "other",
+);
+assert.ok(!supertonic.includes("data-token-chip"));
+assert.ok(!button(supertonic, "Download296 MB").includes("disabled"));
+const ready = render({ ...model, active: false }, "other");
+assert.ok(!button(ready, "Use").includes("disabled"));
+const select = ready.match(/<select[^>]*>(.*?)<\/select>/);
+assert.ok(select);
+assert.ok(select[1].includes('<option value="auto"'));
+assert.ok(select[1].includes('<option value="cpu"'));
+assert.ok(select[1].includes('<option value="npu"'));
+assert.ok(!select[1].includes('<option value="gpu"'));
+const license = active.match(/<a[^>]*>(.*?)<\/a>/);
+assert.ok(license);
+assert.ok(license[0].includes(`href="${model.card_url}"`));
+assert.ok(license[0].includes('target="_blank"'));
+assert.ok(license[0].includes('title="Voice attribution"'));
+assert.ok(license[1].includes("CC-BY-4.0"));
 const downloading = render(
   { ...model, downloaded: false, active: false },
   "other",
   "pocket-en",
 );
-assert.ok(button(downloading, "Download").includes("disabled"));
+assert.ok(downloading.includes('data-badge="downloading"'));
 assert.ok(!button(downloading, "Cancel").includes("disabled"));
 const progress = render(
   { ...model, downloaded: false },
@@ -165,7 +205,9 @@ const invalidDriver = render(
   },
   "pocket-en",
 );
-const npuRow = invalidDriver.match(/<div data-device="npu"[^>]*>(.*?)<\/div>/);
-assert.ok(npuRow, invalidDriver);
-assert.ok(npuRow[1].includes("NPU driver too old"));
+assert.ok(!invalidDriver.includes('data-device="npu"'));
 assert.ok(invalidDriver.match(/<option value="npu"[^>]*disabled/));
+assert.ok(invalidDriver.includes("NPU driver too old"));
+console.log(
+  "Card states: active preparing, available Pocket without/with token, available Supertonic, downloaded inactive, downloading, progress, invalid NPU passed",
+);

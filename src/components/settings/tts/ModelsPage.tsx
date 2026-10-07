@@ -1,3 +1,4 @@
+import { Button } from "@/components/ui/Button";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -33,6 +34,7 @@ const downloads = downloadController({
     unwrapTts(await commands.cancelTtsDownload(id));
   },
 });
+let sessionTokenSet = false;
 export function ModelsPage() {
   const { t } = useTranslation();
   const { refreshSettingsChecked } = useSettings();
@@ -45,6 +47,8 @@ export function ModelsPage() {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [token, setToken] = useState("");
+  const [tokenSet, setTokenSet] = useState(sessionTokenSet);
+  const [showToken, setShowToken] = useState(false);
   const refresh = async () => {
     setModels(unwrapTts(await commands.getTtsModels()));
   };
@@ -79,66 +83,104 @@ export function ModelsPage() {
       await refresh();
       await refreshSettingsChecked();
       setError(null);
+      return true;
     } catch (reason) {
       setError(
         reason instanceof Error && reason.message.startsWith("tts.errors.")
           ? reason.message
           : "tts.errors.generic",
       );
+      return false;
     }
   };
   return (
     <section className="w-full max-w-3xl flex flex-col gap-4">
-      <h2>{t("tts.modelsTitle")}</h2>
-      <label>
-        {t("tts.token")}
-        <input
-          type="password"
-          autoComplete="off"
-          value={token}
-          onChange={(event) => setToken(event.target.value)}
-        />
-      </label>
-      <p>{t("tts.tokenHelp")}</p>
-      <button
-        onClick={() => {
-          void run(commands.setTtsHfToken(token));
-          setToken("");
-        }}
-      >
-        {t("tts.saveToken")}
-      </button>
+      <div>
+        <h1 className="text-xl font-semibold mb-2">{t("tts.modelsTitle")}</h1>
+        <p className="text-text/60 text-sm">{t("tts.modelsSubtitle")}</p>
+      </div>
       {(error || downloadState.error) && (
         <p role="alert">
           {t(error ?? downloadState.error ?? "tts.errors.generic")}
         </p>
       )}
-      {models.map((model) => (
-        <ModelCard
-          key={model.id}
-          model={model}
-          downloadProgress={downloadState.progress[model.id]}
-          available={available}
-          state={{
-            selectedId: models.find((row) => row.active)?.id ?? "",
-            downloadId: downloadState.active.includes(model.id)
-              ? model.id
-              : (downloadState.active[0] ?? null),
-            deletingId,
-          }}
-          actions={{
-            use: (id) => void run(commands.setTtsModel(id)),
-            download: (id) => void downloads.download(id),
-            delete: (id) => {
-              setDeletingId(id);
-              void run(commands.deleteTtsModel(id)).finally(() =>
-                setDeletingId(null),
-              );
-            },
-          }}
-          runOn={(id, value) => void run(commands.setTtsRunOn(id, value))}
-          cancel={(id) => void downloads.cancel(id)}
-        />
+      {([true, false] as const).map((downloaded) => (
+        <div key={String(downloaded)} className="space-y-3">
+          <h2 className="text-sm font-medium text-text/60">
+            {t(downloaded ? "tts.downloaded" : "tts.availableToDownload")}
+          </h2>
+          {models
+            .filter(
+              (model) =>
+                (model.downloaded &&
+                  !downloadState.active.includes(model.id) &&
+                  !model.downloading) === downloaded,
+            )
+            .map((model) => (
+              <ModelCard
+                key={model.id}
+                model={model}
+                downloadProgress={downloadState.progress[model.id]}
+                available={available}
+                state={{
+                  selectedId: models.find((row) => row.active)?.id ?? "",
+                  downloadId: downloadState.active.includes(model.id)
+                    ? model.id
+                    : (downloadState.active[0] ?? null),
+                  deletingId,
+                }}
+                actions={{
+                  use: (id) => void run(commands.setTtsModel(id)),
+                  download: (id) => void downloads.download(id),
+                  delete: (id) => {
+                    setDeletingId(id);
+                    void run(commands.deleteTtsModel(id)).finally(() =>
+                      setDeletingId(null),
+                    );
+                  },
+                }}
+                runOn={(id, value) => void run(commands.setTtsRunOn(id, value))}
+                cancel={(id) => void downloads.cancel(id)}
+                tokenSet={tokenSet}
+                setToken={() => setShowToken((visible) => !visible)}
+                tokenEntry={
+                  showToken && (
+                    <form
+                      className="w-full text-xs text-text/50 space-y-2"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void run(commands.setTtsHfToken(token)).then(
+                          (saved) => {
+                            if (saved) {
+                              sessionTokenSet = token.trim().length > 0;
+                              setTokenSet(sessionTokenSet);
+                              setToken("");
+                              setShowToken(false);
+                            }
+                          },
+                        );
+                      }}
+                    >
+                      <label className="flex items-center gap-2">
+                        {t("tts.token")}
+                        <input
+                          type="password"
+                          autoComplete="off"
+                          value={token}
+                          onChange={(event) => setToken(event.target.value)}
+                          className="rounded-lg border border-mid-gray/20 bg-background px-2 py-1 text-text"
+                        />
+                      </label>
+                      <p>{t("tts.tokenHelp")}</p>
+                      <Button variant="primary-soft" size="sm" type="submit">
+                        {t("tts.saveToken")}
+                      </Button>
+                    </form>
+                  )
+                }
+              />
+            ))}
+        </div>
       ))}
     </section>
   );

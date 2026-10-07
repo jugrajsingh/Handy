@@ -1,3 +1,17 @@
+import type { ReactNode } from "react";
+import {
+  AudioLines,
+  Check,
+  Download,
+  HardDrive,
+  Info,
+  KeyRound,
+  Loader2,
+  Trash2,
+} from "lucide-react";
+import Badge from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
+import { formatModelSize } from "@/lib/utils/format";
 import { useTranslation } from "react-i18next";
 import type { TtsModelInfo, Device, RunOn } from "@/bindings";
 import { RatingBars } from "./RatingBars";
@@ -32,6 +46,9 @@ export interface ModelCardProps {
   actions: TtsRowCallbacks;
   runOn: (id: string, value: RunOn) => void;
   cancel: (id: string) => void;
+  tokenSet?: boolean;
+  setToken?: () => void;
+  tokenEntry?: ReactNode;
 }
 export function applyModelUse(
   row: Pick<ReturnType<typeof rowActions>, "canUse" | "use">,
@@ -46,6 +63,9 @@ export function ModelCard({
   actions,
   runOn,
   cancel,
+  tokenSet = false,
+  setToken,
+  tokenEntry,
 }: ModelCardProps) {
   const { t } = useTranslation();
   const row = rowActions(model, state, actions);
@@ -54,62 +74,149 @@ export function ModelCard({
     model.npu_driver_too_old ||
     (model.preparation.state === "failed" &&
       model.preparation.device === "npu");
+  const needsToken = model.id === "pocket-en" && !model.downloaded;
   return (
     <article
       data-tts-model={model.id}
-      className="w-full rounded-xl border border-mid-gray/20 p-4"
+      className={`flex flex-col rounded-xl px-4 py-3 gap-2 text-left transition-all duration-200 border-2 ${row.isActive ? "border-logo-primary/50 bg-logo-primary/10" : "border-mid-gray/20"}`}
     >
-      <h3>{model.display_name}</h3>
-      <p>{t(`tts.description.${model.id}`)}</p>
-      <p>{t("tts.voiceCount", { count: model.voices.length })}</p>
-      <p>{model.license}</p>
-      <p>{t(model.attribution)}</p>
-      <a href={model.card_url} target="_blank" rel="noreferrer">
-        {t("tts.modelCard")}
-      </a>
-      <p>
-        {t("tts.downloadSize", {
-          megabytes: (model.size_bytes / 1e6).toFixed(1),
-        })}
-      </p>
-      <RatingBars
-        modelId={model.id}
-        rating={rating}
-        available={available}
-        invalidNpu={invalidNpu}
-      />
-      <RunOnControl
-        invalidNpu={invalidNpu}
-        downloaded={model.downloaded}
-        available={available}
-        rating={rating}
-        value={model.run_on}
-        preparation={model.preparation}
-        change={(value) => runOn(model.id, value)}
-      />
-      {downloadProgress && (
-        <progress
-          aria-label={t("tts.downloadProgress")}
-          max={downloadProgress.total_bytes}
-          value={downloadProgress.downloaded_bytes}
+      <div className="flex justify-between items-center w-full">
+        <div className="flex flex-col items-start flex-1 min-w-0">
+          <div className="flex items-center gap-3 flex-wrap">
+            <h3 className="text-base font-semibold text-text">
+              {model.display_name}
+            </h3>
+            {row.isActive && (
+              <span data-badge="active">
+                <Badge variant="primary">
+                  <Check className="w-3 h-3 mr-1" />
+                  {t("tts.active")}
+                </Badge>
+              </span>
+            )}
+            {!row.isActive && model.id === "pocket-en" && (
+              <span data-badge="recommended">
+                <Badge variant="primary">{t("tts.recommended")}</Badge>
+              </span>
+            )}
+            {row.isDownloading && (
+              <span data-badge="downloading">
+                <Badge variant="secondary">
+                  <Loader2 className="w-3 h-3 mr-1 animate-spin" />
+                  {t("tts.downloading")}
+                </Badge>
+              </span>
+            )}
+          </div>
+          <p className="text-text/60 text-sm leading-relaxed">
+            {t(`tts.description.${model.id}`)}
+          </p>
+        </div>
+        <RatingBars
+          modelId={model.id}
+          rating={rating}
+          available={available}
+          invalidNpu={invalidNpu}
         />
-      )}
-      <div className="flex gap-3">
-        <button disabled={!row.canUse} onClick={() => applyModelUse(row)}>
-          {t(row.isActive ? "tts.active" : "tts.use")}
-        </button>
-        {!model.downloaded && (
-          <button disabled={!row.canDownload} onClick={row.download}>
-            {t("tts.download")}
-          </button>
+      </div>
+      <hr className="w-full border-mid-gray/20" />
+      <div className="flex items-center gap-3 w-full -mb-0.5 mt-0.5 flex-wrap">
+        <div className="flex items-center gap-1 text-xs text-text/50">
+          <AudioLines className="w-3.5 h-3.5" />
+          <span>{t("tts.voiceCount", { count: model.voices.length })}</span>
+        </div>
+        <a
+          href={model.card_url}
+          target="_blank"
+          rel="noreferrer"
+          title={t(model.attribution)}
+          className="flex items-center gap-1 text-xs text-text/50 hover:text-logo-primary"
+        >
+          {model.license}
+          <Info className="w-3.5 h-3.5" />
+        </a>
+        <div className="flex items-center gap-3 ms-auto">
+          {model.downloaded && (
+            <RunOnControl
+              invalidNpu={invalidNpu}
+              downloaded={model.downloaded}
+              available={available}
+              rating={rating}
+              value={model.run_on}
+              preparation={model.preparation}
+              change={(value) => runOn(model.id, value)}
+            />
+          )}
+          {model.downloaded ? (
+            <span className="flex items-center gap-1.5 text-xs text-text/50">
+              <HardDrive className="w-3.5 h-3.5" />
+              {formatModelSize(model.size_bytes / 1e6)}
+            </span>
+          ) : (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="flex items-center gap-1.5 text-text/50"
+              disabled={!row.canDownload}
+              onClick={row.download}
+            >
+              <Download className="w-3.5 h-3.5" />
+              <span className="sr-only">{t("tts.download")}</span>
+              <span>{formatModelSize(model.size_bytes / 1e6)}</span>
+            </Button>
+          )}
+          {model.downloaded && !row.isActive && (
+            <Button
+              variant="primary-soft"
+              size="sm"
+              disabled={!row.canUse}
+              onClick={() => applyModelUse(row)}
+            >
+              {t("tts.use")}
+            </Button>
+          )}
+          {model.downloaded && (
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={!row.canDelete}
+              onClick={row.delete}
+              className="flex items-center gap-1.5 text-logo-primary/85 hover:text-logo-primary hover:bg-logo-primary/10"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span>{t("tts.delete")}</span>
+            </Button>
+          )}
+          {row.isDownloading && (
+            <Button
+              variant="danger-ghost"
+              size="sm"
+              onClick={() => cancel(model.id)}
+            >
+              {t("tts.cancel")}
+            </Button>
+          )}
+        </div>
+        {needsToken && (
+          <div
+            className="flex items-center gap-1.5 text-xs text-text/50 w-full"
+            data-token-chip={tokenSet ? "set" : "required"}
+          >
+            <KeyRound className="w-3.5 h-3.5" />
+            <span>{t(tokenSet ? "tts.tokenSet" : "tts.needsToken")}</span>
+            <Button variant="ghost" size="sm" onClick={setToken}>
+              {t("tts.saveToken")}
+            </Button>
+          </div>
         )}
-        {model.downloaded && (
-          <button disabled={!row.canDelete} onClick={row.delete}>
-            {t("tts.delete")}
-          </button>
-        )}
-        {row.isDownloading && (
-          <button onClick={() => cancel(model.id)}>{t("tts.cancel")}</button>
+        {needsToken && tokenEntry}
+        {downloadProgress && row.isDownloading && (
+          <progress
+            className="w-full h-1.5 accent-logo-primary"
+            aria-label={t("tts.downloadProgress")}
+            max={downloadProgress.total_bytes}
+            value={downloadProgress.downloaded_bytes}
+          />
         )}
       </div>
     </article>

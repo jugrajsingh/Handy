@@ -1088,8 +1088,7 @@
       "quality": "Quality",
       "speed": "Speed",
       "recommended": "Recommended",
-      "notSupported": "Not supported",
-      "tooltip": "First audio: {{firstAudio}} s; {{faster}} times real time; RTF at 2x: {{rtf2x}}; cold load: {{cold}} s; cached load: {{cached}} s; {{placement}}"
+      "tooltip": "First audio {{firstAudio}} s, {{faster}}x faster than real time, loads in {{load}} s"
     },
     "devices": {
       "auto": "Auto",
@@ -1164,8 +1163,13 @@
       "error": "Error"
     },
     "modelsTitle": "Text-to-speech Models",
-    "modelCard": "Model card and licence",
-    "downloadSize": "Download: {{megabytes}} MB",
+    "modelsSubtitle": "Choose a voice model. Speeds are measured on this machine.",
+    "downloaded": "Downloaded",
+    "availableToDownload": "Available to download",
+    "recommended": "Recommended",
+    "downloading": "Downloading",
+    "needsToken": "Needs a Hugging Face token",
+    "tokenSet": "Token set",
     "active": "Active",
     "use": "Use",
     "download": "Download",

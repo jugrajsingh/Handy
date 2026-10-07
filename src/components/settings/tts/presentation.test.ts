@@ -39,17 +39,24 @@ assert.deepEqual(
 assert.equal(rows[1].fill, 80);
 assert.equal(rows[1].recommended, true);
 assert.deepEqual(rows[1].tooltip, {
-  firstAudio: 0.5,
-  faster: 4,
-  rtf2x: 0.4,
-  cold: 20,
-  cached: 2,
-  placement: "main: CPU, decoder: NPU",
+  firstAudio: "0.5",
+  faster: "4.0",
+  load: "2.0",
 });
-const unsupported = deviceRows(rating, ["gpu"], false)[0];
-assert.equal(unsupported.fill, 0);
-assert.equal(unsupported.stateKey, "tts.ratings.notSupported");
-const oldDriver = deviceRows(rating, ["npu"], true)[0];
-assert.equal(oldDriver.recommended, false);
-assert.equal(oldDriver.stateKey, "tts.errors.npuDriverTooOld");
+assert.deepEqual(deviceRows(rating, ["gpu"], false), []);
+assert.deepEqual(deviceRows(rating, ["npu"], true), []);
+const precise = {
+  ...supported,
+  first_audio_p95_s: 1.987654321,
+  rtf_1x: 0.263157894,
+  load_s_cached: 0.456789,
+};
+assert.deepEqual(
+  deviceRows(
+    { ...rating, devices: { ...rating.devices, cpu: precise } },
+    ["cpu"],
+    false,
+  )[0].tooltip,
+  { firstAudio: "2.0", faster: "3.8", load: "0.5" },
+);
 console.log("TTS rating presentation assertions passed");
