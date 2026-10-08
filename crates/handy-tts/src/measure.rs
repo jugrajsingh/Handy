@@ -422,7 +422,7 @@ pub fn run(
     Ok(())
 }
 
-/// Measure every prepared Pocket chunk and enforce the continuity gate.
+/// Runs the production session against an isolated worker and a real-time capturing feed.
 pub fn continuity(
     id: &str,
     root: &Path,
@@ -430,63 +430,871 @@ pub fn continuity(
     cache: &Path,
     corpus: &Path,
     output: &Path,
+    options: ContinuityOptions<'_>,
 ) -> Result<()> {
-    use handy_tts_core::performance::{Timing, gate, replay};
-    use std::io::Write;
-    ensure!(
-        id == "pocket-en",
-        "continuity probe is the Pocket acceptance gate"
-    );
     let model = catalog::entry(id)?;
     let source = std::fs::read_to_string(corpus).context("read explicit continuity corpus")?;
-    let words = source.split_whitespace().count();
     let mut cursor = TextCursor::new(&source, false)?;
-    let mut engine =
-        crate::runtime::load_adapter(id, root, model.default_voice, model.threads, device, cache)?;
-    let mut records = std::io::BufWriter::new(
-        std::fs::File::create(output).context("create explicit continuity output")?,
-    );
-    let mut timings = Vec::new();
-    let mut rtfs = Vec::new();
+    let mut pauses = Vec::new();
     while let Some(chunk) = cursor.next_chunk()? {
-        let began = Instant::now();
-        let samples = engine.synthesize(&chunk.text, None, &AtomicBool::new(false))?;
-        let synthesis_seconds = began.elapsed().as_secs_f64();
-        let began = Instant::now();
-        let pcm = dsp::stretch(
-            Pcm {
-                id: chunk.index as u64 + 1,
-                sample_rate: engine.sample_rate(),
-                samples,
-            },
-            2.0,
-            0.0,
-        )?;
-        let dsp_seconds = began.elapsed().as_secs_f64();
-        let audio_seconds = pcm.samples.len() as f64 / f64::from(pcm.sample_rate);
-        rtfs.push((synthesis_seconds + dsp_seconds) / audio_seconds);
-        timings.push(Timing {
-            synthesis_seconds: synthesis_seconds + dsp_seconds,
-            audio_seconds,
-            samples: pcm.samples.len(),
-            sample_rate: pcm.sample_rate,
-        });
-        writeln!(
-            records,
-            "{}",
-            serde_json::json!({"kind":"dsp", "samples":pcm.samples.len(), "audio_s":audio_seconds, "synth_s":synthesis_seconds, "dsp_s":dsp_seconds})
-        )?;
+        pauses.push(chunk.pause_ms);
     }
-    records.flush()?;
+    let expected_chunks = pauses.len();
+    ensure!(expected_chunks > 0, "continuity corpus contains no speech");
+    let ratings: handy_tts_core::device::Ratings = serde_json::from_str(include_str!(
+        "../../../src-tauri/resources/tts/ratings.json"
+    ))?;
+    let rating = ratings
+        .models
+        .get(id)
+        .and_then(|model| model.devices.get(&device))
+        .context("continuity rating missing")?;
+    ensure!(rating.supported, "unsupported continuity device");
+    let before = crate::runtime::memory_available().context("read MemAvailable before load")?;
+    let lanes = options.lanes.unwrap_or_else(|| {
+        handy_tts_core::memory::lanes_for(
+            before,
+            (rating.lanes.base_rss_mib.unwrap_or(0.0) * 1048576.0) as u64,
+            (rating.lanes.lane_rss_mib.unwrap_or(0.0) * 1048576.0) as u64,
+            rating.lanes.best_lanes,
+        )
+    });
+    ensure!((1..=3).contains(&lanes), "continuity lanes must be 1 to 3");
+    let began = Instant::now();
+    let worker = ProcessWorker::start(id, root, device, cache, lanes)?;
+    let load_seconds = began.elapsed().as_secs_f64();
+    let selection = handy_tts_core::selection::Selection {
+        model_id: id.into(),
+        voice: model.default_voice.into(),
+        speed: options.speed,
+        pitch: 0.0,
+        output_device: None,
+        read_code: false,
+    };
+    let capture = CaptureOutput::new(0, Some(options.wav))?;
+    let mut session =
+        handy_tts_core::session::Session::new(&source, selection, worker, capture, None)
+            .map_err(anyhow::Error::msg)?;
+    session.play().map_err(anyhow::Error::msg)?;
+    session
+        .queue
+        .estimate_from_rating(rating.rtf_1x.unwrap_or(0.0), 1.0, f64::from(options.speed));
+    let dsp_timings = std::sync::Arc::new(std::sync::Mutex::new((None::<Instant>, Vec::new())));
+    let dsp_observer = dsp_timings.clone();
+    let dsp_origin = Instant::now();
+    session.set_dsp_clock(move || {
+        let now = Instant::now();
+        if let Ok(mut timing) = dsp_observer.lock() {
+            if let Some(start) = timing.0.take() {
+                timing.1.push(now.duration_since(start).as_secs_f64());
+            } else {
+                timing.0 = Some(now);
+            }
+        }
+        now.duration_since(dsp_origin).as_secs_f64()
+    });
+    drive_session(&mut session, true, options.startup_only)?;
+    let snapshot = session.snapshot();
+    let rate = session
+        .playback
+        .output
+        .state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("capture poisoned"))?
+        .feed
+        .sample_rate();
+    session.playback.output.finish_wav()?;
+    let mut capture = session
+        .playback
+        .output
+        .state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("capture poisoned"))?;
+    let dsp_times = dsp_timings
+        .lock()
+        .map_err(|_| anyhow::anyhow!("DSP timing poisoned"))?;
+    for (index, raw) in session.worker.records.iter().enumerate() {
+        if let Some(chunk) = capture
+            .chunks
+            .iter_mut()
+            .find(|c| c["index"] == raw["index"])
+        {
+            for key in [
+                "synthesis_seconds",
+                "trimmed_samples",
+                "lead_removed",
+                "tail_removed",
+            ] {
+                chunk[key] = raw[key].clone();
+            }
+            chunk["dsp_seconds"] = (*dsp_times.1.get(index).context("DSP timing missing")?).into();
+        }
+    }
+    let plan = handy_tts_core::speed::plan(options.speed, model.native_speed)?;
+    let chunks = aggregate_chunks(&capture.chunks, &pauses, rate, options.speed, plan.stretch)?;
+    let mut rtfs = chunks
+        .iter()
+        .map(|chunk| {
+            let elapsed = chunk["synthesis_seconds"]
+                .as_f64()
+                .context("synthesis time missing")?
+                + chunk["dsp_seconds"].as_f64().context("DSP time missing")?;
+            let played = chunk["scheduled"]
+                .as_u64()
+                .context("scheduled samples missing")? as f64
+                / f64::from(rate);
+            Ok(elapsed / played)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let median = quantile(&mut rtfs, 0.5)?;
-    let result = replay(&timings, 2.0).map_err(|error| anyhow::anyhow!(error))?;
-    let pass = gate(id, device, device, median, words, result.buffering_pauses);
+    let worker_peak = session.worker.peak_rss;
+    let combined_growth = session.worker.combined_growth;
+    let rss = session.worker.rss_samples.clone();
+    session.worker.shutdown()?;
+    let after = crate::runtime::memory_available().context("read MemAvailable after unload")?;
+    let mut record = serde_json::json!({
+        "schema_version": 1, "startup_only": options.startup_only, "model": id, "device": device, "speed": options.speed,
+        "lanes": lanes, "corpus": corpus, "words": source.split_whitespace().count(),
+        "sample_rate": rate, "expected_chunks": expected_chunks, "wav": options.wav,
+        "chunks": chunks, "segments": capture.chunks, "source_pauses_ms": pauses, "buffering_pauses": snapshot.buffering_pauses,
+        "buffering_seconds": session.queue.buffering_seconds,
+        "underrun_samples": capture.feed.underrun_samples(),
+        "head_start_seconds": capture.chunks.first().and_then(|r| r["started_seconds"].as_f64()), "load_seconds": load_seconds,
+        "worker_peak_rss_mib": worker_peak, "combined_growth_mib": combined_growth,
+        "rss_samples": rss, "unload_delta_mib": (before as f64 - after as f64) / 1048576.0,
+        "median_rtf": median,
+    });
+    if let Some(directory) = options.gpu_inputs {
+        ensure!(
+            id == "supertonic-3" && device == Device::Gpu,
+            "GPU timing inputs require Supertonic GPU"
+        );
+        record["gpu"] = gpu_repeat_timings(id, root, device, cache, directory, lanes)?;
+    }
+    std::fs::write(output, serde_json::to_vec_pretty(&record)?)
+        .context("write continuity evidence")?;
     println!(
-        "DSP_GATE speed=2 median_rtf={median:.6} buffering_pauses={} head_start_wait_seconds={:.6} words={words} pass={pass}",
-        result.buffering_pauses, result.head_start_wait_seconds
+        "CONTINUITY model={id} device={device:?} speed={} lanes={lanes} chunks={expected_chunks} head_start={} buffering={} underrun={} median_rtf={median}",
+        options.speed,
+        snapshot.head_start_seconds.unwrap_or(0.0),
+        snapshot.buffering_pauses,
+        capture.feed.underrun_samples()
     );
-    ensure!(pass, "Pocket continuity gate failed");
+    if options.require_long_document {
+        let pass = source.split_whitespace().count() >= 2000
+            && snapshot.buffering_pauses == 0
+            && capture.feed.underrun_samples() == 0;
+        println!("LONG_DOCUMENT_GATE pass={pass}");
+        ensure!(pass, "continuity long-document gate failed");
+    }
     Ok(())
+}
+
+/// Explicit output and concurrency controls for a continuity measurement.
+pub struct ContinuityOptions<'a> {
+    pub speed: f32,
+    pub wav: &'a Path,
+    pub lanes: Option<usize>,
+    pub gpu_inputs: Option<&'a Path>,
+    pub require_long_document: bool,
+    pub startup_only: bool,
+}
+
+fn gpu_repeat_timings(
+    id: &str,
+    root: &Path,
+    device: Device,
+    cache: &Path,
+    directory: &Path,
+    lanes: usize,
+) -> Result<serde_json::Value> {
+    let model = catalog::entry(id)?;
+    let began = Instant::now();
+    let mut engines = crate::runtime::load_adapters(
+        id,
+        root,
+        model.default_voice,
+        model.threads,
+        device,
+        cache,
+        lanes,
+    )?;
+    let engine = &mut engines[0];
+    let cached_load_seconds = began.elapsed().as_secs_f64();
+    let mut first = Vec::new();
+    let mut repeat = Vec::new();
+    for (_, source) in first_audio_documents(directory)? {
+        let mut cursor = TextCursor::new(&source, false)?;
+        while let Some(chunk) = cursor.next_chunk()? {
+            for times in [&mut first, &mut repeat] {
+                let start = Instant::now();
+                crate::runtime::synthesize_bounded(
+                    engine.as_mut(),
+                    &chunk.text,
+                    Some(1.0),
+                    &AtomicBool::new(false),
+                )?;
+                times.push(start.elapsed().as_secs_f64());
+            }
+        }
+    }
+    let requests = first.len();
+    Ok(
+        serde_json::json!({"corpus_documents": 7, "requests": requests,
+        "first_p95_s": quantile(&mut first.clone(), 0.95)?, "repeat_p95_s": quantile(&mut repeat.clone(), 0.95)?,
+        "cached_load_seconds": cached_load_seconds, "first_seconds": first, "repeat_seconds": repeat}),
+    )
+}
+
+fn aggregate_chunks(
+    segments: &[serde_json::Value],
+    pauses: &[u32],
+    rate: u32,
+    requested: f32,
+    stretch: f32,
+) -> Result<Vec<serde_json::Value>> {
+    let mut chunks = Vec::new();
+    let mut position = 0;
+    while position < segments.len() {
+        let first = &segments[position];
+        let index = first["index"].as_u64().context("segment index missing")? as usize;
+        ensure!(index < pauses.len(), "part without a sentence");
+        let begin = position;
+        position += 1;
+        while position < segments.len()
+            && segments[position]["index"]
+                .as_u64()
+                .context("part index missing")? as usize
+                >= pauses.len()
+        {
+            position += 1;
+        }
+        let last = &segments[position - 1];
+        let mut row = first.clone();
+        let pause = handy_tts_core::edges::pause_samples(pauses[index], requested, rate);
+        let speech = (first["trimmed_samples"]
+            .as_u64()
+            .context("native length missing")? as f64
+            / f64::from(stretch))
+        .round() as u64;
+        row["scheduled"] = (speech + pause as u64).into();
+        row["pause_samples"] = pause.into();
+        row["delivered"] = segments[begin..position]
+            .iter()
+            .map(|s| s["delivered"].as_u64().context("delivered samples missing"))
+            .collect::<Result<Vec<_>>>()?
+            .iter()
+            .sum::<u64>()
+            .into();
+        row["finished_sample"] = last["finished_sample"].clone();
+        row["gap_after_ms"] = last["gap_after_ms"].clone();
+        let start = first["started_sample"].as_u64();
+        let loud_position = |segment: &serde_json::Value, key: &str| {
+            segment[key]
+                .as_u64()
+                .zip(segment["started_sample"].as_u64())
+                .zip(start)
+                .map(|((loud, offset), start)| offset - start + loud)
+        };
+        row["first_loud"] = segments[begin..position]
+            .iter()
+            .find_map(|s| loud_position(s, "first_loud"))
+            .into();
+        row["last_loud"] = segments[begin..position]
+            .iter()
+            .rev()
+            .find_map(|s| loud_position(s, "last_loud"))
+            .into();
+        row["all_quiet"] = row["first_loud"].is_null().into();
+        row["segment_indices"] = segments[begin..position]
+            .iter()
+            .map(|s| s["index"].clone())
+            .collect::<Vec<_>>()
+            .into();
+        chunks.push(row);
+    }
+    for index in 0..chunks.len().saturating_sub(1) {
+        let a = &chunks[index];
+        let b = &chunks[index + 1];
+        let gap = a["last_loud"]
+            .as_u64()
+            .zip(a["started_sample"].as_u64())
+            .zip(b["first_loud"].as_u64().zip(b["started_sample"].as_u64()))
+            .map(|((last, end), (first, start))| {
+                (start + first).saturating_sub(end + last + 1) as f64 * 1000.0 / f64::from(rate)
+            });
+        chunks[index]["gap_after_ms"] = gap.into();
+    }
+    Ok(chunks)
+}
+
+struct TimedReply {
+    id: u64,
+    pcm: Result<Pcm, String>,
+    received: Instant,
+}
+
+struct ProcessWorker {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    replies: std::sync::mpsc::Receiver<Result<TimedReply, String>>,
+    reader: Option<std::thread::JoinHandle<()>>,
+    pending: std::collections::BTreeMap<u64, (handy_tts_core::scheduler::Ticket, Instant)>,
+    next_id: u64,
+    lanes: usize,
+    records: Vec<serde_json::Value>,
+    peak_rss: f64,
+    combined_baseline: Option<f64>,
+    combined_growth: f64,
+    rss_samples: Vec<serde_json::Value>,
+    last_sample: Instant,
+}
+impl ProcessWorker {
+    fn start(id: &str, root: &Path, device: Device, cache: &Path, lanes: usize) -> Result<Self> {
+        use handy_tts_core::protocol::{Request, Status, read_header, write_request};
+        let model = catalog::entry(id)?;
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .args(["--model", id])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .context("spawn continuity worker")?;
+        let result = (|| -> Result<_> {
+            let mut input = child.stdin.take().context("worker stdin missing")?;
+            let mut output =
+                std::io::BufReader::new(child.stdout.take().context("worker stdout missing")?);
+            write_request(
+                &mut input,
+                &Request::Load {
+                    model_dir: root.into(),
+                    voice: model.default_voice.into(),
+                    threads: model.threads,
+                    lanes,
+                    device,
+                    cache_dir: cache.into(),
+                },
+            )?;
+            let ready = read_header(&mut output)?;
+            ensure!(
+                ready.status == Status::Ready && ready.device == Some(device),
+                "continuity load failed: {:?}",
+                ready.message
+            );
+            let (sender, replies) = std::sync::mpsc::sync_channel(lanes);
+            let reader = std::thread::spawn(move || {
+                loop {
+                    let result = handy_tts_core::protocol::read_header(&mut output)
+                        .map(|header| {
+                            let id = header.id;
+                            let pcm = handy_tts_core::protocol::read_pcm_after_header(
+                                &mut output,
+                                header,
+                                id,
+                            )
+                            .map_err(|error| error.to_string());
+                            TimedReply {
+                                id,
+                                pcm,
+                                received: Instant::now(),
+                            }
+                        })
+                        .map_err(|error| error.to_string());
+                    let fatal = result.is_err();
+                    if sender.send(result).is_err() || fatal {
+                        break;
+                    }
+                }
+            });
+            Ok((input, replies, reader))
+        })();
+        match result {
+            Ok((input, replies, reader)) => Ok(Self {
+                child,
+                input,
+                replies,
+                reader: Some(reader),
+                pending: Default::default(),
+                next_id: 1,
+                lanes,
+                records: Vec::new(),
+                peak_rss: 0.0,
+                combined_baseline: None,
+                combined_growth: 0.0,
+                rss_samples: Vec::new(),
+                last_sample: Instant::now(),
+            }),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                Err(error)
+            }
+        }
+    }
+    fn sample_memory(&mut self, elapsed: f64, started: bool) -> Result<()> {
+        if self.last_sample.elapsed() < Duration::from_millis(100) {
+            return Ok(());
+        }
+        self.last_sample = Instant::now();
+        let worker = rss_mib(&std::fs::read_to_string(format!(
+            "/proc/{}/status",
+            self.child.id()
+        ))?)?;
+        let parent = resident_memory()?;
+        self.peak_rss = self.peak_rss.max(worker);
+        if started {
+            let baseline = *self.combined_baseline.get_or_insert(parent + worker);
+            self.combined_growth = self.combined_growth.max(parent + worker - baseline);
+        }
+        self.rss_samples.push(
+            serde_json::json!({"seconds": elapsed, "worker_mib": worker, "parent_mib": parent}),
+        );
+        Ok(())
+    }
+    fn shutdown(&mut self) -> Result<()> {
+        handy_tts_core::protocol::write_request(
+            &mut self.input,
+            &handy_tts_core::protocol::Request::Shutdown,
+        )?;
+        for _ in 0..=self.lanes + 1 {
+            match self.replies.recv_timeout(Duration::from_secs(60)) {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    anyhow::bail!("continuity shutdown timed out")
+                }
+            }
+        }
+        ensure!(self.child.wait()?.success(), "continuity worker failed");
+        if let Some(reader) = self.reader.take() {
+            reader
+                .join()
+                .map_err(|_| anyhow::anyhow!("continuity reader panicked"))?;
+        }
+        Ok(())
+    }
+}
+impl Drop for ProcessWorker {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+impl handy_tts_core::session::Worker for ProcessWorker {
+    fn request(
+        &mut self,
+        ticket: handy_tts_core::scheduler::Ticket,
+        text: &str,
+        selection: &handy_tts_core::selection::Selection,
+    ) -> Result<(), String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        handy_tts_core::protocol::write_request(
+            &mut self.input,
+            &handy_tts_core::protocol::Request::Synthesize {
+                id,
+                text: text.into(),
+                speed: Some(selection.speed),
+            },
+        )
+        .map_err(|e| e.to_string())?;
+        self.pending.insert(id, (ticket, Instant::now()));
+        Ok(())
+    }
+    fn poll(&mut self) -> Option<handy_tts_core::session::Completion> {
+        let (id, result, received) = match self.replies.try_recv().ok()? {
+            Ok(reply) => (reply.id, reply.pcm, reply.received),
+            Err(error) => (*self.pending.keys().next()?, Err(error), Instant::now()),
+        };
+        let (ticket, began) = self.pending.remove(&id)?;
+        let synthesis_seconds = received.duration_since(began).as_secs_f64();
+        if let Ok(pcm) = &result {
+            let trim = handy_tts_core::edges::trim(pcm.samples.clone(), pcm.sample_rate);
+            self.records.push(serde_json::json!({"index": ticket.index, "synthesis_seconds": synthesis_seconds,
+                "trimmed_samples": trim.samples.len(), "lead_removed": trim.lead_removed, "tail_removed": trim.tail_removed}));
+        }
+        Some(handy_tts_core::session::Completion {
+            ticket,
+            result,
+            synthesis_seconds,
+        })
+    }
+    fn available_lanes(&mut self) -> Option<usize> {
+        if crate::runtime::memory_available()
+            .is_ok_and(|m| m < handy_tts_core::memory::LANE_RESERVE_BYTES)
+            && self.lanes > 1
+        {
+            self.lanes = 1;
+            let _ = handy_tts_core::protocol::write_request(
+                &mut self.input,
+                &handy_tts_core::protocol::Request::SetLanes { lanes: 1 },
+            );
+        }
+        Some(self.lanes)
+    }
+    fn cancel(&mut self, ticket: handy_tts_core::scheduler::Ticket) {
+        if let Some((&id, _)) = self.pending.iter().find(|(_, (t, _))| *t == ticket) {
+            let _ = handy_tts_core::protocol::write_request(
+                &mut self.input,
+                &handy_tts_core::protocol::Request::Cancel { id },
+            );
+        }
+    }
+    fn selection_changed(&mut self) {}
+}
+
+struct CaptureState {
+    feed: handy_tts_core::feed::Feed,
+    chunks: Vec<serde_json::Value>,
+    events: Vec<handy_tts_core::playback::segment::OutputEvent>,
+    paused: bool,
+    position: u64,
+    first_started: bool,
+    origin: Option<Instant>,
+    terminal: bool,
+    wav: Option<std::io::BufWriter<std::fs::File>>,
+}
+impl CaptureState {
+    fn new(rate: u32, path: Option<&Path>) -> Result<Self> {
+        use std::io::Write;
+        let mut wav = path
+            .map(std::fs::File::create)
+            .transpose()?
+            .map(std::io::BufWriter::new);
+        if let Some(writer) = &mut wav {
+            writer.write_all(&[0; 44])?;
+        }
+        Ok(Self {
+            feed: handy_tts_core::feed::Feed::new(rate),
+            chunks: Vec::new(),
+            events: Vec::new(),
+            paused: false,
+            position: 0,
+            first_started: false,
+            origin: None,
+            terminal: false,
+            wav,
+        })
+    }
+    fn pull(&mut self, count: usize) -> Result<()> {
+        use handy_tts_core::feed::FeedEvent;
+        use std::io::Write;
+        if self.paused || self.chunks.is_empty() {
+            return Ok(());
+        }
+        let mut bytes = Vec::with_capacity(count * 4);
+        for _ in 0..count {
+            if self.terminal && self.chunks.iter().all(|c| c["delivered"] == c["scheduled"]) {
+                break;
+            }
+            let mut sample = [0.0];
+            self.feed.pull(&mut sample);
+            for event in self.feed.drain_events() {
+                match event {
+                    FeedEvent::Started(index) => {
+                        self.first_started = true;
+                        let row = self
+                            .chunks
+                            .iter_mut()
+                            .find(|r| r["index"] == index)
+                            .context("unrecorded segment started")?;
+                        row["started_sample"] = self.position.into();
+                        row["started_seconds"] =
+                            self.origin.map(|t| t.elapsed().as_secs_f64()).into();
+                    }
+                    FeedEvent::Finished { index, delivered } => {
+                        let row = self
+                            .chunks
+                            .iter_mut()
+                            .find(|r| r["index"] == index)
+                            .context("unrecorded segment finished")?;
+                        row["finished_sample"] = (self.position + 1).into();
+                        row["delivered"] = delivered.into();
+                    }
+                    FeedEvent::Underrun => {}
+                }
+                self.events.push(event.into());
+            }
+            bytes.extend_from_slice(&sample[0].to_le_bytes());
+            self.position += 1;
+        }
+        if let Some(wav) = &mut self.wav {
+            wav.write_all(&bytes)?;
+        }
+        Ok(())
+    }
+    fn finish_wav(&mut self) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write};
+        for index in 0..self.chunks.len().saturating_sub(1) {
+            let a = &self.chunks[index];
+            let b = &self.chunks[index + 1];
+            if a["started_sample"].is_null() || b["started_sample"].is_null() {
+                continue;
+            }
+            let end = a["started_sample"]
+                .as_u64()
+                .context("chunk start missing")?;
+            let start = b["started_sample"]
+                .as_u64()
+                .context("chunk start missing")?;
+            let gap = a["last_loud"]
+                .as_u64()
+                .zip(b["first_loud"].as_u64())
+                .map(|(last, first)| {
+                    (start + first).saturating_sub(end + last + 1) as f64 * 1000.0
+                        / f64::from(self.feed.sample_rate())
+                });
+            self.chunks[index]["gap_after_ms"] = gap.into();
+        }
+        if let Some(wav) = &mut self.wav {
+            let bytes =
+                u32::try_from(self.position * 4).context("capture exceeds WAV size limit")?;
+            let rate = self.feed.sample_rate();
+            wav.seek(SeekFrom::Start(0))?;
+            wav.write_all(b"RIFF")?;
+            wav.write_all(&(bytes + 36).to_le_bytes())?;
+            wav.write_all(b"WAVEfmt ")?;
+            wav.write_all(&16u32.to_le_bytes())?;
+            wav.write_all(&3u16.to_le_bytes())?;
+            wav.write_all(&1u16.to_le_bytes())?;
+            wav.write_all(&rate.to_le_bytes())?;
+            wav.write_all(&(rate * 4).to_le_bytes())?;
+            wav.write_all(&4u16.to_le_bytes())?;
+            wav.write_all(&32u16.to_le_bytes())?;
+            wav.write_all(b"data")?;
+            wav.write_all(&bytes.to_le_bytes())?;
+            wav.flush()?;
+        }
+        Ok(())
+    }
+}
+struct CaptureOutput {
+    state: std::sync::Arc<std::sync::Mutex<CaptureState>>,
+}
+impl CaptureOutput {
+    fn new(rate: u32, path: Option<&Path>) -> Result<Self> {
+        Ok(Self {
+            state: std::sync::Arc::new(std::sync::Mutex::new(CaptureState::new(rate, path)?)),
+        })
+    }
+    fn finish_wav(&mut self) -> Result<()> {
+        self.state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("capture poisoned"))?
+            .finish_wav()
+    }
+}
+impl handy_tts_core::playback::segment::Output for CaptureOutput {
+    type Prepared = ();
+    fn names(&self) -> Result<Vec<String>, handy_tts_core::playback::PlaybackError> {
+        Ok(Vec::new())
+    }
+    fn open(&mut self, _: Option<&str>) -> Result<(), handy_tts_core::playback::PlaybackError> {
+        Ok(())
+    }
+    fn prepare(&mut self, _: Option<&str>) -> Result<(), handy_tts_core::playback::PlaybackError> {
+        Ok(())
+    }
+    fn commit(&mut self, _: ()) {}
+    fn set_sample_rate(
+        &mut self,
+        rate: u32,
+    ) -> Result<(), handy_tts_core::playback::PlaybackError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| handy_tts_core::playback::PlaybackError::Unavailable)?;
+        if state.feed.sample_rate() == 0 {
+            state.feed = handy_tts_core::feed::Feed::new(rate);
+        }
+        if rate != state.feed.sample_rate() {
+            return Err(handy_tts_core::playback::PlaybackError::Unavailable);
+        }
+        Ok(())
+    }
+    fn append(
+        &mut self,
+        segment: handy_tts_core::feed::Segment,
+    ) -> Result<(), handy_tts_core::playback::PlaybackError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| handy_tts_core::playback::PlaybackError::Unavailable)?;
+        let first = segment
+            .speech
+            .iter()
+            .position(|s| s.abs() >= handy_tts_core::edges::THRESHOLD);
+        let last = segment
+            .speech
+            .iter()
+            .rposition(|s| s.abs() >= handy_tts_core::edges::THRESHOLD);
+        state.chunks.push(serde_json::json!({"index": segment.index, "scheduled": segment.samples(),
+            "delivered": 0, "pause_samples": segment.pause, "first_loud": first, "last_loud": last, "all_quiet": first.is_none()}));
+        state.feed.push(segment);
+        Ok(())
+    }
+    fn events(&mut self) -> Vec<handy_tts_core::playback::segment::OutputEvent> {
+        self.state
+            .lock()
+            .map(|mut s| std::mem::take(&mut s.events))
+            .unwrap_or_default()
+    }
+    fn retract_unstarted(&mut self) -> Vec<handy_tts_core::feed::Segment> {
+        self.state
+            .lock()
+            .map(|mut s| s.feed.retract_unstarted())
+            .unwrap_or_default()
+    }
+    fn content_samples(&self) -> u64 {
+        self.state
+            .lock()
+            .map(|s| s.feed.content_samples())
+            .unwrap_or(0)
+    }
+    fn pause(&mut self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.paused = true;
+        }
+    }
+    fn resume(&mut self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.paused = false;
+        }
+    }
+    fn stop(&mut self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.feed.clear(0);
+            s.paused = false;
+        }
+    }
+}
+
+trait CaptureWorker: handy_tts_core::session::Worker {
+    fn sample_memory(&mut self, _elapsed: f64, _started: bool) -> Result<()> {
+        Ok(())
+    }
+}
+impl CaptureWorker for ProcessWorker {
+    fn sample_memory(&mut self, elapsed: f64, started: bool) -> Result<()> {
+        ProcessWorker::sample_memory(self, elapsed, started)
+    }
+}
+
+fn drive_session<W: CaptureWorker>(
+    session: &mut handy_tts_core::session::Session<'_, W, CaptureOutput>,
+    real_time: bool,
+    startup_only: bool,
+) -> Result<()> {
+    use handy_tts_core::scheduler::PlaybackState;
+    let origin = Instant::now();
+    let state = session.playback.output.state.clone();
+    state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("capture poisoned"))?
+        .origin = Some(origin);
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let mixer = real_time.then(|| {
+            scope.spawn(|| -> Result<()> {
+                for step in 0..720_000u64 {
+                    if done.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    let mut capture = state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("capture poisoned"))?;
+                    let rate = u64::from(capture.feed.sample_rate());
+                    let count = ((step + 1) * rate / 200 - step * rate / 200) as usize;
+                    capture.pull(count)?;
+                    drop(capture);
+                    std::thread::sleep(
+                        (origin + Duration::from_millis((step + 1) * 5))
+                            .saturating_duration_since(Instant::now()),
+                    );
+                }
+                anyhow::bail!("capture sample clock timed out")
+            })
+        });
+        let result = (|| -> Result<()> {
+            session.play().map_err(anyhow::Error::msg)?;
+            let mut last_progress = 0.0;
+            for step in 0..1_800_000u64 {
+                let now = if real_time {
+                    origin.elapsed().as_secs_f64()
+                } else {
+                    step as f64 * 0.005
+                };
+                if now >= 3600.0 {
+                    break;
+                }
+                session.tick(now).map_err(anyhow::Error::msg)?;
+                let snapshot = session.snapshot();
+                ensure!(
+                    snapshot.state != PlaybackState::Error,
+                    "continuity session failed: {:?}",
+                    snapshot.error
+                );
+                let started = {
+                    let mut capture = state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("capture poisoned"))?;
+                    capture.terminal = session.queue.source_finished
+                        && session.queue.in_flight.is_empty()
+                        && session.queue.ready.is_empty()
+                        && session.queue.waiting.is_empty();
+                    capture.first_started
+                };
+                if real_time && now - last_progress >= 30.0 {
+                    let capture = state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("capture poisoned"))?;
+                    let finished = capture
+                        .chunks
+                        .iter()
+                        .filter(|chunk| chunk["delivered"] == chunk["scheduled"])
+                        .count();
+                    eprintln!(
+                        "CONTINUITY_PROGRESS elapsed={now:.3} state={:?} source_start={} source_finished={} in_flight={} ready={} waiting={} segments={} finished={finished} buffering={} underrun={} first_started={:?}",
+                        snapshot.state,
+                        snapshot.source_start,
+                        session.queue.source_finished,
+                        session.queue.in_flight.len(),
+                        session.queue.ready.len(),
+                        session.queue.waiting.len(),
+                        capture.chunks.len(),
+                        snapshot.buffering_pauses,
+                        capture.feed.underrun_samples(),
+                        capture
+                            .chunks
+                            .first()
+                            .and_then(|c| c["started_seconds"].as_f64()),
+                    );
+                    last_progress = now;
+                }
+                session.worker.sample_memory(now, started)?;
+                if snapshot.state == PlaybackState::Finished || (startup_only && started) {
+                    return Ok(());
+                }
+                if real_time {
+                    std::thread::sleep(Duration::from_millis(2));
+                } else {
+                    let mut capture = state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("capture poisoned"))?;
+                    let rate = u64::from(capture.feed.sample_rate());
+                    capture.pull(((step + 1) * rate / 200 - step * rate / 200) as usize)?;
+                }
+            }
+            anyhow::bail!("continuity session timed out")
+        })();
+        done.store(true, Ordering::SeqCst);
+        if let Some(mixer) = mixer {
+            mixer
+                .join()
+                .map_err(|_| anyhow::anyhow!("capture mixer panicked"))??;
+        }
+        result
+    })
 }
 #[cfg(test)]
 mod measurement_tests {
@@ -648,5 +1456,142 @@ The final sentence takes a very long time to synthesize.";
             assert!(!calls[0].contains("**"));
             assert!(!calls[0].contains("https://"));
         }
+    }
+}
+
+#[cfg(test)]
+mod continuity_tests {
+    use super::*;
+    use handy_tts_core::{
+        scheduler::Ticket,
+        selection::Selection,
+        session::{Completion, Session, Worker},
+    };
+    use std::collections::VecDeque;
+
+    #[derive(Default)]
+    struct FakeWorker(VecDeque<Ticket>);
+    impl CaptureWorker for FakeWorker {}
+    impl Worker for FakeWorker {
+        fn request(&mut self, ticket: Ticket, _: &str, _: &Selection) -> Result<(), String> {
+            self.0.push_front(ticket);
+            Ok(())
+        }
+        fn poll(&mut self) -> Option<Completion> {
+            self.0.pop_front().map(|ticket| Completion {
+                ticket,
+                result: Ok(Pcm {
+                    id: ticket.index as u64 + 1,
+                    sample_rate: 8000,
+                    samples: vec![0.5; 8000],
+                }),
+                synthesis_seconds: 0.01,
+            })
+        }
+        fn available_lanes(&mut self) -> Option<usize> {
+            Some(3)
+        }
+        fn cancel(&mut self, _: Ticket) {}
+        fn selection_changed(&mut self) {}
+    }
+
+    #[test]
+    fn continuity_record_contains_every_chunk_once() {
+        let source = include_str!("../../handy-tts-core/tests/fixtures/speech/owner-2x.txt");
+        let selection = Selection {
+            model_id: "supertonic-3".into(),
+            voice: "F1".into(),
+            speed: 2.0,
+            pitch: 0.0,
+            output_device: None,
+            read_code: false,
+        };
+        let mut session = Session::new(
+            source,
+            selection,
+            FakeWorker::default(),
+            CaptureOutput::new(8000, None).unwrap(),
+            None,
+        )
+        .unwrap();
+        session.set_dsp_clock(|| 0.0);
+        drive_session(&mut session, false, false).unwrap();
+        let capture = session.playback.output.state.lock().unwrap();
+        let rows = &capture.chunks;
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        for row in rows {
+            assert_eq!(row["scheduled"], row["delivered"]);
+            assert_eq!(
+                row["finished_sample"].as_u64().unwrap() - row["started_sample"].as_u64().unwrap(),
+                row["scheduled"].as_u64().unwrap()
+            );
+        }
+        assert_eq!(capture.feed.underrun_samples(), 0);
+        drop(capture);
+        assert!(session.snapshot().head_start_seconds.unwrap() > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod continuity_parts_tests {
+    use super::*;
+
+    #[test]
+    fn split_segments_form_one_complete_sentence_and_missing_tail_is_detected() {
+        let segments = vec![
+            serde_json::json!({"index":0,"scheduled":1000,"delivered":1000,"started_sample":0,"finished_sample":1000,"first_loud":0,"last_loud":999,"pause_samples":0,"trimmed_samples":1400,"synthesis_seconds":0.1,"dsp_seconds":0.0}),
+            serde_json::json!({"index":100,"scheduled":440,"delivered":440,"started_sample":1000,"finished_sample":1440,"first_loud":0,"last_loud":399,"pause_samples":40,"gap_after_ms":60.0}),
+            serde_json::json!({"index":1,"scheduled":1880,"delivered":1880,"started_sample":1440,"finished_sample":3320,"first_loud":20,"last_loud":1799,"pause_samples":80,"trimmed_samples":1800,"synthesis_seconds":0.1,"dsp_seconds":0.0}),
+        ];
+        let result = aggregate_chunks(&segments, &[40, 80], 1000, 1.0, 1.0).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0]["index"], 0);
+        assert_eq!(result[0]["scheduled"], 1440);
+        assert_eq!(result[0]["delivered"], 1440);
+        assert_eq!(result[0]["finished_sample"], 1440);
+        assert_eq!(result[0]["gap_after_ms"], 60.0);
+        let missing = aggregate_chunks(
+            &[segments[0].clone(), segments[2].clone()],
+            &[40, 80],
+            1000,
+            1.0,
+            1.0,
+        )
+        .unwrap();
+        assert_ne!(missing[0]["scheduled"], missing[0]["delivered"]);
+    }
+}
+
+#[cfg(test)]
+mod quiet_capture_tests {
+    use super::*;
+    use handy_tts_core::{feed::Segment, playback::segment::Output};
+
+    #[test]
+    fn quiet_segment_keeps_samples_and_reports_an_unmeasurable_gap() {
+        let mut output = CaptureOutput::new(8000, None).unwrap();
+        for (index, value) in [0.0, 0.5].into_iter().enumerate() {
+            output
+                .append(Segment {
+                    epoch: 0,
+                    index,
+                    speech: vec![value; 800],
+                    pause: 0,
+                })
+                .unwrap();
+        }
+        let mut state = output.state.lock().unwrap();
+        state.terminal = true;
+        state.pull(1600).unwrap();
+        state.finish_wav().unwrap();
+        assert_eq!(state.chunks[0]["delivered"], 800);
+        assert!(state.chunks[0]["gap_after_ms"].is_null());
+        assert_eq!(state.feed.content_samples(), 1600);
     }
 }

@@ -27,8 +27,8 @@ fn main() -> Result<()> {
     }
     if args.first().is_some_and(|a| a == "--measure-continuity") {
         anyhow::ensure!(
-            args.len() == 7,
-            "continuity needs model, root, device, cache, corpus and output"
+            args.len() >= 11,
+            "continuity needs model, root, device, cache, corpus, output, --speed and --wav"
         );
         let device = match args[3].as_str() {
             "cpu" => handy_tts_core::device::Device::Cpu,
@@ -36,6 +36,27 @@ fn main() -> Result<()> {
             "npu" => handy_tts_core::device::Device::Npu,
             _ => anyhow::bail!("unknown device"),
         };
+        let mut speed = None;
+        let mut wav = None;
+        let mut lanes = None;
+        let mut gpu_inputs = None;
+        let mut require_long_document = false;
+        let mut startup_only = false;
+        anyhow::ensure!(
+            (args.len() - 7).is_multiple_of(2),
+            "continuity options need values"
+        );
+        for pair in args[7..].as_chunks::<2>().0 {
+            match pair[0].as_str() {
+                "--speed" => speed = Some(pair[1].parse()?),
+                "--wav" => wav = Some(std::path::Path::new(&pair[1])),
+                "--lanes" => lanes = Some(pair[1].parse()?),
+                "--startup-only" => startup_only = pair[1].parse()?,
+                "--require-long-document" => require_long_document = pair[1].parse()?,
+                "--gpu-timings" => gpu_inputs = Some(std::path::Path::new(&pair[1])),
+                _ => anyhow::bail!("unknown continuity option"),
+            }
+        }
         return handy_tts::measure::continuity(
             &args[1],
             std::path::Path::new(&args[2]),
@@ -43,6 +64,14 @@ fn main() -> Result<()> {
             std::path::Path::new(&args[4]),
             std::path::Path::new(&args[5]),
             std::path::Path::new(&args[6]),
+            handy_tts::measure::ContinuityOptions {
+                speed: speed.ok_or_else(|| anyhow::anyhow!("--speed required"))?,
+                wav: wav.ok_or_else(|| anyhow::anyhow!("--wav required"))?,
+                lanes,
+                gpu_inputs,
+                require_long_document,
+                startup_only,
+            },
         );
     }
     if args.first().is_some_and(|a| a == "--measure-matrix") {
