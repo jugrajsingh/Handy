@@ -89,6 +89,17 @@ pub struct Completion {
 /// Nonblocking transport implemented by a supervised worker adapter.
 pub trait Worker {
     fn request(&mut self, ticket: Ticket, text: &str, selection: &Selection) -> Result<(), String>;
+    /// Returns false when admission must wait for worker capacity.
+    fn try_request(
+        &mut self,
+        ticket: Ticket,
+        text: &str,
+        selection: &Selection,
+    ) -> Result<bool, String> {
+        self.request(ticket, text, selection).map(|()| true)
+    }
+    /// Cancels requests no longer retained by the scheduler.
+    fn retain_requests(&mut self, _tickets: &[Ticket]) {}
     fn poll(&mut self) -> Option<Completion>;
     /// Supplies an optional request limit before each new request, including memory adapt-down.
     fn available_lanes(&mut self) -> Option<usize> {
@@ -911,6 +922,8 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             self.received(completion);
         }
         self.admit_parts();
+        let retained: Vec<_> = self.queue.in_flight.values().copied().collect();
+        self.worker.retain_requests(&retained);
         if let Some(index) = self.restart_from
             && self.queue.failed_index.is_none()
             && self.queue.in_flight.is_empty()
@@ -949,12 +962,26 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                         self.request_plans.insert(ticket.index, plan);
                         let mut native_selection = self.selection.clone();
                         native_selection.speed = plan.native;
-                        self.worker.request(ticket, &text.text, &native_selection)
+                        self.worker
+                            .try_request(ticket, &text.text, &native_selection)
                     });
-                    self.metadata.insert(ticket.index, text);
-                    if let Err(error) = result {
-                        self.error = Some(error);
-                        self.queue.complete(ticket, Err(()));
+                    match result {
+                        Ok(false) => {
+                            self.queue.defer_request(ticket);
+                            self.request_plans.remove(&ticket.index);
+                            self.pending_text = Some(text);
+                            break;
+                        }
+                        Ok(true) => {
+                            self.metadata.insert(ticket.index, text);
+                        }
+                        Err(error) => {
+                            self.metadata.insert(ticket.index, text);
+                            self.error = Some(error);
+                            self.queue.complete(ticket, Err(()));
+                            let retained: Vec<_> = self.queue.in_flight.values().copied().collect();
+                            self.worker.retain_requests(&retained);
+                        }
                     }
                 }
                 None => {
@@ -1074,6 +1101,7 @@ mod tests {
         native_speeds: Vec<Option<f32>>,
         cancelled: Vec<Ticket>,
         fail_once: Option<usize>,
+        busy_once: bool,
         seconds: f64,
         selections: usize,
     }
@@ -1105,6 +1133,17 @@ mod tests {
                 },
             ));
             Ok(())
+        }
+        fn try_request(
+            &mut self,
+            ticket: Ticket,
+            text: &str,
+            selection: &Selection,
+        ) -> Result<bool, String> {
+            if std::mem::take(&mut self.busy_once) {
+                return Ok(false);
+            }
+            self.request(ticket, text, selection).map(|()| true)
         }
         fn poll(&mut self) -> Option<Completion> {
             if self
@@ -1274,6 +1313,31 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+    #[test]
+    fn worker_backpressure_retains_ticket_and_text_until_admitted() {
+        let source = "Every sentence contains enough characters for its own speech chunk.";
+        let mut session = session(source, 0.1);
+        session.worker.busy_once = true;
+        session.play().unwrap();
+        session.tick(0.0).unwrap();
+        assert_eq!(session.queue.failed_index, None);
+        assert_eq!(session.queue.next_index, 0);
+        assert!(session.queue.in_flight.is_empty());
+        assert!(session.worker.requested.is_empty());
+        assert_eq!(session.pending_text.as_ref().unwrap().text, source);
+        assert_eq!(session.snapshot().error, None);
+        session.tick(0.0).unwrap();
+        assert_eq!(
+            session.worker.requested,
+            [Ticket {
+                epoch: session.queue.epoch,
+                index: 0
+            }]
+        );
+        assert_eq!(session.metadata[&0].text, source);
+        assert_eq!(session.queue.failed_index, None);
+        assert!(session.queue.in_flight.contains_key(&0));
     }
     mod streaming {
         use super::*;

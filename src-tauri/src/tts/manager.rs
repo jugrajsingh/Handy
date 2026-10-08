@@ -276,15 +276,18 @@ impl<B: Transport> TtsManager<B> {
         self.activity.fetch_add(1, Ordering::AcqRel);
         self.control.kill();
     }
+    fn stop_backend(&self, inner: &mut Inner<B>) {
+        inner.backend.stop();
+        self.lanes.store(1, Ordering::Release);
+        self.low_memory.store(false, Ordering::Release);
+    }
     pub fn unload(&self) {
         self.interrupt();
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let failed = inner.lifecycle.state == State::Failed;
         inner.lifecycle.stopping();
         self.publish(State::Stopping, Preparation::Idle);
-        inner.backend.stop();
-        self.lanes.store(1, Ordering::Release);
-        self.low_memory.store(false, Ordering::Release);
+        self.stop_backend(&mut inner);
         inner.key = None;
         inner.lifecycle.stopped();
         if failed {
@@ -366,7 +369,7 @@ impl<B: Transport> TtsManager<B> {
                 self.wake_idle();
                 if interrupted() {
                     if discard_cancelled_ready {
-                        inner.backend.stop();
+                        self.stop_backend(&mut inner);
                         inner.key = None;
                         inner.lifecycle.stopped();
                         self.publish(State::Unloaded, Preparation::Idle);
@@ -375,6 +378,12 @@ impl<B: Transport> TtsManager<B> {
                 }
                 return Ok(());
             }
+        }
+        if inner.key.is_some() {
+            self.stop_backend(&mut inner);
+            inner.key = None;
+            inner.lifecycle.stopped();
+            self.publish(State::Unloaded, Preparation::Idle);
         }
         let config = inner.config.clone();
         let choice = config.run_on.get(entry.id).copied().unwrap_or_default();
@@ -457,7 +466,7 @@ impl<B: Transport> TtsManager<B> {
                 lanes,
             });
             if interrupted() && (discard_cancelled_ready || result.is_err()) {
-                inner.backend.stop();
+                self.stop_backend(&mut inner);
                 inner.key = None;
                 inner.lifecycle.stopped();
                 self.publish(State::Unloaded, Preparation::Idle);
@@ -470,7 +479,7 @@ impl<B: Transport> TtsManager<B> {
                         entry.id,
                         TtsError::Memory
                     );
-                    inner.backend.stop();
+                    self.stop_backend(&mut inner);
                     inner.key = None;
                     inner.lifecycle.stopped();
                     inner.last_failure = Some((Instant::now(), TtsError::Memory));
@@ -509,7 +518,7 @@ impl<B: Transport> TtsManager<B> {
                     drop(cached);
                     if interrupted() {
                         if discard_cancelled_ready {
-                            inner.backend.stop();
+                            self.stop_backend(&mut inner);
                             inner.key = None;
                             inner.lifecycle.stopped();
                             self.publish(State::Unloaded, Preparation::Idle);
@@ -524,7 +533,7 @@ impl<B: Transport> TtsManager<B> {
                         "TTS worker start failed: {} on {device:?}: {last}",
                         entry.id
                     );
-                    inner.backend.stop();
+                    self.stop_backend(&mut inner);
                     inner.key = None;
                     if interrupted() {
                         inner.lifecycle.stopped();
@@ -588,7 +597,7 @@ impl<B: Transport> TtsManager<B> {
             if self.cancelled(id) {
                 let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if !inner.backend.alive() {
-                    inner.backend.stop();
+                    self.stop_backend(&mut inner);
                     inner.key = None;
                     inner.lifecycle.stopped();
                     self.publish(State::Unloaded, Preparation::Idle);
@@ -615,23 +624,26 @@ impl<B: Transport> TtsManager<B> {
                 .map_err(|_| TtsError::Worker)?
                 .native;
                 (
-                    inner.backend.submit(id, text, Some(native))?,
+                    inner.backend.submit(id, text, Some(native)),
                     inner.backend.synthesis_timeout(),
                     inner.generation,
                 )
             };
-            let result = match receive.recv_timeout(timeout) {
-                Ok(result) => result,
-                Err(_) => {
-                    let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                    if inner.generation == generation {
-                        inner.backend.stop();
-                        inner.key = None;
-                        inner.lifecycle.stopped();
-                        self.publish(State::Unloaded, Preparation::Idle);
+            let result = match receive {
+                Err(error) => Err(error),
+                Ok(receive) => match receive.recv_timeout(timeout) {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                        if inner.generation == generation {
+                            self.stop_backend(&mut inner);
+                            inner.key = None;
+                            inner.lifecycle.stopped();
+                            self.publish(State::Unloaded, Preparation::Idle);
+                        }
+                        Err(TtsError::Worker)
                     }
-                    Err(TtsError::Worker)
-                }
+                },
             };
             self.wake_idle();
             if self.cancelled(id) {
@@ -648,7 +660,7 @@ impl<B: Transport> TtsManager<B> {
                 return result;
             }
             if same_worker {
-                inner.backend.stop();
+                self.stop_backend(&mut inner);
                 inner.key = None;
                 inner.lifecycle.stopped();
                 self.publish(State::Unloaded, Preparation::Idle);
@@ -703,7 +715,7 @@ impl<B: Transport> TtsManager<B> {
         }
         inner.lifecycle.stopping();
         self.publish(State::Stopping, Preparation::Idle);
-        inner.backend.stop();
+        self.stop_backend(&mut inner);
         inner.key = None;
         inner.lifecycle.stopped();
         self.publish(State::Unloaded, Preparation::Idle);
@@ -789,7 +801,10 @@ mod tests {
         fail_all: bool,
         fail_npu: bool,
         memory_at_load: bool,
+        submit_failures: usize,
+        limits: Vec<usize>,
         start_gate: Option<Arc<std::sync::Barrier>>,
+        start_hook: Option<Arc<dyn Fn() + Send + Sync>>,
         alive_gate: Option<(Arc<std::sync::Barrier>, Arc<std::sync::Barrier>)>,
     }
     #[derive(Clone, Default)]
@@ -821,6 +836,9 @@ mod tests {
                 gate.wait();
                 gate.wait();
             }
+            if let Some(hook) = &trace.start_hook {
+                hook();
+            }
             if trace.memory_at_load {
                 return Err(TtsError::Memory);
             }
@@ -842,7 +860,14 @@ mod tests {
             _: &str,
             speed: Option<f32>,
         ) -> Result<mpsc::Receiver<Result<Pcm, TtsError>>, TtsError> {
-            self.trace.lock().unwrap().speeds.push(speed);
+            let mut trace = self.trace.lock().unwrap();
+            trace.speeds.push(speed);
+            if trace.submit_failures > 0 {
+                trace.submit_failures -= 1;
+                self.control.alive.store(false, Ordering::Release);
+                return Err(TtsError::Protocol);
+            }
+            drop(trace);
             let (send, receive) = mpsc::channel();
             send.send(Ok(Pcm {
                 id,
@@ -852,7 +877,8 @@ mod tests {
             .unwrap();
             Ok(receive)
         }
-        fn set_lanes(&mut self, _: usize) -> Result<(), TtsError> {
+        fn set_lanes(&mut self, lanes: usize) -> Result<(), TtsError> {
+            self.trace.lock().unwrap().limits.push(lanes);
             Ok(())
         }
         fn alive(&mut self) -> bool {
@@ -950,6 +976,103 @@ mod tests {
     }
     fn enough() -> Result<u64, TtsError> {
         Ok(handy_tts_core::memory::MIN_AVAILABLE_BYTES)
+    }
+    #[test]
+    fn submission_failure_after_worker_exit_retries_once() {
+        for failures in [1, 2] {
+            let trace = Arc::new(Mutex::new(Trace {
+                submit_failures: failures,
+                ..Default::default()
+            }));
+            let model = manager(RunOn::Cpu, trace.clone(), enough);
+            model.ensure(&selection()).unwrap();
+            let result = model.synthesize(&selection(), 41, "Retry this sentence");
+            if failures == 1 {
+                assert_eq!(result.unwrap().id, 41);
+                assert_eq!(model.status(), State::Ready);
+                assert!(model.control.alive.load(Ordering::Acquire));
+            } else {
+                assert_eq!(result, Err(TtsError::Protocol));
+                assert_eq!(model.status(), State::Unloaded);
+                assert!(!model.control.alive.load(Ordering::Acquire));
+                assert!(model.inner.lock().unwrap().key.is_none());
+            }
+            let trace = trace.lock().unwrap();
+            assert_eq!(trace.starts.len(), 2);
+            assert_eq!(trace.speeds.len(), 2);
+            assert!(trace.stopped >= failures);
+        }
+    }
+    fn three_lane_manager(trace: Arc<Mutex<Trace>>) -> Arc<TtsManager<Fake>> {
+        let mut config = config(RunOn::Cpu);
+        for rating in config.ratings.models.values_mut() {
+            rating.devices.get_mut(&Device::Cpu).unwrap().lanes = device::LaneSizing {
+                best_lanes: 3,
+                base_rss_mib: Some(100.0),
+                lane_rss_mib: Some(100.0),
+            };
+        }
+        TtsManager::with_backend(
+            config,
+            Fake {
+                control: FakeControl::default(),
+                trace,
+            },
+            Checks {
+                memory: || Ok(8 * 1024 * 1024 * 1024),
+                downloaded: |_, _| true,
+            },
+        )
+        .unwrap()
+    }
+    #[test]
+    fn idle_unload_resets_memory_adaptation_for_next_load() {
+        for idle in [true, false] {
+            let trace = Arc::new(Mutex::new(Trace::default()));
+            let model = three_lane_manager(trace.clone());
+            model.ensure(&selection()).unwrap();
+            model.lower_lanes();
+            assert_eq!(model.available_lanes(), 1);
+            if idle {
+                model.idle(UnloadAfter::Immediately, false);
+            } else {
+                model.unload();
+            }
+            assert_eq!(model.status(), State::Unloaded);
+            model.ensure(&selection()).unwrap();
+            assert_eq!(trace.lock().unwrap().load_lanes, [3, 3]);
+            assert_eq!(trace.lock().unwrap().limits, [1]);
+            assert_eq!(model.available_lanes(), 3);
+        }
+    }
+    #[test]
+    fn memory_pressure_during_load_is_applied_to_the_new_worker() {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let model = three_lane_manager(trace.clone());
+        model.ensure(&selection()).unwrap();
+        model.lower_lanes();
+        model.unload();
+        let weak = Arc::downgrade(&model);
+        trace.lock().unwrap().start_hook =
+            Some(Arc::new(move || weak.upgrade().unwrap().lower_lanes()));
+        model.ensure(&selection()).unwrap();
+        assert_eq!(trace.lock().unwrap().load_lanes, [3, 3]);
+        assert_eq!(trace.lock().unwrap().limits, [1, 1]);
+        assert_eq!(model.available_lanes(), 1);
+    }
+    #[test]
+    fn crash_restart_resets_memory_adaptation_for_next_load() {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let model = three_lane_manager(trace.clone());
+        model.ensure(&selection()).unwrap();
+        model.lower_lanes();
+        model.control.kill();
+        model.ensure(&selection()).unwrap();
+        model.lower_lanes();
+        trace.lock().unwrap().submit_failures = 1;
+        assert!(model.synthesize(&selection(), 42, "Restart").is_ok());
+        assert_eq!(trace.lock().unwrap().load_lanes, [3, 3, 3]);
+        assert_eq!(model.available_lanes(), 3);
     }
     #[test]
     fn missing_startup_default_reports_not_downloaded_without_starting_worker() {

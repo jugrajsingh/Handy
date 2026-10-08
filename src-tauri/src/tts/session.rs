@@ -126,27 +126,57 @@ impl<B: super::backend::Transport> ManagerWorker<B> {
 }
 impl<B: super::backend::Transport> Worker for ManagerWorker<B> {
     fn request(&mut self, ticket: Ticket, text: &str, selection: &Selection) -> Result<(), String> {
+        if self.try_request(ticket, text, selection)? {
+            Ok(())
+        } else {
+            Err("tts.errors.busy".into())
+        }
+    }
+    fn try_request(
+        &mut self,
+        ticket: Ticket,
+        text: &str,
+        selection: &Selection,
+    ) -> Result<bool, String> {
         let key = (ticket.epoch, ticket.index);
         let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
-        if active.contains_key(&key) || active.len() >= self.manager.available_lanes() {
+        if active.contains_key(&key) {
             return Err("tts.errors.busy".into());
+        }
+        if active.len() >= self.manager.available_lanes() {
+            return Ok(false);
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         active.insert(key, id);
-        if self
-            .tx
-            .try_send(Work {
-                ticket,
-                text: text.into(),
-                selection: selection.clone(),
-                id,
-            })
-            .is_err()
-        {
-            active.remove(&key);
-            return Err("tts.errors.busy".into());
+        match self.tx.try_send(Work {
+            ticket,
+            text: text.into(),
+            selection: selection.clone(),
+            id,
+        }) {
+            Ok(()) => Ok(true),
+            Err(mpsc::TrySendError::Full(_)) => {
+                active.remove(&key);
+                Ok(false)
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                active.remove(&key);
+                Err("tts.errors.worker".into())
+            }
         }
-        Ok(())
+    }
+    fn retain_requests(&mut self, tickets: &[Ticket]) {
+        let obsolete: Vec<_> = self
+            .active
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .keys()
+            .map(|&(epoch, index)| Ticket { epoch, index })
+            .filter(|ticket| !tickets.contains(ticket))
+            .collect();
+        for ticket in obsolete {
+            self.cancel(ticket);
+        }
     }
     fn poll(&mut self) -> Option<Completion> {
         self.rx
@@ -551,6 +581,7 @@ pub(super) mod tests {
         active: bool,
         stops: usize,
         commits: usize,
+        finished: Vec<usize>,
         feed: Option<handy_tts_core::feed::Feed>,
     }
     impl Output for Audio {
@@ -587,7 +618,12 @@ pub(super) mod tests {
                 .map(|feed| {
                     feed.drain_events()
                         .into_iter()
-                        .map(OutputEvent::from)
+                        .map(|event| {
+                            if let handy_tts_core::feed::FeedEvent::Finished { index, .. } = event {
+                                self.finished.push(index);
+                            }
+                            OutputEvent::from(event)
+                        })
                         .collect()
                 })
                 .unwrap_or_default()
@@ -719,11 +755,108 @@ pub(super) mod tests {
         Ticket { epoch: 7, index }
     }
     #[test]
+    fn failed_lane_retry_waits_for_obsolete_jobs_without_busy_error() {
+        let (worker, control, submitted) = lane_worker();
+        let source =
+            "Every sentence contains enough characters for its own speech chunk.\n\n".repeat(3);
+        let mut session =
+            Session::new(&source, selection(), worker, Audio::default(), None).unwrap();
+        session.play().unwrap();
+        session.tick(0.0).unwrap();
+        let active = session.worker.active.lock().unwrap().clone();
+        let mut replies = std::collections::BTreeMap::new();
+        for _ in 0..3 {
+            let (id, send) = submitted.recv_timeout(Duration::from_secs(3)).unwrap();
+            replies.insert(id, send);
+        }
+        let epoch = session.queue.epoch;
+        replies
+            .remove(&active[&(epoch, 0)])
+            .unwrap()
+            .send(Err(TtsError::Protocol))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while session.queue.state != PlaybackState::Error && Instant::now() < deadline {
+            session.tick(0.0).unwrap();
+            std::thread::yield_now();
+        }
+        assert_eq!(session.queue.failed_index, Some(0));
+        session.play().unwrap();
+        session.tick(0.0).unwrap();
+        assert_eq!(
+            session.queue.failed_index,
+            None,
+            "retry failed: {:?}",
+            session.snapshot().error
+        );
+        assert_eq!(session.snapshot().error, None);
+        let cancelled = control.cancelled.lock().unwrap().len();
+        assert_eq!(cancelled, 2);
+        let (id, send) = submitted.recv_timeout(Duration::from_secs(3)).unwrap();
+        let retry_epoch = session.queue.epoch;
+        assert_eq!(session.worker.active.lock().unwrap()[&(retry_epoch, 0)], id);
+        assert_eq!(session.queue.in_flight.len(), 1);
+        assert!(submitted.try_recv().is_err());
+        for (old_id, old_send) in replies {
+            old_send
+                .send(Ok(handy_tts_core::protocol::Pcm {
+                    id: old_id,
+                    sample_rate: 8000,
+                    samples: vec![0.2; 8000],
+                }))
+                .unwrap();
+        }
+        send.send(Ok(handy_tts_core::protocol::Pcm {
+            id,
+            sample_rate: 8000,
+            samples: vec![0.2; 8000],
+        }))
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut retried = vec![0];
+        while session.queue.state != PlaybackState::Finished && Instant::now() < deadline {
+            session.tick(0.0).unwrap();
+            assert_eq!(session.queue.failed_index, None);
+            assert_eq!(session.snapshot().error, None);
+            while let Ok((id, send)) = submitted.try_recv() {
+                let index = session
+                    .worker
+                    .active
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|(_, value)| **value == id)
+                    .unwrap()
+                    .0
+                     .1;
+                retried.push(index);
+                send.send(Ok(handy_tts_core::protocol::Pcm {
+                    id,
+                    sample_rate: 8000,
+                    samples: vec![0.2; 8000],
+                }))
+                .unwrap();
+            }
+            if let Some(feed) = &mut session.playback.output.feed {
+                feed.pull(&mut [0.0; 16000]);
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(session.queue.state, PlaybackState::Finished);
+        retried.sort_unstable();
+        assert_eq!(retried, [0, 1, 2]);
+        assert_eq!(session.playback.output.finished, [0, 1, 2]);
+    }
+    #[test]
     fn cancel_targets_only_that_ticket() {
         let (mut worker, control, submitted) = lane_worker();
         for i in 0..3 {
             worker.request(ticket(i), "sentence", &selection()).unwrap();
         }
+        assert!(!worker
+            .try_request(ticket(3), "sentence", &selection())
+            .unwrap());
+        assert_eq!(worker.active.lock().unwrap().len(), 3);
         let mut replies = Vec::new();
         for _ in 0..3 {
             replies.push(submitted.recv_timeout(Duration::from_secs(3)).unwrap());

@@ -321,6 +321,18 @@ impl Queue {
         self.busy_lanes.insert(ticket.index, busy);
         Some(ticket)
     }
+    /// Releases the latest reservation when the worker cannot admit it yet.
+    pub fn defer_request(&mut self, ticket: Ticket) {
+        if ticket.epoch == self.epoch
+            && self.next_index == ticket.index + 1
+            && self.in_flight.get(&ticket.index) == Some(&ticket)
+        {
+            self.in_flight.remove(&ticket.index);
+            self.estimates.remove(&ticket.index);
+            self.busy_lanes.remove(&ticket.index);
+            self.next_index = ticket.index;
+        }
+    }
     /// Completes a request without a synthesis timing observation.
     pub fn complete(
         &mut self,
