@@ -331,7 +331,10 @@ impl TtsService {
         preview_with(ready.session.as_ref(), &self.preview, stop, |cancel| {
             std::thread::spawn(move || {
                 let _completed = PreviewCompletion(completed);
-                use handy_tts_core::playback::{Playback, Poll};
+                use handy_tts_core::{
+                    feed::Segment,
+                    playback::segment::{OutputEvent, Playback},
+                };
                 let result = (|| -> Result<(), String> {
                     if cancel.load(std::sync::atomic::Ordering::Acquire) {
                         return Ok(());
@@ -355,9 +358,25 @@ impl TtsService {
                         handy.as_deref(),
                     )
                     .map_err(|e| e.to_string())?;
-                    output.play(0, pcm, 0).map_err(|e| e.to_string())?;
+                    output
+                        .output
+                        .set_sample_rate(pcm.sample_rate)
+                        .map_err(|e| e.to_string())?;
+                    output
+                        .append(Segment {
+                            epoch: 0,
+                            index: 0,
+                            speech: pcm.samples,
+                            pause: 0,
+                        })
+                        .map_err(|e| e.to_string())?;
                     while !cancel.load(std::sync::atomic::Ordering::Acquire) {
-                        if output.poll().map_err(|e| e.to_string())? == Poll::Finished {
+                        if output
+                            .events()
+                            .map_err(|e| e.to_string())?
+                            .iter()
+                            .any(|event| matches!(event, OutputEvent::Finished { index: 0, .. }))
+                        {
                             break;
                         }
                         std::thread::sleep(std::time::Duration::from_millis(20));

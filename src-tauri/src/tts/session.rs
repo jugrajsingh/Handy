@@ -18,6 +18,8 @@ struct Work {
     selection: Selection,
     id: u64,
 }
+type CompletionWake = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
+
 #[derive(Clone)]
 pub(super) struct ManagerWorker {
     manager: Arc<TtsManager>,
@@ -25,12 +27,15 @@ pub(super) struct ManagerWorker {
     rx: Arc<Mutex<mpsc::Receiver<Completion>>>,
     next: Arc<AtomicU64>,
     active: Arc<AtomicU64>,
+    wake: CompletionWake,
 }
 impl ManagerWorker {
     pub(super) fn new(manager: Arc<TtsManager>) -> Self {
         let (tx, jobs) = mpsc::sync_channel::<Work>(1);
         let (results, rx) = mpsc::sync_channel(1);
         let active = Arc::new(AtomicU64::new(0));
+        let wake: CompletionWake = Arc::new(Mutex::new(None));
+        let notify = wake.clone();
         let engine = manager.clone();
         std::thread::spawn(move || {
             for job in jobs {
@@ -51,6 +56,10 @@ impl ManagerWorker {
                 {
                     break;
                 }
+                let wake = notify.lock().unwrap_or_else(|p| p.into_inner()).clone();
+                if let Some(wake) = wake {
+                    wake();
+                }
             }
         });
         Self {
@@ -59,6 +68,7 @@ impl ManagerWorker {
             rx: Arc::new(Mutex::new(rx)),
             next: Arc::new(AtomicU64::new(1)),
             active,
+            wake,
         }
     }
 }
@@ -90,6 +100,9 @@ impl Worker for ManagerWorker {
     }
     fn selection_changed(&mut self) {
         self.manager.selected();
+    }
+    fn set_completion_waker(&mut self, wake: Arc<dyn Fn() + Send + Sync>) {
+        *self.wake.lock().unwrap_or_else(|p| p.into_inner()) = Some(wake);
     }
     fn retry_failed_selection(&mut self) {
         self.manager.retry_failed_selection();
@@ -123,6 +136,7 @@ impl SessionView {
     }
 }
 pub enum SessionCommand {
+    WorkerReady,
     Interrupt(mpsc::Sender<()>),
     PauseAcknowledged(mpsc::Sender<()>),
     Replace {
@@ -144,7 +158,7 @@ pub enum SessionCommand {
 }
 type SelectionPersist =
     Box<dyn FnOnce(&Selection) -> Result<(), handy_tts_core::selection::SelectionError> + Send>;
-fn apply_selection<W: Worker, O: handy_tts_core::playback::Output>(
+fn apply_selection<W: Worker, O: handy_tts_core::playback::segment::Output>(
     session: &mut Session<'_, W, O>,
     selection: Selection,
     downloaded: bool,
@@ -191,7 +205,7 @@ impl ReadAloudSession {
     }
     fn spawn_with<W, O>(
         manager: Arc<TtsManager>,
-        worker: W,
+        mut worker: W,
         output: impl Fn() -> O + Send + 'static,
         selection: Selection,
         handy_output: Option<String>,
@@ -199,9 +213,13 @@ impl ReadAloudSession {
     ) -> Arc<Self>
     where
         W: Worker + Clone + Send + 'static,
-        O: handy_tts_core::playback::Output + Send + 'static,
+        O: handy_tts_core::playback::segment::Output + Send + 'static,
     {
         let (tx, rx) = mpsc::sync_channel(16);
+        let notify = tx.clone();
+        worker.set_completion_waker(Arc::new(move || {
+            let _ = notify.try_send(SessionCommand::WorkerReady);
+        }));
         let empty = SessionSnapshot {
             epoch: 0,
             state: PlaybackState::Waiting,
@@ -271,9 +289,11 @@ impl ReadAloudSession {
                     } else {
                         rx.recv_timeout(Duration::from_millis(20))
                     };
-                    let commanded = message.is_ok();
+                    let commanded =
+                        message.is_ok() && !matches!(message, Ok(SessionCommand::WorkerReady));
                     let was_visible = visible;
                     match message {
+                        Ok(SessionCommand::WorkerReady) => {}
                         Ok(SessionCommand::PauseAcknowledged(done)) => {
                             session.pause();
                             let _ = done.send(());
@@ -437,8 +457,11 @@ impl ReadAloudSession {
 pub(super) mod tests {
     use super::*;
     use handy_tts_core::{
-        playback::{Output, PlaybackError, Poll},
-        protocol::Pcm,
+        feed::Segment,
+        playback::{
+            segment::{Output, OutputEvent},
+            PlaybackError,
+        },
     };
     #[derive(Default)]
     struct Audio {
@@ -446,6 +469,7 @@ pub(super) mod tests {
         active: bool,
         stops: usize,
         commits: usize,
+        feed: Option<handy_tts_core::feed::Feed>,
     }
     impl Output for Audio {
         type Prepared = ();
@@ -465,17 +489,42 @@ pub(super) mod tests {
         fn commit(&mut self, _: ()) {
             self.commits += 1;
         }
-        fn play(&mut self, _: Pcm, _: u32) -> Result<(), PlaybackError> {
+        fn set_sample_rate(&mut self, _: u32) -> Result<(), PlaybackError> {
+            Ok(())
+        }
+        fn append(&mut self, segment: Segment) -> Result<(), PlaybackError> {
+            self.feed
+                .get_or_insert_with(|| handy_tts_core::feed::Feed::new(8000))
+                .push(segment);
             self.active = true;
             Ok(())
         }
-        fn poll(&mut self) -> Poll {
-            Poll::Playing
+        fn events(&mut self) -> Vec<OutputEvent> {
+            self.feed
+                .as_mut()
+                .map(|feed| {
+                    feed.drain_events()
+                        .into_iter()
+                        .map(OutputEvent::from)
+                        .collect()
+                })
+                .unwrap_or_default()
         }
+        fn retract_unstarted(&mut self) -> Vec<Segment> {
+            self.feed
+                .as_mut()
+                .map(|feed| feed.retract_unstarted())
+                .unwrap_or_default()
+        }
+        fn content_samples(&self) -> u64 {
+            self.feed.as_ref().map_or(0, |feed| feed.content_samples())
+        }
+
         fn pause(&mut self) {}
         fn resume(&mut self) {}
         fn stop(&mut self) {
             self.active = false;
+            self.feed = None;
             self.stops += 1;
         }
     }
@@ -490,6 +539,28 @@ pub(super) mod tests {
         }
         fn cancel(&mut self, _: Ticket) {}
         fn selection_changed(&mut self) {}
+    }
+    #[test]
+    fn worker_completion_notifies_actor_after_result_is_available() {
+        let mut worker = ManagerWorker::new(manager());
+        let (notify, receive) = mpsc::channel();
+        worker.set_completion_waker(Arc::new(move || {
+            notify.send(()).unwrap();
+        }));
+        let ticket = Ticket { epoch: 4, index: 7 };
+        worker
+            .request(
+                ticket,
+                "A complete sentence for this unavailable test model.",
+                &selection(),
+            )
+            .unwrap();
+        receive.recv_timeout(Duration::from_secs(3)).unwrap();
+        let completion = worker
+            .poll()
+            .expect("the wake follows the queued completion");
+        assert_eq!(completion.ticket, ticket);
+        assert!(completion.result.is_err());
     }
     fn selection() -> Selection {
         Selection {
@@ -578,11 +649,20 @@ pub(super) mod tests {
         fn commit(&mut self, _: ()) {
             self.0.lock().unwrap().commits += 1;
         }
-        fn play(&mut self, _: Pcm, _: u32) -> Result<(), PlaybackError> {
+        fn set_sample_rate(&mut self, _: u32) -> Result<(), PlaybackError> {
             Ok(())
         }
-        fn poll(&mut self) -> Poll {
-            Poll::Playing
+        fn append(&mut self, _: Segment) -> Result<(), PlaybackError> {
+            Ok(())
+        }
+        fn events(&mut self) -> Vec<OutputEvent> {
+            vec![]
+        }
+        fn retract_unstarted(&mut self) -> Vec<Segment> {
+            vec![]
+        }
+        fn content_samples(&self) -> u64 {
+            0
         }
         fn pause(&mut self) {}
         fn resume(&mut self) {}
@@ -1057,16 +1137,21 @@ pub(super) mod tests {
         session.play().unwrap();
         session
             .playback
-            .play(
-                7,
-                Pcm {
-                    id: 7,
-                    sample_rate: 10,
-                    samples: vec![0.1; 10],
-                },
-                0,
-            )
+            .append(Segment {
+                epoch: session.queue.epoch,
+                index: 7,
+                speech: vec![0.1; 10],
+                pause: 0,
+            })
             .unwrap();
+        session
+            .playback
+            .output
+            .feed
+            .as_mut()
+            .unwrap()
+            .pull(&mut [0.0]);
+        session.playback.events().unwrap();
         session.playback.output.fail_prepare = true;
         let before = (
             session.queue.epoch,

@@ -7,9 +7,18 @@ pub struct SelectionChange {
     pub resume: bool,
     pub missing_download: bool,
 }
+/// Identifies controls changes that retain the current sentence and worker.
+pub fn speed_pitch_only(current: &Selection, next: &Selection) -> bool {
+    current.model_id == next.model_id
+        && current.voice == next.voice
+        && current.output_device == next.output_device
+        && current.read_code == next.read_code
+        && (current.speed != next.speed || current.pitch != next.pitch)
+}
 /// Validates and persists a selection before invalidating current audio.
 pub fn select_with(
     queue: &mut crate::scheduler::Queue,
+    current: &Selection,
     selection: Selection,
     downloaded: bool,
     persist: impl FnOnce(&Selection) -> Result<(), SelectionError>,
@@ -26,6 +35,14 @@ pub fn select_with(
         old,
         PlaybackState::Playing | PlaybackState::Buffering | PlaybackState::Starting
     );
+    if downloaded && speed_pitch_only(current, &selection) {
+        return Ok(SelectionChange {
+            epoch: queue.epoch,
+            sentence_index: queue.next_unspoken(),
+            resume,
+            missing_download: false,
+        });
+    }
     let sentence_index = queue.switch_selection(downloaded);
     if downloaded && old == PlaybackState::Paused {
         queue.pause();
@@ -83,7 +100,7 @@ mod tests {
                 source_end: 80,
             });
             let mut trace = vec![];
-            let changed = select_with(&mut q, selection(), true, |value| {
+            let changed = select_with(&mut q, &selection(), selection(), true, |value| {
                 trace.push((entry_point, value.model_id.clone(), value.voice.clone()));
                 Ok(())
             })
@@ -94,7 +111,8 @@ mod tests {
             assert_eq!(changed.epoch, 5);
             assert!(q.playing.is_none());
             assert_eq!(q.request_next().unwrap().index, 7);
-            let missing = select_with(&mut q, selection(), false, |_| Ok(())).unwrap();
+            let missing =
+                select_with(&mut q, &selection(), selection(), false, |_| Ok(())).unwrap();
             assert_eq!(missing.sentence_index, 7);
             assert!(!missing.resume);
             assert!(missing.missing_download);
@@ -107,19 +125,23 @@ mod tests {
         q.play();
         let epoch = q.epoch;
         assert_eq!(
-            select_with(&mut q, selection(), true, |_| Err(SelectionError::Persist)),
+            select_with(&mut q, &selection(), selection(), true, |_| Err(
+                SelectionError::Persist
+            )),
             Err(SelectionError::Persist)
         );
         assert_eq!(q.epoch, epoch);
         let mut invalid = selection();
         invalid.voice = "missing".into();
         assert_eq!(
-            select_with(&mut q, invalid, true, |_| panic!("must not persist")),
+            select_with(&mut q, &selection(), invalid, true, |_| panic!(
+                "must not persist"
+            )),
             Err(SelectionError::Voice)
         );
         assert_eq!(q.epoch, epoch);
         q.pause();
-        select_with(&mut q, selection(), true, |_| Ok(())).unwrap();
+        select_with(&mut q, &selection(), selection(), true, |_| Ok(())).unwrap();
         assert_eq!(q.state, crate::scheduler::PlaybackState::Paused);
         assert!(q.request_next().is_none());
     }

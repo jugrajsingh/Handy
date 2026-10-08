@@ -3,9 +3,8 @@ use handy_tts_core::{
     feed::{Feed, Segment, SharedFeed},
     playback::{
         segment::{Output, OutputEvent},
-        Output as LegacyOutput, PlaybackError, Poll,
+        PlaybackError,
     },
-    protocol::Pcm,
 };
 use rodio::{
     mixer::Mixer, queue::SourcesQueueOutput, source::UniformSourceIterator, OutputStream,
@@ -361,6 +360,9 @@ impl Output for RodioOutput {
         self.lost = prepared.lost;
         self.paused = prepared.paused;
     }
+    fn set_sample_rate(&mut self, rate: u32) -> Result<(), PlaybackError> {
+        RodioOutput::set_sample_rate(self, rate)
+    }
     fn append(&mut self, segment: Segment) -> Result<(), PlaybackError> {
         let rate = self.rate.ok_or(PlaybackError::Unavailable)?;
         if self.sink.is_none() {
@@ -599,62 +601,6 @@ impl RodioOutput {
             rate,
             mixer_format,
         ))
-    }
-}
-
-// The legacy session and preview migrate to segment playback in s9.
-impl LegacyOutput for RodioOutput {
-    type Prepared = PreparedStream;
-    fn names(&self) -> Result<Vec<String>, PlaybackError> {
-        Output::names(self)
-    }
-    fn open(&mut self, name: Option<&str>) -> Result<(), PlaybackError> {
-        if self.mixer.is_none() {
-            self.selected = name.map(str::to_owned);
-            Ok(())
-        } else {
-            Output::open(self, name)
-        }
-    }
-    fn prepare(&mut self, name: Option<&str>) -> Result<Self::Prepared, PlaybackError> {
-        Output::prepare(self, name)
-    }
-    fn commit(&mut self, prepared: Self::Prepared) {
-        Output::commit(self, prepared);
-    }
-    fn play(&mut self, pcm: Pcm, pause_ms: u32) -> Result<(), PlaybackError> {
-        self.set_sample_rate(pcm.sample_rate)?;
-        Output::append(
-            self,
-            Segment {
-                epoch: 0,
-                index: pcm.id as usize,
-                pause: (u64::from(pcm.sample_rate) * u64::from(pause_ms) / 1000) as usize,
-                speech: pcm.samples,
-            },
-        )
-    }
-    fn poll(&mut self) -> Poll {
-        let events = Output::events(self);
-        if events.contains(&OutputEvent::DeviceLost) {
-            Poll::DeviceLost
-        } else if events
-            .iter()
-            .any(|event| matches!(event, OutputEvent::Finished { .. }))
-        {
-            Poll::Finished
-        } else {
-            Poll::Playing
-        }
-    }
-    fn pause(&mut self) {
-        Output::pause(self);
-    }
-    fn resume(&mut self) {
-        Output::resume(self);
-    }
-    fn stop(&mut self) {
-        Output::stop(self);
     }
 }
 
@@ -1287,31 +1233,40 @@ mod tests {
     }
 
     #[test]
-    fn legacy_poll_finishes_only_on_the_last_pulled_pause_sample() {
+    fn segment_finishes_only_on_the_last_pulled_pause_sample() {
         let (mixer, mut mixed) = rodio::mixer::mixer(1, 24_000);
         let mut output = RodioOutput::with_mixer(&mixer, 24_000);
-        LegacyOutput::play(
+        SegmentOutput::append(
             &mut output,
-            Pcm {
-                id: 7,
-                sample_rate: 24_000,
-                samples: vec![0.25; 240],
+            Segment {
+                epoch: 0,
+                index: 7,
+                speech: vec![0.25; 240],
+                pause: 240,
             },
-            10,
         )
         .unwrap();
-        assert_eq!(LegacyOutput::poll(&mut output), Poll::Playing);
+        assert!(SegmentOutput::events(&mut output).is_empty());
         pull(&mut mixed, 479);
-        assert_eq!(LegacyOutput::poll(&mut output), Poll::Playing);
+        assert_eq!(
+            SegmentOutput::events(&mut output),
+            [OutputEvent::Started(7)]
+        );
         assert_eq!(SegmentOutput::content_samples(&output), 479);
         assert!(output.finished_logs.is_empty());
         pull(&mut mixed, 1);
-        assert_eq!(LegacyOutput::poll(&mut output), Poll::Finished);
+        assert_eq!(
+            SegmentOutput::events(&mut output),
+            [OutputEvent::Finished {
+                index: 7,
+                delivered: 480
+            }]
+        );
         assert_eq!(
             output.finished_logs,
             ["tts chunk finished index=7 scheduled=480 delivered=480 underrun=0"]
         );
-        assert_eq!(LegacyOutput::poll(&mut output), Poll::Playing);
+        assert!(SegmentOutput::events(&mut output).is_empty());
     }
 
     #[test]

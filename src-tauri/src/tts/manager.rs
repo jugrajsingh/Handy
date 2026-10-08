@@ -1062,7 +1062,11 @@ for line in sys.stdin:
     #[test]
     fn same_model_selection_clears_failed_and_allows_play_retry() {
         use handy_tts_core::{
-            playback::{Output, PlaybackError, Poll},
+            feed::Segment,
+            playback::{
+                segment::{Output, OutputEvent},
+                PlaybackError,
+            },
             scheduler::Ticket,
             session::{Session, Worker},
         };
@@ -1079,11 +1083,20 @@ for line in sys.stdin:
                 Ok(())
             }
             fn commit(&mut self, _: ()) {}
-            fn play(&mut self, _: Pcm, _: u32) -> Result<(), PlaybackError> {
+            fn set_sample_rate(&mut self, _: u32) -> Result<(), PlaybackError> {
                 Ok(())
             }
-            fn poll(&mut self) -> Poll {
-                Poll::Playing
+            fn append(&mut self, _: Segment) -> Result<(), PlaybackError> {
+                Ok(())
+            }
+            fn events(&mut self) -> Vec<OutputEvent> {
+                vec![]
+            }
+            fn retract_unstarted(&mut self) -> Vec<Segment> {
+                vec![]
+            }
+            fn content_samples(&self) -> u64 {
+                0
             }
             fn pause(&mut self) {}
             fn resume(&mut self) {}
@@ -1516,7 +1529,11 @@ for line in sys.stdin:
     #[test]
     fn real_crashing_worker_drains_preceding_sentences_and_retries_failed_sentence() {
         use handy_tts_core::{
-            playback::{Output, PlaybackError, Poll},
+            feed::{Feed, Segment},
+            playback::{
+                segment::{Output, OutputEvent},
+                PlaybackError,
+            },
             scheduler::PlaybackState,
             session::Session,
             text::TextCursor,
@@ -1526,6 +1543,9 @@ for line in sys.stdin:
         struct Speaker {
             played: Vec<usize>,
             finished: bool,
+            feed: Option<Feed>,
+            remaining: std::collections::VecDeque<usize>,
+            speech_indices: std::collections::BTreeMap<usize, usize>,
         }
         impl Output for Speaker {
             type Prepared = ();
@@ -1539,22 +1559,59 @@ for line in sys.stdin:
                 Ok(())
             }
             fn commit(&mut self, _: ()) {}
-            fn play(&mut self, pcm: Pcm, _: u32) -> Result<(), PlaybackError> {
-                self.played
-                    .push(pcm.samples[pcm.samples.len() / 2] as usize);
-                self.finished = false;
+            fn set_sample_rate(&mut self, rate: u32) -> Result<(), PlaybackError> {
+                if self.feed.is_none() {
+                    self.feed = Some(Feed::new(rate));
+                }
                 Ok(())
             }
-            fn poll(&mut self) -> Poll {
+            fn append(&mut self, segment: Segment) -> Result<(), PlaybackError> {
+                self.speech_indices.insert(
+                    segment.index,
+                    segment.speech[segment.speech.len() / 2] as usize,
+                );
+                self.remaining.push_back(segment.samples());
+                self.feed.as_mut().unwrap().push(segment);
+                Ok(())
+            }
+            fn events(&mut self) -> Vec<OutputEvent> {
+                let Some(feed) = &mut self.feed else {
+                    return vec![];
+                };
                 if self.finished {
-                    Poll::Finished
-                } else {
-                    Poll::Playing
+                    if let Some(count) = self.remaining.pop_front() {
+                        feed.pull(&mut vec![0.0; count]);
+                    }
+                    self.finished = false;
                 }
+                let events: Vec<_> = feed
+                    .drain_events()
+                    .into_iter()
+                    .map(OutputEvent::from)
+                    .collect();
+                for event in &events {
+                    if let OutputEvent::Started(index) = event {
+                        self.played.push(self.speech_indices.remove(index).unwrap());
+                    }
+                }
+                events
+            }
+            fn retract_unstarted(&mut self) -> Vec<Segment> {
+                self.feed
+                    .as_mut()
+                    .map(|f| f.retract_unstarted())
+                    .unwrap_or_default()
+            }
+            fn content_samples(&self) -> u64 {
+                self.feed.as_ref().map_or(0, |f| f.content_samples())
             }
             fn pause(&mut self) {}
             fn resume(&mut self) {}
-            fn stop(&mut self) {}
+            fn stop(&mut self) {
+                self.feed = None;
+                self.remaining.clear();
+                self.speech_indices.clear();
+            }
         }
         let scratch = std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap();
         let fixture = tempfile::tempdir_in(scratch).unwrap();

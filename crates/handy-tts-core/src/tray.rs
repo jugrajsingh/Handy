@@ -105,6 +105,7 @@ mod tests {
         assert!(
             select_tts_with("pocket-en", &downloaded, |_| select_with(
                 &mut queue,
+                &choice.clone(),
                 choice,
                 true,
                 |_| Ok(())

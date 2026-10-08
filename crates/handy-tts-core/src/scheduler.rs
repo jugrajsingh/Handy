@@ -161,6 +161,20 @@ impl Queue {
         self.next_index = index;
         self.next_admit_index = index;
     }
+    /// Rewinds unplayed requests without changing the selection epoch or current audio.
+    pub fn rerequest_from(&mut self, index: usize) {
+        self.in_flight.retain(|i, _| *i < index);
+        self.ready.retain(|i, _| *i < index);
+        self.last_parts.retain(|i| *i < index);
+        self.estimates.retain(|i, _| *i < index);
+        self.busy_lanes.retain(|i, _| *i < index);
+        self.next_index = index;
+        self.next_admit_index = index;
+        self.source_finished = false;
+        if self.playing.is_none() && self.state != PlaybackState::Paused {
+            self.state = PlaybackState::Buffering;
+        }
+    }
     /// Seeds played-time throughput before the first measured completion.
     pub fn estimate_from_rating(&mut self, rtf_1x: f64, native: f32, stretch_cost: f64) {
         if self.observations == 0
