@@ -8,6 +8,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
@@ -29,7 +30,7 @@ pub fn with_config<T>(config: BackendConfig, load: impl FnOnce() -> Result<T>) -
 }
 pub enum Session {
     Ort(OrtSession),
-    OpenVino(crate::ov_graph::Graph),
+    OpenVino(crate::ov_graph::GraphLane),
 }
 pub struct Outputs {
     values: Vec<(String, DynValue)>,
@@ -52,7 +53,26 @@ impl Outputs {
         self.values.iter().map(|(n, v)| (n.as_str(), v))
     }
 }
+thread_local! {
+    static COMPILED: RefCell<Option<BTreeMap<PathBuf, Arc<crate::ov_graph::CompiledGraph>>>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn with_compiled_graphs<T>(load: impl FnOnce() -> Result<T>) -> Result<T> {
+    let old = COMPILED.with(|slot| slot.replace(Some(BTreeMap::new())));
+    let result = load();
+    COMPILED.with(|slot| slot.replace(old));
+    result
+}
+
 pub fn session(path: &Path, threads: usize) -> Result<Session> {
+    session_for_lane(path, threads, &crate::cancellation::Cancellation::new()?)
+}
+
+pub(crate) fn session_for_lane(
+    path: &Path,
+    threads: usize,
+    cancellation: &crate::cancellation::Cancellation,
+) -> Result<Session> {
     let context = CONFIG.with(|slot| slot.borrow().clone());
     if let Some(context) = context {
         let name = path
@@ -64,8 +84,9 @@ pub fn session(path: &Path, threads: usize) -> Result<Session> {
             .get(name.as_ref())
             .copied()
             .unwrap_or(context.device);
+        let reporting = COMPLETED.with(Cell::get) < context.placement.len() as u32;
         let progress = |completed| {
-            if context.device != Device::Cpu {
+            if context.device != Device::Cpu && reporting {
                 let value = handy_tts_core::device::Preparation::Preparing {
                     device: context.device,
                     completed,
@@ -84,14 +105,31 @@ pub fn session(path: &Path, threads: usize) -> Result<Session> {
                 .get(name.as_ref())
                 .cloned()
                 .unwrap_or_default();
-            let graph = Session::OpenVino(crate::ov_graph::Graph::load(
-                path,
-                if device == Device::Gpu { "GPU" } else { "NPU" },
-                &context.cache_dir,
-                fixed,
-                threads,
-                context.model_id == "pocket-en",
-            )?);
+            let cached = COMPILED.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(|graphs| graphs.get(path).cloned())
+            });
+            let compiled = match cached {
+                Some(compiled) => compiled,
+                None => {
+                    let compiled = Arc::new(crate::ov_graph::CompiledGraph::load(
+                        path,
+                        if device == Device::Gpu { "GPU" } else { "NPU" },
+                        &context.cache_dir,
+                        fixed,
+                        threads,
+                        context.model_id == "pocket-en",
+                    )?);
+                    COMPILED.with(|slot| {
+                        if let Some(graphs) = slot.borrow_mut().as_mut() {
+                            graphs.insert(path.to_path_buf(), compiled.clone());
+                        }
+                    });
+                    compiled
+                }
+            };
+            let graph = Session::OpenVino(compiled.lane(cancellation.flag.clone())?);
             let completed = COMPLETED.with(|slot| {
                 let n = slot.get() + 1;
                 slot.set(n);
@@ -185,7 +223,7 @@ impl Session {
                     }
                     values.insert(
                         name.to_string(),
-                        to_ov(&value, graph.info.shapes.get(name.as_ref()))?,
+                        to_ov(&value, graph.compiled.info.shapes.get(name.as_ref()))?,
                     );
                 }
                 let tensors = graph.infer(&values)?;
@@ -203,7 +241,10 @@ impl Session {
                     } else {
                         None
                     };
-                    result.push((graph.info.outputs[index].clone(), from_ov(tensor, crop)?));
+                    result.push((
+                        graph.compiled.info.outputs[index].clone(),
+                        from_ov(tensor, crop)?,
+                    ));
                 }
                 Ok(Outputs { values: result })
             }

@@ -48,6 +48,10 @@ fn log_failure(operation: &str, error: &anyhow::Error) {
 }
 
 pub trait SynthEngine: Send {
+    /// Exposes lane cancellation to the independent control reader.
+    fn cancellation(&self) -> Option<crate::cancellation::Cancellation> {
+        None
+    }
     fn synthesize(
         &mut self,
         text: &str,
@@ -128,7 +132,21 @@ pub(crate) fn synthesize_bounded(
 
 const CONTROL_CAPACITY: usize = 8;
 
-type CancelFlags = Arc<std::sync::Mutex<std::collections::HashMap<u64, Arc<AtomicBool>>>>;
+struct CancelTarget {
+    flag: Arc<AtomicBool>,
+    inference: Option<crate::cancellation::Cancellation>,
+}
+impl CancelTarget {
+    fn cancel(&self) {
+        self.flag.store(true, Ordering::SeqCst);
+        if let Some(inference) = &self.inference
+            && let Err(error) = inference.cancel()
+        {
+            log_failure("cancel", &error);
+        }
+    }
+}
+type CancelFlags = Arc<std::sync::Mutex<std::collections::HashMap<u64, CancelTarget>>>;
 
 struct Job {
     id: u64,
@@ -145,12 +163,13 @@ enum Event {
 struct Lane {
     sender: Option<mpsc::SyncSender<Job>>,
     busy: Arc<AtomicBool>,
+    cancellation: Option<crate::cancellation::Cancellation>,
 }
 
 fn cancel_all(flags: &CancelFlags) {
     if let Ok(flags) = flags.lock() {
         for cancel in flags.values() {
-            cancel.store(true, Ordering::SeqCst);
+            cancel.cancel();
         }
     }
 }
@@ -254,7 +273,7 @@ fn lane_loop(
     }
 }
 
-/// Dispatches bounded concurrent syntheses with independent cancellation and framed replies.
+/// Dispatches a single-engine factory with a divided CPU thread budget.
 pub fn run(
     reader: impl BufRead + Send + 'static,
     writer: impl Write + Send,
@@ -265,6 +284,32 @@ pub fn run(
         handy_tts_core::device::Device,
         &Path,
     ) -> Result<Box<dyn SynthEngine>>,
+    memory: impl Fn() -> Result<u64>,
+) -> Result<()> {
+    run_lanes(
+        reader,
+        writer,
+        |root, voice, threads, device, cache, lanes| {
+            (0..lanes)
+                .map(|_| load(root, voice, (threads / lanes).max(1), device, cache))
+                .collect()
+        },
+        memory,
+    )
+}
+
+/// Loads all engine lanes together before dispatching concurrent syntheses.
+pub fn run_lanes(
+    reader: impl BufRead + Send + 'static,
+    writer: impl Write + Send,
+    mut load: impl FnMut(
+        &Path,
+        &str,
+        usize,
+        handy_tts_core::device::Device,
+        &Path,
+        usize,
+    ) -> Result<Vec<Box<dyn SynthEngine>>>,
     memory: impl Fn() -> Result<u64>,
 ) -> Result<()> {
     let writer = std::sync::Mutex::new(writer);
@@ -308,7 +353,13 @@ pub fn run(
                                 continue;
                             }
                             let cancel = Arc::new(AtomicBool::new(false));
-                            flags.insert(*id, cancel.clone());
+                            flags.insert(
+                                *id,
+                                CancelTarget {
+                                    flag: cancel.clone(),
+                                    inference: None,
+                                },
+                            );
                             Some(cancel)
                         }
                         Request::Cancel { id } => {
@@ -316,7 +367,7 @@ pub fn run(
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?;
                             if let Some(cancel) = flags.get(id) {
-                                cancel.store(true, Ordering::SeqCst);
+                                cancel.cancel();
                             }
                             continue;
                         }
@@ -373,15 +424,17 @@ pub fn run(
                         let loaded = (|| -> Result<Vec<Box<dyn SynthEngine>>> {
                             ensure!((1..=8).contains(&threads), "invalid threads");
                             ensure!((1..=3).contains(&count), "invalid lanes");
-                            (0..count)
-                                .map(|_| load(&model_dir, &voice, threads, device, &cache_dir))
-                                .collect()
+                            let engines =
+                                load(&model_dir, &voice, threads, device, &cache_dir, count)?;
+                            ensure!(engines.len() == count, "loader returned wrong lane count");
+                            Ok(engines)
                         })();
                         match loaded {
                             Ok(engines) => {
                                 let actual_device = engines[0].device();
                                 let actual_placement = engines[0].placement();
                                 for (index, engine) in engines.into_iter().enumerate() {
+                                    let cancellation = engine.cancellation();
                                     let (sender, jobs) = mpsc::sync_channel::<Job>(1);
                                     let writer = &writer;
                                     let tx = tx.clone();
@@ -404,6 +457,7 @@ pub fn run(
                                     lanes.push(Lane {
                                         sender: Some(sender),
                                         busy,
+                                        cancellation,
                                     });
                                 }
                                 active_lanes = count;
@@ -489,6 +543,21 @@ pub fn run(
                                 None
                             };
                             if let Some(lane) = available {
+                                {
+                                    let mut flags = flags
+                                        .lock()
+                                        .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?;
+                                    let target = flags
+                                        .get_mut(&id)
+                                        .context("synthesis cancel target missing")?;
+                                    if let Some(inference) = &lane.cancellation {
+                                        inference.reset()?;
+                                        target.inference = Some(inference.clone());
+                                        if target.flag.load(Ordering::SeqCst) {
+                                            target.cancel();
+                                        }
+                                    }
+                                }
                                 lane.busy.store(true, Ordering::SeqCst);
                                 lane.sender
                                     .as_ref()
@@ -534,14 +603,15 @@ pub struct EngineAdapter {
     placement: std::collections::BTreeMap<String, handy_tts_core::device::Device>,
 }
 impl SynthEngine for EngineAdapter {
+    fn cancellation(&self) -> Option<crate::cancellation::Cancellation> {
+        Some(self.engine.cancellation().clone())
+    }
     fn synthesize(
         &mut self,
         text: &str,
         speed: Option<f32>,
         cancelled: &AtomicBool,
     ) -> Result<Vec<f32>> {
-        ensure!(!cancelled.load(Ordering::SeqCst), "cancelled");
-        crate::reset_inference()?;
         ensure!(!cancelled.load(Ordering::SeqCst), "cancelled");
         let output = self.engine.synth(text, speed)?;
         ensure!(!cancelled.load(Ordering::SeqCst), "cancelled");
@@ -565,15 +635,39 @@ pub fn load_adapter(
     device: handy_tts_core::device::Device,
     cache: &Path,
 ) -> Result<Box<dyn SynthEngine>> {
+    let mut engines = load_adapters(model, root, voice, threads, device, cache, 1)?;
+    engines
+        .pop()
+        .context("single lane loader returned no engine")
+}
+
+/// Loads independent engines with shared OpenVINO compilation and divided CPU threads.
+pub fn load_adapters(
+    model: &str,
+    root: &Path,
+    voice: &str,
+    threads: usize,
+    device: handy_tts_core::device::Device,
+    cache: &Path,
+    lanes: usize,
+) -> Result<Vec<Box<dyn SynthEngine>>> {
+    ensure!((1..=3).contains(&lanes), "invalid lanes");
+    ensure!((1..=8).contains(&threads), "invalid threads");
     let config = crate::backend_config::config(model, root, device, cache)?;
     let placement = config.placement.clone();
-    let engine =
-        crate::graph::with_config(config, || crate::Engine::load(model, root, threads, voice))?;
-    Ok(Box::new(EngineAdapter {
-        engine,
-        device,
-        placement,
-    }))
+    let engines = crate::graph::with_config(config, || {
+        crate::Engine::load_lanes(model, root, (threads / lanes).max(1), voice, lanes)
+    })?;
+    Ok(engines
+        .into_iter()
+        .map(|engine| {
+            Box::new(EngineAdapter {
+                engine,
+                device,
+                placement: placement.clone(),
+            }) as Box<dyn SynthEngine>
+        })
+        .collect())
 }
 pub fn parse_model(args: impl Iterator<Item = String>) -> Result<String> {
     let args: Vec<_> = args.collect();
@@ -601,10 +695,14 @@ mod tests {
         use std::time::Duration;
 
         struct Scripted {
+            cancellation: crate::cancellation::Cancellation,
             release: Arc<AtomicBool>,
             started: Arc<AtomicBool>,
         }
         impl SynthEngine for Scripted {
+            fn cancellation(&self) -> Option<crate::cancellation::Cancellation> {
+                Some(self.cancellation.clone())
+            }
             fn synthesize(
                 &mut self,
                 text: &str,
@@ -614,7 +712,9 @@ mod tests {
                 if text == "slow" {
                     self.started.store(true, Ordering::SeqCst);
                     for _ in 0..2000 {
-                        if self.release.load(Ordering::SeqCst) || cancelled.load(Ordering::SeqCst) {
+                        if self.release.load(Ordering::SeqCst)
+                            || self.cancellation.flag.load(Ordering::SeqCst)
+                        {
                             break;
                         }
                         std::thread::sleep(Duration::from_millis(1));
@@ -659,6 +759,7 @@ mod tests {
             release: Arc<AtomicBool>,
             started: Arc<AtomicBool>,
             loads: Arc<Mutex<usize>>,
+            threads: Arc<Mutex<Vec<usize>>>,
         }
         impl Harness {
             fn new(lanes: usize, yield_header: bool) -> Self {
@@ -670,7 +771,13 @@ mod tests {
                 let release = Arc::new(AtomicBool::new(false));
                 let started = Arc::new(AtomicBool::new(false));
                 let loads = Arc::new(Mutex::new(0));
-                let state = (release.clone(), started.clone(), loads.clone());
+                let threads = Arc::new(Mutex::new(Vec::new()));
+                let state = (
+                    release.clone(),
+                    started.clone(),
+                    loads.clone(),
+                    threads.clone(),
+                );
                 let thread = std::thread::spawn(move || {
                     run(
                         BufReader::new(reader),
@@ -680,9 +787,11 @@ mod tests {
                             yield_header,
                             headers: 0,
                         },
-                        move |_, _, _, _, _| {
+                        move |_, _, threads, _, _| {
                             *state.2.lock().unwrap() += 1;
+                            state.3.lock().unwrap().push(threads);
                             Ok(Box::new(Scripted {
+                                cancellation: crate::cancellation::Cancellation::new().unwrap(),
                                 release: state.0.clone(),
                                 started: state.1.clone(),
                             }))
@@ -697,6 +806,7 @@ mod tests {
                     release,
                     started,
                     loads,
+                    threads,
                 };
                 harness.raw(serde_json::json!({"type":"load","model_dir":"fixture","voice":"alba","threads":4,"lanes":lanes}));
                 assert_eq!(harness.header().status, Status::Ready);
@@ -742,6 +852,18 @@ mod tests {
                 }
             }
         }
+        #[test]
+        fn lane_factories_split_the_cpu_thread_budget() {
+            for lanes in 1..=3 {
+                let mut harness = Harness::new(lanes, false);
+                assert_eq!(
+                    *harness.threads.lock().unwrap(),
+                    vec![(4 / lanes).max(1); lanes]
+                );
+                harness.shutdown();
+            }
+        }
+
         mod coordinated {
             use super::*;
             use std::collections::BTreeSet;
@@ -1043,7 +1165,23 @@ mod tests {
             });
             let cancelled = Arc::new(AtomicBool::new(true));
             let flags: CancelFlags = Arc::new(Mutex::new(
-                [(1, cancelled.clone()), (2, cancelled.clone())].into(),
+                [
+                    (
+                        1,
+                        CancelTarget {
+                            flag: cancelled.clone(),
+                            inference: None,
+                        },
+                    ),
+                    (
+                        2,
+                        CancelTarget {
+                            flag: cancelled.clone(),
+                            inference: None,
+                        },
+                    ),
+                ]
+                .into(),
             ));
             let busy = Arc::new(AtomicBool::new(true));
             jobs.send(Job {
@@ -1057,6 +1195,7 @@ mod tests {
             let worker = std::thread::spawn(move || {
                 lane_loop(
                     Box::new(Scripted {
+                        cancellation: crate::cancellation::Cancellation::new().unwrap(),
                         release: Arc::new(AtomicBool::new(false)),
                         started: Arc::new(AtomicBool::new(false)),
                     }),

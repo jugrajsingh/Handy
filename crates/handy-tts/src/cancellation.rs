@@ -2,7 +2,39 @@ use anyhow::Result;
 use handy_tts_core::device::Device;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-pub static CANCELLED: AtomicBool = AtomicBool::new(false);
+/// Cancellation state shared only by the graphs of one synthesis lane.
+#[derive(Clone)]
+pub struct Cancellation {
+    pub flag: std::sync::Arc<AtomicBool>,
+    pub options: std::sync::Arc<ort::session::RunOptions>,
+}
+impl Cancellation {
+    /// Creates a flag and ORT options for one lane.
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            flag: std::sync::Arc::new(AtomicBool::new(false)),
+            options: std::sync::Arc::new(
+                ort::session::RunOptions::new()
+                    .map_err(|error| anyhow::anyhow!("create cancellable ORT options: {error}"))?,
+            ),
+        })
+    }
+    /// Marks this lane cancelled and terminates its ORT graph runs.
+    pub fn cancel(&self) -> Result<()> {
+        self.flag.store(true, Ordering::Release);
+        self.options
+            .terminate()
+            .map_err(|error| anyhow::anyhow!("terminate lane inference: {error}"))
+    }
+    /// Resets the lane after its previous request has settled.
+    pub fn reset(&self) -> Result<()> {
+        self.options
+            .unterminate()
+            .map_err(|error| anyhow::anyhow!("reset lane inference cancellation: {error}"))?;
+        self.flag.store(false, Ordering::Release);
+        Ok(())
+    }
+}
 pub enum Wait {
     Ready,
     Pending,
@@ -83,6 +115,21 @@ impl AsyncRequest for openvino::InferRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn lane_run_options_and_flags_are_independent_and_reusable() {
+        let one = Cancellation::new().unwrap();
+        let two = Cancellation::new().unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&one.flag, &two.flag));
+        assert!(!std::sync::Arc::ptr_eq(&one.options, &two.options));
+        two.cancel().unwrap();
+        assert!(two.flag.load(Ordering::Acquire));
+        assert!(!one.flag.load(Ordering::Acquire));
+        one.reset().unwrap();
+        assert!(two.flag.load(Ordering::Acquire));
+        two.reset().unwrap();
+        assert!(!two.flag.load(Ordering::Acquire));
+    }
+
     struct Fake<'a> {
         flag: &'a AtomicBool,
         starts: usize,

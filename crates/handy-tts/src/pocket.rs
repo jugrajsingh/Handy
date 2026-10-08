@@ -59,6 +59,7 @@ fn forward(
     state: &mut Vec<DynValue>,
     mut inputs: Vec<(String, DynValue)>,
     offset: usize,
+    options: &ort::session::RunOptions,
 ) -> Result<Vec<DynValue>> {
     inputs.extend(
         specs
@@ -68,7 +69,7 @@ fn forward(
             .collect::<Result<Vec<_>>>()?,
     );
     let outputs = session
-        .run_with_options(inputs, crate::run_options()?)
+        .run_with_options(inputs, options)
         .context("run Pocket stateful graph")?;
     let values: Vec<DynValue> = outputs
         .iter()
@@ -87,6 +88,7 @@ fn alias(value: &DynValue) -> Result<DynValue> {
         .map_err(|_| anyhow::anyhow!("Pocket state must own its backing tensor"))
 }
 pub struct Pocket {
+    pub(crate) cancellation: crate::cancellation::Cancellation,
     main: Session,
     flow: Session,
     decoder: Session,
@@ -98,7 +100,12 @@ pub struct Pocket {
     rng: StdRng,
 }
 impl Pocket {
-    pub fn load(root: &Path, threads: usize, voice: &str) -> Result<Self> {
+    pub fn load(
+        root: &Path,
+        threads: usize,
+        voice: &str,
+        cancellation: crate::cancellation::Cancellation,
+    ) -> Result<Self> {
         let dir = root.join("onnx/english_2026-04");
         let metadata: Json = serde_json::from_slice(
             &fs::read(dir.join("bundle.json")).context("read Pocket bundle")?,
@@ -111,10 +118,26 @@ impl Pocket {
             "unexpected Pocket bundle dimensions"
         );
         let mut engine = Self {
-            main: crate::session(&dir.join("flow_lm_main_int8.onnx"), threads)?,
-            flow: crate::session(&dir.join("flow_lm_flow_int8.onnx"), threads)?,
-            decoder: crate::session(&dir.join("mimi_decoder_int8.onnx"), threads)?,
-            conditioner: crate::session(&dir.join("text_conditioner.onnx"), threads)?,
+            main: crate::session_for_lane(
+                &dir.join("flow_lm_main_int8.onnx"),
+                threads,
+                &cancellation,
+            )?,
+            flow: crate::session_for_lane(
+                &dir.join("flow_lm_flow_int8.onnx"),
+                threads,
+                &cancellation,
+            )?,
+            decoder: crate::session_for_lane(
+                &dir.join("mimi_decoder_int8.onnx"),
+                threads,
+                &cancellation,
+            )?,
+            conditioner: crate::session_for_lane(
+                &dir.join("text_conditioner.onnx"),
+                threads,
+                &cancellation,
+            )?,
             flow_specs: serde_json::from_value(metadata["flow_lm_state_manifest"].clone())
                 .context("parse Pocket flow state manifest")?,
             mimi_specs: serde_json::from_value(metadata["mimi_state_manifest"].clone())
@@ -123,6 +146,7 @@ impl Pocket {
             tokenizer: SentencePieceProcessor::open(dir.join("tokenizer.model"))
                 .context("load Pocket SentencePiece tokenizer")?,
             rng: StdRng::seed_from_u64(20261001),
+            cancellation,
         };
         engine.voice(root, voice)?;
         Ok(engine)
@@ -296,7 +320,7 @@ impl Pocket {
             .conditioner
             .run_with_options(
                 ort::inputs!["token_ids"=>Tensor::from_array(([1,ids.len()],ids))?],
-                crate::run_options()?,
+                &self.cancellation.options,
             )
             .context("run Pocket text conditioner")?;
         let (shape, embedding) = text_output
@@ -319,6 +343,7 @@ impl Pocket {
                 ("text_embeddings".into(), embedding),
             ],
             2,
+            &self.cancellation.options,
         )?;
         let mut current = floats(vec![1, 1, 32], vec![f32::NAN; 32])?;
         let empty = floats(vec![1, 0, 1024], vec![])?;
@@ -339,6 +364,7 @@ impl Pocket {
                     ("text_embeddings".into(), alias(&empty)?),
                 ],
                 2,
+                &self.cancellation.options,
             )?;
             let (_, logit) = outputs[1]
                 .try_extract_tensor::<f32>()
@@ -355,7 +381,7 @@ impl Pocket {
                     z * 0.7f32.sqrt()
                 })
                 .collect();
-            let output=self.flow.run_with_options(ort::inputs!["c"=>&outputs[0],"s"=>Tensor::from_array(([1,1],vec![0.0f32]))?,"t"=>Tensor::from_array(([1,1],vec![1.0f32]))?,"x"=>Tensor::from_array(([1,32],noise.clone()))?], crate::run_options()?).context("run Pocket flow step")?;
+            let output=self.flow.run_with_options(ort::inputs!["c"=>&outputs[0],"s"=>Tensor::from_array(([1,1],vec![0.0f32]))?,"t"=>Tensor::from_array(([1,1],vec![1.0f32]))?,"x"=>Tensor::from_array(([1,32],noise.clone()))?], &self.cancellation.options).context("run Pocket flow step")?;
             let (_, velocity) = output
                 .at(0)?
                 .try_extract_tensor::<f32>()
@@ -384,6 +410,7 @@ impl Pocket {
                     floats(vec![1, chunk.len() / 32, 32], chunk.to_vec())?,
                 )],
                 1,
+                &self.cancellation.options,
             )?;
             let (_, pcm) = output
                 .first()

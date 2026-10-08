@@ -1,7 +1,7 @@
 pub mod backend_config;
 pub mod cancellation;
 pub mod graph;
-use graph::session;
+use graph::session_for_lane;
 pub mod devices;
 mod kokoro;
 pub mod ov_graph;
@@ -52,17 +52,62 @@ pub enum Engine {
 }
 impl Engine {
     pub fn load(id: &str, root: &Path, threads: usize, voice: &str) -> Result<Self> {
+        Self::load_lane(id, root, threads, voice, cancellation::Cancellation::new()?)
+    }
+    fn load_lane(
+        id: &str,
+        root: &Path,
+        threads: usize,
+        voice: &str,
+        cancellation: cancellation::Cancellation,
+    ) -> Result<Self> {
         match id {
             "pocket-en" => Ok(Self::Pocket(Box::new(pocket::Pocket::load(
-                root, threads, voice,
+                root,
+                threads,
+                voice,
+                cancellation,
             )?))),
             "supertonic-3" => Ok(Self::Supertonic(Box::new(supertonic::Supertonic::load(
-                root, threads, voice,
+                root,
+                threads,
+                voice,
+                cancellation,
             )?))),
             "kokoro-82m-int8" => Ok(Self::Kokoro(Box::new(kokoro::Kokoro::load(
-                root, threads, voice,
+                root,
+                threads,
+                voice,
+                cancellation,
             )?))),
             _ => bail!("unknown model id"),
+        }
+    }
+    /// Loads lane-local engine state while sharing accelerated compiled weights.
+    pub fn load_lanes(
+        id: &str,
+        root: &Path,
+        threads_per_lane: usize,
+        voice: &str,
+        lanes: usize,
+    ) -> Result<Vec<Self>> {
+        anyhow::ensure!((1..=3).contains(&lanes), "invalid lanes");
+        anyhow::ensure!(
+            (1..=8).contains(&threads_per_lane) && threads_per_lane * lanes <= 8,
+            "invalid lane thread budget"
+        );
+        graph::with_compiled_graphs(|| {
+            (0..lanes)
+                .map(|_| Self::load(id, root, threads_per_lane, voice))
+                .collect()
+        })
+    }
+    /// Returns the cancellation handle for this engine's lane.
+    pub fn cancellation(&self) -> &cancellation::Cancellation {
+        match self {
+            Self::Pocket(engine) => &engine.cancellation,
+            Self::Supertonic(engine) => &engine.cancellation,
+            Self::Kokoro(engine) => &engine.cancellation,
         }
     }
     pub fn synth(&mut self, text: &str, speed: Option<f32>) -> Result<Vec<f32>> {
@@ -89,30 +134,6 @@ impl Engine {
             _ => 24000,
         }
     }
-}
-
-static RUN_OPTIONS: std::sync::OnceLock<ort::session::RunOptions> = std::sync::OnceLock::new();
-pub fn initialize_run_options() -> Result<()> {
-    if RUN_OPTIONS.get().is_none() {
-        let options = ort::session::RunOptions::new().context("create cancellable ORT options")?;
-        let _ = RUN_OPTIONS.set(options);
-    }
-    Ok(())
-}
-pub fn run_options() -> Result<&'static ort::session::RunOptions> {
-    RUN_OPTIONS.get().context("ORT run options not initialized")
-}
-pub fn cancel_inference() {
-    cancellation::CANCELLED.store(true, std::sync::atomic::Ordering::Release);
-    if let Some(options) = RUN_OPTIONS.get() {
-        let _ = options.terminate();
-    }
-}
-pub fn reset_inference() -> Result<()> {
-    cancellation::CANCELLED.store(false, std::sync::atomic::Ordering::Release);
-    run_options()?
-        .unterminate()
-        .context("reset inference cancellation")
 }
 
 pub mod measure;

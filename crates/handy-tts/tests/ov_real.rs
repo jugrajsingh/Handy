@@ -234,8 +234,7 @@ fn paths() -> (PathBuf, PathBuf, Device) {
 #[ignore = "requires opt-in mounted Supertonic graphs and GPU or NPU"]
 fn real_encoder_zero_padding_and_output_crop_preserve_the_original_token_length() {
     let (root, cache, device) = paths();
-    handy_tts::initialize_run_options().unwrap();
-    handy_tts::reset_inference().unwrap();
+    let options = ort::session::RunOptions::new().unwrap();
     let config = handy_tts::backend_config::config("supertonic-3", &root, device, &cache).unwrap();
     let mut graph = handy_tts::graph::with_config(config, || {
         handy_tts::graph::session(&root.join("onnx/text_encoder.onnx"), 2)
@@ -252,7 +251,7 @@ fn real_encoder_zero_padding_and_output_crop_preserve_the_original_token_length(
     let output = graph
         .run_with_options(
             ort::inputs!["text_ids"=>ids,"text_mask"=>mask,"style_ttl"=>style],
-            handy_tts::run_options().unwrap(),
+            &options,
         )
         .unwrap();
     let (shape, values) = output.at(0).unwrap().try_extract_tensor::<f32>().unwrap();
@@ -412,4 +411,145 @@ fn real_oversized_npu_chunk_returns_complete_audio_after_word_boundary_splitting
         "REAL_NPU_OVER_CAP single_samples={} complete_samples={}",
         lengths[0], lengths[1]
     );
+}
+
+#[test]
+#[ignore = "requires opt-in mounted Supertonic graphs and GPU"]
+fn gpu_two_lanes_produce_same_lengths_as_one() {
+    let (root, cache, device) = paths();
+    if device != Device::Gpu {
+        return;
+    }
+    let text = "Reading clearly, one phrase at a time.";
+    let flag = AtomicBool::new(false);
+    let mut single =
+        handy_tts::runtime::load_adapter("supertonic-3", &root, "F1", 2, device, &cache).unwrap();
+    let expected = single.synthesize(text, Some(1.0), &flag).unwrap().len();
+    drop(single);
+    let mut lanes =
+        handy_tts::runtime::load_adapters("supertonic-3", &root, "F1", 2, device, &cache, 2)
+            .unwrap();
+    let outputs = std::thread::scope(|scope| {
+        let handles: Vec<_> = lanes
+            .iter_mut()
+            .map(|engine| {
+                let flag = &flag;
+                scope.spawn(move || engine.synthesize(text, Some(1.0), flag).unwrap())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    for pcm in &outputs {
+        assert_eq!(pcm.len(), expected);
+        assert!(pcm.iter().all(|sample| sample.is_finite()));
+    }
+    println!(
+        "REAL_GPU_LANES single_samples={expected} lane_samples={:?}",
+        outputs.iter().map(Vec::len).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+#[ignore = "requires opt-in mounted Supertonic graphs and GPU"]
+fn gpu_cancel_one_lane_other_completes() {
+    let (root, cache, device) = paths();
+    if device != Device::Gpu {
+        return;
+    }
+    traced_cancel_probe(device);
+    let mut child = Worker(
+        Command::new(env!("CARGO_BIN_EXE_handy-tts"))
+            .args(["--model", "supertonic-3"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let mut input = child.0.stdin.take().unwrap();
+    let mut output = BufReader::new(child.0.stdout.take().unwrap());
+    write_request(
+        &mut input,
+        &Request::Load {
+            model_dir: root,
+            voice: "F1".into(),
+            threads: 2,
+            lanes: 2,
+            device,
+            cache_dir: cache,
+        },
+    )
+    .unwrap();
+    assert_eq!(read_header(&mut output).unwrap().status, Status::Ready);
+    for (id, text) in [
+        (1, "Reading clearly, one phrase at a time."),
+        (
+            2,
+            "The cancellation test reads a deliberately lengthy sentence while an independent synthesis continues producing its complete audio, with fresh requests and separate buffers for both lanes.",
+        ),
+    ] {
+        write_request(
+            &mut input,
+            &Request::Synthesize {
+                id,
+                text: text.into(),
+                speed: Some(1.0),
+            },
+        )
+        .unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(2));
+    write_request(&mut input, &Request::Cancel { id: 2 }).unwrap();
+    let mut results = BTreeMap::new();
+    let mut expected_samples = None;
+    for _ in 0..2 {
+        let header = read_header(&mut output).unwrap();
+        let id = header.id;
+        let status = header.status.clone();
+        if status == Status::Ok {
+            let pcm = read_pcm_after_header(&mut output, header, id).unwrap();
+            assert!(!pcm.samples.is_empty());
+            assert!(pcm.samples.iter().all(|sample| sample.is_finite()));
+            expected_samples = Some(pcm.samples.len());
+        } else {
+            assert!(header.samples.is_none_or(|samples| samples == 0));
+        }
+        assert!(results.insert(id, status).is_none());
+    }
+    assert_eq!(
+        results,
+        BTreeMap::from([(1, Status::Ok), (2, Status::Cancelled)])
+    );
+    for id in [3, 4] {
+        write_request(
+            &mut input,
+            &Request::Synthesize {
+                id,
+                text: "Reading clearly, one phrase at a time.".into(),
+                speed: Some(1.0),
+            },
+        )
+        .unwrap();
+    }
+    let mut retries = BTreeMap::new();
+    for _ in 0..2 {
+        let header = read_header(&mut output).unwrap();
+        assert_eq!(header.status, Status::Ok);
+        let id = header.id;
+        let pcm = read_pcm_after_header(&mut output, header, id).unwrap();
+        assert_eq!(
+            Some(pcm.samples.len()),
+            expected_samples,
+            "cancellation must preserve the other lane's full audio and both retry lengths"
+        );
+        assert!(pcm.samples.iter().all(|sample| sample.is_finite()));
+        assert!(retries.insert(id, pcm.samples.len()).is_none());
+    }
+    assert_eq!(retries.keys().copied().collect::<Vec<_>>(), [3, 4]);
+    write_request(&mut input, &Request::Shutdown).unwrap();
+    assert!(child.0.wait().unwrap().success());
+    println!("REAL_GPU_CANCEL lane_one=Ok lane_two=Cancelled retry_lanes=Ok");
 }

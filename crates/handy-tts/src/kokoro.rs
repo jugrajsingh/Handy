@@ -7,13 +7,19 @@ use serde_json::Value as Json;
 use std::{collections::HashMap, fs, path::Path};
 
 pub struct Kokoro {
+    pub(crate) cancellation: crate::cancellation::Cancellation,
     session: Session,
     g2p: G2P,
     vocab: HashMap<char, i64>,
     voice: Vec<f32>,
 }
 impl Kokoro {
-    pub fn load(root: &Path, threads: usize, voice: &str) -> Result<Self> {
+    pub fn load(
+        root: &Path,
+        threads: usize,
+        voice: &str,
+        cancellation: crate::cancellation::Cancellation,
+    ) -> Result<Self> {
         let tokenizer: Json = serde_json::from_slice(
             &fs::read(root.join("tokenizer.json")).context("read Kokoro tokenizer")?,
         )
@@ -28,10 +34,15 @@ impl Kokoro {
             }
         }
         let mut engine = Self {
-            session: crate::session(&root.join("onnx/model_quantized.onnx"), threads)?,
+            session: crate::session_for_lane(
+                &root.join("onnx/model_quantized.onnx"),
+                threads,
+                &cancellation,
+            )?,
             g2p: G2P::new(Language::EnglishUS),
             vocab,
             voice: vec![],
+            cancellation,
         };
         engine.voice(root, voice)?;
         Ok(engine)
@@ -133,7 +144,7 @@ impl Kokoro {
             .session
             .run_with_options(
                 ort::inputs! {"input_ids"=>&ids,"style"=>&style,"speed"=>&speed},
-                crate::run_options()?,
+                &self.cancellation.options,
             )
             .context("Kokoro inference")?;
         Ok(output

@@ -10,7 +10,6 @@ fn main() -> Result<()> {
             args.len() == 7,
             "continuity needs model, root, device, cache, corpus and output"
         );
-        handy_tts::initialize_run_options()?;
         let device = match args[3].as_str() {
             "cpu" => handy_tts_core::device::Device::Cpu,
             "gpu" => handy_tts_core::device::Device::Gpu,
@@ -31,7 +30,6 @@ fn main() -> Result<()> {
             args.len() == 8 && args[6] == "--first-audio-inputs",
             "matrix measurement needs model, root, device, cache, corpus and --first-audio-inputs directory"
         );
-        handy_tts::initialize_run_options()?;
         let device = match args[3].as_str() {
             "cpu" => handy_tts_core::device::Device::Cpu,
             "gpu" => handy_tts_core::device::Device::Gpu,
@@ -52,7 +50,6 @@ fn main() -> Result<()> {
             args.len() == 5,
             "measurement needs model, root, device and cache"
         );
-        handy_tts::initialize_run_options()?;
         let device = match args[3].as_str() {
             "cpu" => handy_tts_core::device::Device::Cpu,
             "gpu" => handy_tts_core::device::Device::Gpu,
@@ -107,12 +104,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let model = handy_tts::runtime::parse_model(std::env::args().skip(1))?;
-    handy_tts::initialize_run_options()?;
-    handy_tts::runtime::run(
+    handy_tts::runtime::run_lanes(
         std::io::BufReader::new(std::io::stdin()),
         std::io::BufWriter::new(std::io::stdout()),
-        |root, voice, threads, device, cache| {
-            handy_tts::runtime::load_adapter(&model, root, voice, threads, device, cache)
+        |root, voice, threads, device, cache, lanes| {
+            handy_tts::runtime::load_adapters(&model, root, voice, threads, device, cache, lanes)
         },
         handy_tts::runtime::memory_available,
     )

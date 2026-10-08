@@ -1,7 +1,12 @@
 use anyhow::{Context, Result, ensure};
 use handy_tts_core::device::Device;
 use openvino::{Core, DeviceType, InferRequest, PartialShape, RwPropertyKey, Tensor};
-use std::{collections::BTreeMap, path::Path, time::Instant};
+use std::{
+    collections::BTreeMap,
+    path::Path,
+    sync::{Arc, Mutex, atomic::AtomicBool},
+    time::Instant,
+};
 #[derive(Debug)]
 pub(crate) struct NpuCompileRejected;
 impl std::fmt::Display for NpuCompileRejected {
@@ -19,14 +24,67 @@ pub struct GraphInfo {
     pub outputs: Vec<String>,
     pub shapes: BTreeMap<String, Vec<i64>>,
 }
-pub struct Graph {
-    pub info: GraphInfo,
-    request: InferRequest,
-    compiled: openvino::CompiledModel,
-    device: Device,
-    _core: Core,
+/// Creates independent requests from one compiled graph.
+pub trait RequestFactory {
+    type Request: crate::cancellation::AsyncRequest;
+    /// Creates a request with buffers independent of existing requests.
+    fn create_request(&mut self) -> Result<Self::Request>;
 }
-impl Graph {
+impl RequestFactory for openvino::CompiledModel {
+    type Request = InferRequest;
+    fn create_request(&mut self) -> Result<InferRequest> {
+        self.create_infer_request()
+            .context("create graph inference request")
+    }
+}
+
+/// Compiled weights and graph metadata shared by synthesis lanes.
+pub struct CompiledGraph<C = openvino::CompiledModel> {
+    pub info: GraphInfo,
+    compiled: Mutex<C>,
+    device: Device,
+    _core: Mutex<Option<Core>>,
+}
+
+/// One lane's request and cancellation flag.
+pub struct GraphLane<C: RequestFactory = openvino::CompiledModel> {
+    request: C::Request,
+    pub compiled: Arc<CompiledGraph<C>>,
+    cancelled: Arc<AtomicBool>,
+}
+impl<C: RequestFactory> CompiledGraph<C> {
+    /// Creates a lane using these compiled weights and the supplied flag.
+    pub fn lane(self: &Arc<Self>, cancelled: Arc<AtomicBool>) -> Result<GraphLane<C>> {
+        let request = self
+            .compiled
+            .lock()
+            .map_err(|_| anyhow::anyhow!("compiled graph poisoned"))?
+            .create_request()?;
+        Ok(GraphLane {
+            compiled: self.clone(),
+            request,
+            cancelled,
+        })
+    }
+}
+impl<C: RequestFactory> GraphLane<C> {
+    fn run(&mut self) -> Result<()> {
+        if let Err(error) =
+            crate::cancellation::drive(&mut self.request, &self.cancelled, self.compiled.device)
+        {
+            self.request = self
+                .compiled
+                .compiled
+                .lock()
+                .map_err(|_| anyhow::anyhow!("compiled graph poisoned"))?
+                .create_request()
+                .context("replace cancelled OpenVINO request")?;
+            return Err(error.context("run cancellable OpenVINO graph"));
+        }
+        Ok(())
+    }
+}
+impl CompiledGraph {
     pub fn load(
         path: &Path,
         device: &str,
@@ -88,7 +146,7 @@ impl Graph {
                 .context("reshape NPU input")?;
         }
         let start = Instant::now();
-        let mut compiled = core
+        let compiled = core
             .compile_model(&model, kind)
             .map_err(|error| {
                 let error = anyhow::Error::new(error);
@@ -112,9 +170,6 @@ impl Graph {
             .map(|i| compiled.get_output_by_index(i)?.get_name())
             .collect::<std::result::Result<Vec<_>, openvino::InferenceError>>()
             .context("get graph output names")?;
-        let request = compiled
-            .create_infer_request()
-            .context("create graph inference request")?;
         Ok(Self {
             info: GraphInfo {
                 device: device.into(),
@@ -129,36 +184,30 @@ impl Graph {
                 outputs,
                 shapes: fixed,
             },
-            request,
-            compiled,
+            compiled: Mutex::new(compiled),
             device: match device {
                 "GPU" => Device::Gpu,
                 "NPU" => Device::Npu,
                 _ => Device::Cpu,
             },
-            _core: core,
+            _core: Mutex::new(Some(core)),
         })
     }
+}
+impl GraphLane {
     pub fn infer(&mut self, inputs: &BTreeMap<String, Tensor>) -> Result<Vec<Tensor>> {
-        ensure!(inputs.len() == self.info.inputs.len(), "wrong input count");
-        for name in &self.info.inputs {
+        ensure!(
+            inputs.len() == self.compiled.info.inputs.len(),
+            "wrong input count"
+        );
+        for name in &self.compiled.info.inputs {
             let tensor = inputs.get(name).context("missing named graph input")?;
             self.request
                 .set_tensor(name, tensor)
                 .context("set graph input tensor")?;
         }
-        if let Err(error) = crate::cancellation::drive(
-            &mut self.request,
-            &crate::cancellation::CANCELLED,
-            self.device,
-        ) {
-            self.request = self
-                .compiled
-                .create_infer_request()
-                .context("replace cancelled OpenVINO request")?;
-            return Err(error.context("run cancellable OpenVINO graph"));
-        }
-        (0..self.info.outputs.len())
+        self.run()?;
+        (0..self.compiled.info.outputs.len())
             .map(|i| {
                 let value = self
                     .request
@@ -183,5 +232,116 @@ pub fn probe(path: &Path, device: &str, cache: &Path) -> Result<GraphInfo> {
     } else {
         BTreeMap::new()
     };
-    Ok(Graph::load(path, device, cache, fixed, 2, false)?.info)
+    Ok(CompiledGraph::load(path, device, cache, fixed, 2, false)?.info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cancellation::{AsyncRequest, Wait};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+
+    struct Factory(Arc<AtomicUsize>);
+    struct FakeRequest {
+        id: usize,
+        cancel_on_wait: Option<Arc<AtomicBool>>,
+        waits: usize,
+        cancels: usize,
+    }
+    impl RequestFactory for Factory {
+        type Request = FakeRequest;
+        fn create_request(&mut self) -> Result<FakeRequest> {
+            Ok(FakeRequest {
+                id: self.0.fetch_add(1, Ordering::SeqCst),
+                cancel_on_wait: None,
+                waits: 0,
+                cancels: 0,
+            })
+        }
+    }
+    impl AsyncRequest for FakeRequest {
+        fn start(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn wait(&mut self) -> Result<Wait> {
+            self.waits += 1;
+            if self.waits == 1 {
+                if let Some(flag) = &self.cancel_on_wait {
+                    flag.store(true, Ordering::Release);
+                }
+                Ok(Wait::Pending)
+            } else {
+                Ok(Wait::Ready)
+            }
+        }
+        fn cancel(&mut self) -> Result<()> {
+            self.cancels += 1;
+            Ok(())
+        }
+    }
+    fn compiled(device: Device) -> Arc<CompiledGraph<Factory>> {
+        Arc::new(CompiledGraph {
+            info: GraphInfo {
+                device: format!("{device:?}"),
+                graph: "fake".into(),
+                compile_seconds: 0.0,
+                cached: false,
+                inputs: vec![],
+                outputs: vec![],
+                shapes: BTreeMap::new(),
+            },
+            compiled: std::sync::Mutex::new(Factory(Arc::new(AtomicUsize::new(0)))),
+            device,
+            _core: Mutex::new(None),
+        })
+    }
+    #[test]
+    fn lanes_share_compiled_graph_and_own_requests() {
+        let shared = compiled(Device::Gpu);
+        let one = shared.lane(Arc::new(AtomicBool::new(false))).unwrap();
+        let two = shared.lane(Arc::new(AtomicBool::new(false))).unwrap();
+        assert!(Arc::ptr_eq(&one.compiled, &two.compiled));
+        assert_ne!(one.request.id, two.request.id);
+        assert!(!Arc::ptr_eq(&one.cancelled, &two.cancelled));
+    }
+    #[test]
+    fn cancel_lane_two_leaves_lane_one_running() {
+        let shared = compiled(Device::Gpu);
+        let mut one = shared.lane(Arc::new(AtomicBool::new(false))).unwrap();
+        let mut two = shared.lane(Arc::new(AtomicBool::new(false))).unwrap();
+        two.request.cancel_on_wait = Some(two.cancelled.clone());
+        let old_id = two.request.id;
+        assert!(two.run().is_err());
+        assert_ne!(two.request.id, old_id, "cancelled request must be replaced");
+        assert!(
+            one.run().is_ok(),
+            "cancelling lane two must leave lane one running"
+        );
+        assert_eq!(one.request.cancels, 0);
+        assert!(!one.cancelled.load(Ordering::Acquire));
+        two.cancelled.store(false, Ordering::Release);
+        assert!(two.run().is_ok(), "cancelled lane must be reusable");
+    }
+    #[test]
+    fn npu_lane_drains_and_discards_only_its_request() {
+        let shared = compiled(Device::Npu);
+        let mut one = shared.lane(Arc::new(AtomicBool::new(false))).unwrap();
+        let mut two = shared.lane(Arc::new(AtomicBool::new(false))).unwrap();
+        two.request.cancel_on_wait = Some(two.cancelled.clone());
+        let result = crate::cancellation::drive(&mut two.request, &two.cancelled, shared.device);
+        assert_eq!((two.request.waits, two.request.cancels), (2, 0));
+        assert_eq!(
+            result
+                .unwrap_err()
+                .downcast_ref::<openvino::InferenceError>()
+                .unwrap()
+                .kind,
+            openvino::InferenceErrorKind::InferCancelled
+        );
+        assert!(one.run().is_ok());
+        assert_eq!(one.request.cancels, 0);
+    }
 }

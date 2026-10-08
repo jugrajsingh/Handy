@@ -36,6 +36,7 @@ struct Config {
 }
 
 pub struct Supertonic {
+    pub(crate) cancellation: crate::cancellation::Cancellation,
     dp: Session,
     encoder: Session,
     estimator: Session,
@@ -56,7 +57,12 @@ fn style(component: Component) -> Result<Array3<f32>> {
     )?)
 }
 impl Supertonic {
-    pub fn load(root: &Path, threads: usize, voice: &str) -> Result<Self> {
+    pub fn load(
+        root: &Path,
+        threads: usize,
+        voice: &str,
+        cancellation: crate::cancellation::Cancellation,
+    ) -> Result<Self> {
         let dir = root.join("onnx");
         let cfg: Config = serde_json::from_slice(
             &fs::read(dir.join("tts.json")).context("read Supertonic config")?,
@@ -67,14 +73,27 @@ impl Supertonic {
         )
         .context("parse unicode indexer")?;
         let mut engine = Self {
-            dp: crate::session(&dir.join("duration_predictor.onnx"), threads)?,
-            encoder: crate::session(&dir.join("text_encoder.onnx"), threads)?,
-            estimator: crate::session(&dir.join("vector_estimator.onnx"), threads)?,
-            vocoder: crate::session(&dir.join("vocoder.onnx"), threads)?,
+            dp: crate::session_for_lane(
+                &dir.join("duration_predictor.onnx"),
+                threads,
+                &cancellation,
+            )?,
+            encoder: crate::session_for_lane(
+                &dir.join("text_encoder.onnx"),
+                threads,
+                &cancellation,
+            )?,
+            estimator: crate::session_for_lane(
+                &dir.join("vector_estimator.onnx"),
+                threads,
+                &cancellation,
+            )?,
+            vocoder: crate::session_for_lane(&dir.join("vocoder.onnx"), threads, &cancellation)?,
             cfg,
             indexer,
             ttl: Array3::zeros((0, 0, 0)),
             style_dp: Array3::zeros((0, 0, 0)),
+            cancellation,
         };
         engine.voice(root, voice)?;
         Ok(engine)
@@ -138,7 +157,7 @@ impl Supertonic {
         let ttl_style = Value::from_array(self.ttl.clone())?;
         let output = self.dp.run_with_options(
             ort::inputs! {"text_ids"=>&ids,"style_dp"=>&dp_style,"text_mask"=>&text_mask},
-            crate::run_options()?,
+            &self.cancellation.options,
         )?;
         let duration = output.get("duration")?.try_extract_tensor::<f32>()?.1[0] / speed;
         ensure!(
@@ -148,7 +167,7 @@ impl Supertonic {
         drop(output);
         let output = self.encoder.run_with_options(
             ort::inputs! {"text_ids"=>&ids,"style_ttl"=>&ttl_style,"text_mask"=>&text_mask},
-            crate::run_options()?,
+            &self.cancellation.options,
         )?;
         let (shape, data) = output.get("text_emb")?.try_extract_tensor::<f32>()?;
         let embedding = Value::from_array(Array3::from_shape_vec(
@@ -173,7 +192,7 @@ impl Supertonic {
             let output=self.estimator.run_with_options(ort::inputs!{
                 "noisy_latent"=>&latent,"text_emb"=>&embedding,"style_ttl"=>&ttl_style,
                 "latent_mask"=>&mask,"text_mask"=>&text_mask,"current_step"=>&current,"total_step"=>&total
-            }, crate::run_options()?)?;
+            }, &self.cancellation.options)?;
             let (shape, data) = output.get("denoised_latent")?.try_extract_tensor::<f32>()?;
             latent = Value::from_array(Array3::from_shape_vec(
                 (shape[0] as usize, shape[1] as usize, shape[2] as usize),
@@ -182,7 +201,7 @@ impl Supertonic {
         }
         let output = self
             .vocoder
-            .run_with_options(ort::inputs! {"latent"=>&latent}, crate::run_options()?)?;
+            .run_with_options(ort::inputs! {"latent"=>&latent}, &self.cancellation.options)?;
         let mut pcm = output
             .get("wav_tts")?
             .try_extract_tensor::<f32>()?

@@ -403,7 +403,6 @@ fn main() -> Result<()> {
     } else {
         None
     };
-    handy_tts::initialize_run_options()?;
     let began = Instant::now();
     let engine = load_adapter(
         &args.model,
