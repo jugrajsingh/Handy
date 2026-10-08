@@ -53,12 +53,42 @@ impl Outputs {
         self.values.iter().map(|(n, v)| (n.as_str(), v))
     }
 }
+/// Cache used by the accelerated loader, with an injectable compiler and request factory.
+pub(crate) struct CompilationCache<C: crate::ov_graph::RequestFactory = openvino::CompiledModel> {
+    graphs: BTreeMap<PathBuf, Arc<crate::ov_graph::CompiledGraph<C>>>,
+}
+impl<C: crate::ov_graph::RequestFactory> Default for CompilationCache<C> {
+    fn default() -> Self {
+        Self {
+            graphs: BTreeMap::new(),
+        }
+    }
+}
+impl<C: crate::ov_graph::RequestFactory> CompilationCache<C> {
+    pub(crate) fn lane(
+        &mut self,
+        path: &Path,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+        compile: impl FnOnce() -> Result<crate::ov_graph::CompiledGraph<C>>,
+    ) -> Result<crate::ov_graph::GraphLane<C>> {
+        let cached = self.graphs.get(path).cloned();
+        let compiled = match cached {
+            Some(compiled) => compiled,
+            None => {
+                let compiled = Arc::new(compile()?);
+                self.graphs.insert(path.to_path_buf(), compiled.clone());
+                compiled
+            }
+        };
+        compiled.lane(cancelled)
+    }
+}
 thread_local! {
-    static COMPILED: RefCell<Option<BTreeMap<PathBuf, Arc<crate::ov_graph::CompiledGraph>>>> = const { RefCell::new(None) };
+    static COMPILED: RefCell<Option<CompilationCache>> = const { RefCell::new(None) };
 }
 
 pub(crate) fn with_compiled_graphs<T>(load: impl FnOnce() -> Result<T>) -> Result<T> {
-    let old = COMPILED.with(|slot| slot.replace(Some(BTreeMap::new())));
+    let old = COMPILED.with(|slot| slot.replace(Some(CompilationCache::default())));
     let result = load();
     COMPILED.with(|slot| slot.replace(old));
     result
@@ -105,31 +135,24 @@ pub(crate) fn session_for_lane(
                 .get(name.as_ref())
                 .cloned()
                 .unwrap_or_default();
-            let cached = COMPILED.with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .and_then(|graphs| graphs.get(path).cloned())
-            });
-            let compiled = match cached {
-                Some(compiled) => compiled,
-                None => {
-                    let compiled = Arc::new(crate::ov_graph::CompiledGraph::load(
+            let graph = COMPILED.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let compile = || {
+                    crate::ov_graph::CompiledGraph::load(
                         path,
                         if device == Device::Gpu { "GPU" } else { "NPU" },
                         &context.cache_dir,
                         fixed,
                         threads,
                         context.model_id == "pocket-en",
-                    )?);
-                    COMPILED.with(|slot| {
-                        if let Some(graphs) = slot.borrow_mut().as_mut() {
-                            graphs.insert(path.to_path_buf(), compiled.clone());
-                        }
-                    });
-                    compiled
+                    )
+                };
+                match slot.as_mut() {
+                    Some(cache) => cache.lane(path, cancellation.flag.clone(), compile),
+                    None => Arc::new(compile()?).lane(cancellation.flag.clone()),
                 }
-            };
-            let graph = Session::OpenVino(compiled.lane(cancellation.flag.clone())?);
+            })?;
+            let graph = Session::OpenVino(graph);
             let completed = COMPLETED.with(|slot| {
                 let n = slot.get() + 1;
                 slot.set(n);

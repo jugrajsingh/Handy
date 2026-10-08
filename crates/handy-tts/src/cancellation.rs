@@ -115,19 +115,75 @@ impl AsyncRequest for openvino::InferRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    struct CpuFixture(std::path::PathBuf);
+    impl CpuFixture {
+        fn new() -> Self {
+            let scratch =
+                std::path::PathBuf::from(std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap());
+            std::fs::create_dir_all(&scratch).unwrap();
+            let fixture = Self(scratch.join(format!("s11-cpu-lanes-{}.onnx", std::process::id())));
+            // ONNX IR 8, opset 13: float32 Add(x, x), input and output shape [2].
+            std::fs::write(
+                &fixture.0,
+                [
+                    8, 8, 58, 61, 10, 14, 10, 1, 120, 10, 1, 120, 18, 1, 121, 34, 3, 65, 100, 100,
+                    18, 9, 108, 97, 110, 101, 45, 116, 101, 115, 116, 90, 15, 10, 1, 120, 18, 10,
+                    10, 8, 8, 1, 18, 4, 10, 2, 8, 2, 98, 15, 10, 1, 121, 18, 10, 10, 8, 8, 1, 18,
+                    4, 10, 2, 8, 2, 66, 2, 16, 13,
+                ],
+            )
+            .unwrap();
+            fixture
+        }
+    }
+    impl Drop for CpuFixture {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).unwrap();
+        }
+    }
+    fn run_cpu(session: &mut crate::graph::Session, lane: &Cancellation) -> Result<Vec<f32>> {
+        let input = ort::value::Tensor::from_array(([2], vec![1.25f32, -2.0]))?;
+        let output = session.run_with_options(ort::inputs!["x" => input], &lane.options)?;
+        Ok(output.at(0)?.try_extract_tensor::<f32>()?.1.to_vec())
+    }
+
     #[test]
     fn lane_run_options_and_flags_are_independent_and_reusable() {
         let one = Cancellation::new().unwrap();
         let two = Cancellation::new().unwrap();
         assert!(!std::sync::Arc::ptr_eq(&one.flag, &two.flag));
         assert!(!std::sync::Arc::ptr_eq(&one.options, &two.options));
+        let fixture = CpuFixture::new();
+        let mut first = crate::graph::session_for_lane(&fixture.0, 1, &one).unwrap();
+        let mut second = crate::graph::session_for_lane(&fixture.0, 1, &two).unwrap();
+        assert!(matches!(first, crate::graph::Session::Ort(_)));
+        assert!(matches!(second, crate::graph::Session::Ort(_)));
+        assert_eq!(run_cpu(&mut first, &one).unwrap(), [2.5, -4.0]);
+        assert_eq!(run_cpu(&mut second, &two).unwrap(), [2.5, -4.0]);
         two.cancel().unwrap();
+        let cancelled = run_cpu(&mut second, &two);
+        assert!(
+            cancelled.is_err(),
+            "cancelled CPU inference must stop through ORT RunOptions"
+        );
+        assert!(cancelled.unwrap_err().is::<ort::Error>());
+        assert_eq!(run_cpu(&mut first, &one).unwrap(), [2.5, -4.0]);
         assert!(two.flag.load(Ordering::Acquire));
         assert!(!one.flag.load(Ordering::Acquire));
         one.reset().unwrap();
         assert!(two.flag.load(Ordering::Acquire));
+        assert!(
+            run_cpu(&mut second, &two).is_err(),
+            "resetting lane one must leave lane two terminated"
+        );
         two.reset().unwrap();
         assert!(!two.flag.load(Ordering::Acquire));
+        let reused = run_cpu(&mut second, &two);
+        assert!(
+            reused.is_ok(),
+            "a reused CPU lane must complete after reset: {reused:?}"
+        );
+        assert_eq!(reused.unwrap(), [2.5, -4.0]);
     }
 
     struct Fake<'a> {

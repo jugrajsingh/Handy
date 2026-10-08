@@ -239,6 +239,7 @@ pub fn probe(path: &Path, device: &str, cache: &Path) -> Result<GraphInfo> {
 mod tests {
     use super::*;
     use crate::cancellation::{AsyncRequest, Wait};
+    use std::path::PathBuf;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -283,7 +284,10 @@ mod tests {
         }
     }
     fn compiled(device: Device) -> Arc<CompiledGraph<Factory>> {
-        Arc::new(CompiledGraph {
+        Arc::new(compiled_model(device))
+    }
+    fn compiled_model(device: Device) -> CompiledGraph<Factory> {
+        CompiledGraph {
             info: GraphInfo {
                 device: format!("{device:?}"),
                 graph: "fake".into(),
@@ -296,8 +300,54 @@ mod tests {
             compiled: std::sync::Mutex::new(Factory(Arc::new(AtomicUsize::new(0)))),
             device,
             _core: Mutex::new(None),
-        })
+        }
     }
+    #[test]
+    fn lanes_share_weights_through_production_compilation_cache() {
+        for device in [Device::Gpu, Device::Npu] {
+            let mut cache = crate::graph::CompilationCache::<Factory>::default();
+            let mut compilations = BTreeMap::<PathBuf, usize>::new();
+            let mut lanes = Vec::new();
+            let paths = [PathBuf::from("encoder.onnx"), PathBuf::from("decoder.onnx")];
+            for _ in 0..3 {
+                let mut graphs = Vec::new();
+                for path in &paths {
+                    let graph = cache
+                        .lane(path, Arc::new(AtomicBool::new(false)), || {
+                            *compilations.entry(path.clone()).or_default() += 1;
+                            Ok(compiled_model(device))
+                        })
+                        .unwrap();
+                    graphs.push(graph);
+                }
+                lanes.push(graphs);
+            }
+            for path in &paths {
+                assert_eq!(
+                    compilations[path], 1,
+                    "production cache must compile each accelerated graph only once"
+                );
+            }
+            for graph in 0..paths.len() {
+                for lane in 1..lanes.len() {
+                    assert!(Arc::ptr_eq(
+                        &lanes[0][graph].compiled,
+                        &lanes[lane][graph].compiled
+                    ));
+                    assert_ne!(lanes[0][graph].request.id, lanes[lane][graph].request.id);
+                }
+                assert_eq!(
+                    lanes
+                        .iter()
+                        .map(|lane| lane[graph].request.id)
+                        .collect::<Vec<_>>(),
+                    [0, 1, 2]
+                );
+            }
+            assert!(!Arc::ptr_eq(&lanes[0][0].compiled, &lanes[0][1].compiled));
+        }
+    }
+
     #[test]
     fn lanes_share_compiled_graph_and_own_requests() {
         let shared = compiled(Device::Gpu);
