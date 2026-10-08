@@ -26,6 +26,8 @@ pub struct LaneSizing {
     #[serde(default = "single_lane")]
     pub best_lanes: usize,
     #[serde(default)]
+    pub rtf_by_lanes: Option<[f64; 3]>,
+    #[serde(default)]
     pub base_rss_mib: Option<f64>,
     #[serde(default)]
     pub lane_rss_mib: Option<f64>,
@@ -37,6 +39,7 @@ impl Default for LaneSizing {
     fn default() -> Self {
         Self {
             best_lanes: 1,
+            rtf_by_lanes: None,
             base_rss_mib: None,
             lane_rss_mib: None,
         }
@@ -94,6 +97,17 @@ impl Ratings {
             let mut recommended = 0;
             for device in [Device::Cpu, Device::Gpu, Device::Npu] {
                 let d = m.devices.get(&device).ok_or(DeviceError::InvalidRatings)?;
+                if !(1..=3).contains(&d.lanes.best_lanes)
+                    || d.lanes
+                        .rtf_by_lanes
+                        .is_some_and(|values| values.iter().any(|v| !v.is_finite() || *v <= 0.0))
+                    || [d.lanes.base_rss_mib, d.lanes.lane_rss_mib]
+                        .into_iter()
+                        .flatten()
+                        .any(|v| !v.is_finite() || v < 0.0)
+                {
+                    return Err(DeviceError::InvalidRatings);
+                }
                 if d.supported {
                     for value in [
                         d.first_audio_p95_s,

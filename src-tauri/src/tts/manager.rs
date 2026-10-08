@@ -1008,6 +1008,7 @@ mod tests {
         for rating in config.ratings.models.values_mut() {
             rating.devices.get_mut(&Device::Cpu).unwrap().lanes = device::LaneSizing {
                 best_lanes: 3,
+                rtf_by_lanes: None,
                 base_rss_mib: Some(100.0),
                 lane_rss_mib: Some(100.0),
             };
@@ -1721,6 +1722,7 @@ for line in sys.stdin:
                     }
                     rating.lanes = device::LaneSizing {
                         best_lanes: if *d == Device::Cpu { 3 } else { 2 },
+                        rtf_by_lanes: None,
                         base_rss_mib: Some(100.0),
                         lane_rss_mib: Some(100.0),
                     };
@@ -1747,6 +1749,7 @@ for line in sys.stdin:
                 .unwrap()
                 .lanes = device::LaneSizing {
                 best_lanes: 3,
+                rtf_by_lanes: None,
                 base_rss_mib: if missing_base { None } else { Some(100.0) },
                 lane_rss_mib: if missing_base { Some(100.0) } else { None },
             };

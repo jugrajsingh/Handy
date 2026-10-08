@@ -5,6 +5,26 @@ fn main() -> Result<()> {
         return Ok(());
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--measure-lanes") {
+        anyhow::ensure!(
+            args.len() == 7,
+            "lane measurement needs model, root, device, cache, corpus and lanes"
+        );
+        let device = match args[3].as_str() {
+            "cpu" => handy_tts_core::device::Device::Cpu,
+            "gpu" => handy_tts_core::device::Device::Gpu,
+            "npu" => handy_tts_core::device::Device::Npu,
+            _ => anyhow::bail!("unknown device"),
+        };
+        return handy_tts::measure::lane_probe(
+            &args[1],
+            std::path::Path::new(&args[2]),
+            device,
+            std::path::Path::new(&args[4]),
+            std::path::Path::new(&args[5]),
+            args[6].parse()?,
+        );
+    }
     if args.first().is_some_and(|a| a == "--measure-continuity") {
         anyhow::ensure!(
             args.len() == 7,

@@ -3,9 +3,9 @@
   "metadata": {
     "machine": "Intel Core Ultra 7 258V; 8 cores",
     "openvino": "2026.4.1-22982-e213a147257-releases/2026/4",
-    "gpu_driver": "intel-compute-runtime-26.22.38646.6-4.fc44.x86_64; intel-level-zero-26.22.38646.6-4.fc44.x86_64",
-    "npu_driver": "Intel user-space NPU 1.38.0; oneapi-level-zero-1.28.6-1.fc44.x86_64",
-    "date": "2026-10-06T20:31:08.744215+00:00"
+    "gpu_driver": "intel-compute-runtime-26.35.39758.11-3.fc44.x86_64; intel-level-zero-26.35.39758.11-3.fc44.x86_64",
+    "npu_driver": "Intel user-space NPU 1.38.0; oneapi-level-zero-1.33.1-3.fc44.x86_64",
+    "date": "2026-10-08T09:08:37.760202+00:00"
   },
   "models": {
     "pocket-en": {
@@ -20,12 +20,18 @@
             "text_conditioner": "cpu"
           },
           "recommended": true,
-          "first_audio_p95_s": 2.2180399829999997,
-          "rtf_1x": 0.23046968977941176,
-          "rtf_2x": 0.5289569901397515,
-          "load_s_cold": 0.641498907,
-          "load_s_cached": 0.424317428,
-          "speed_score": 3.7231650210699607
+          "first_audio_p95_s": 2.381581859,
+          "rtf_1x": 0.28814786320960695,
+          "rtf_2x": 0.6792464745341614,
+          "load_s_cold": 0.608804412,
+          "load_s_cached": 0.481567576,
+          "speed_score": 3.2828928791391014,
+          "rtf_by_lanes": [
+            0.30863529760795266, 0.16539746805867375, 0.1480040474526454
+          ],
+          "best_lanes": 3,
+          "base_rss_mib": 15.5625,
+          "lane_rss_mib": 498.359375
         },
         "npu": {
           "supported": false,
@@ -36,7 +42,8 @@
           "rtf_2x": null,
           "load_s_cold": null,
           "load_s_cached": null,
-          "speed_score": null
+          "speed_score": null,
+          "best_lanes": 1
         },
         "gpu": {
           "supported": true,
@@ -47,12 +54,18 @@
             "text_conditioner": "gpu"
           },
           "recommended": false,
-          "first_audio_p95_s": 1.97383417,
-          "rtf_1x": 0.2640407231104651,
-          "rtf_2x": 0.6041499943113773,
-          "load_s_cold": 1.066387172,
-          "load_s_cached": 0.518169893,
-          "speed_score": 3.7067769175419727
+          "first_audio_p95_s": 2.825255787,
+          "rtf_1x": 0.38647774171348315,
+          "rtf_2x": 1.0024678615217393,
+          "load_s_cold": 1.695311232,
+          "load_s_cached": 0.72284142,
+          "speed_score": 2.582508025073592,
+          "rtf_by_lanes": [
+            0.3391093403820817, 0.224608833346666, 0.2227800619855269
+          ],
+          "best_lanes": 3,
+          "base_rss_mib": 15.46484375,
+          "lane_rss_mib": 630.80859375
         }
       }
     },
@@ -68,12 +81,18 @@
             "vocoder": "cpu"
           },
           "recommended": false,
-          "first_audio_p95_s": 1.486701772,
-          "rtf_1x": 0.15883518713595843,
-          "rtf_2x": 0.16805138384053103,
-          "load_s_cold": 0.533943826,
-          "load_s_cached": 0.343987589,
-          "speed_score": 4.899818455790874
+          "first_audio_p95_s": 2.200267021,
+          "rtf_1x": 0.22355774720627403,
+          "rtf_2x": 0.612320636151075,
+          "load_s_cold": 0.764102237,
+          "load_s_cached": 0.57561613,
+          "speed_score": 3.780585493259239,
+          "rtf_by_lanes": [
+            0.23803903828904277, 0.2561657685781658, 0.1993038897034838
+          ],
+          "best_lanes": 3,
+          "base_rss_mib": 15.22265625,
+          "lane_rss_mib": 522.1015625
         },
         "npu": {
           "supported": true,
@@ -83,13 +102,19 @@
             "vector_estimator": "npu",
             "vocoder": "npu"
           },
-          "recommended": true,
-          "first_audio_p95_s": 1.108219434,
-          "rtf_1x": 0.03634635917781191,
-          "rtf_2x": 0.06702037713992413,
-          "load_s_cold": 19.321401448,
-          "load_s_cached": 0.961517946,
-          "speed_score": 7.530080053373441
+          "recommended": false,
+          "first_audio_p95_s": 0.763127663,
+          "rtf_1x": 0.04353884156990704,
+          "rtf_2x": 0.3191355714119668,
+          "load_s_cold": 24.154593663,
+          "load_s_cached": 0.712835291,
+          "speed_score": 7.85161515535733,
+          "rtf_by_lanes": [
+            0.05508087845925646, 0.0421777553386201, 0.04372359446045408
+          ],
+          "best_lanes": 2,
+          "base_rss_mib": 15.41015625,
+          "lane_rss_mib": 889.1875
         },
         "gpu": {
           "supported": true,
@@ -99,13 +124,19 @@
             "vector_estimator": "gpu",
             "vocoder": "gpu"
           },
-          "recommended": false,
-          "first_audio_p95_s": 4.113096053,
-          "rtf_1x": 0.05175658181987995,
-          "rtf_2x": 0.06784799647727717,
-          "load_s_cold": 2.215045915,
-          "load_s_cached": 0.49970528,
-          "speed_score": 4.947226408483456
+          "recommended": true,
+          "first_audio_p95_s": 0.220975184,
+          "rtf_1x": 0.02536685361958452,
+          "rtf_2x": 0.25328903673746433,
+          "load_s_cold": 11.641696893,
+          "load_s_cached": 3.095002157,
+          "speed_score": 10.0,
+          "rtf_by_lanes": [
+            0.025013170430704567, 0.016162979208864316, 0.016498439044940777
+          ],
+          "best_lanes": 2,
+          "base_rss_mib": 15.25390625,
+          "lane_rss_mib": 1093.43359375
         }
       }
     },
@@ -118,12 +149,18 @@
             "model_quantized": "cpu"
           },
           "recommended": true,
-          "first_audio_p95_s": 7.084963763,
-          "rtf_1x": 0.6594128406021506,
-          "rtf_2x": 0.5678828482213438,
-          "load_s_cold": 2.81667762,
-          "load_s_cached": 2.598315797,
-          "speed_score": 0.6121454132866768
+          "first_audio_p95_s": 24.65956805,
+          "rtf_1x": 0.8230471603144653,
+          "rtf_2x": 1.5757039229007634,
+          "load_s_cold": 5.675141464,
+          "load_s_cached": 3.2190828160000002,
+          "speed_score": 0.28628414519993434,
+          "rtf_by_lanes": [
+            0.9118938368890523, 0.685189531626448, 0.6163311638645006
+          ],
+          "best_lanes": 3,
+          "base_rss_mib": 15.37109375,
+          "lane_rss_mib": 1489.66796875
         },
         "npu": {
           "supported": false,
@@ -134,7 +171,8 @@
           "rtf_2x": null,
           "load_s_cold": null,
           "load_s_cached": null,
-          "speed_score": null
+          "speed_score": null,
+          "best_lanes": 1
         },
         "gpu": {
           "supported": false,
@@ -145,7 +183,8 @@
           "rtf_2x": null,
           "load_s_cold": null,
           "load_s_cached": null,
-          "speed_score": null
+          "speed_score": null,
+          "best_lanes": 1
         }
       }
     }

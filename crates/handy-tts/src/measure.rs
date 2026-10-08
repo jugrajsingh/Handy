@@ -1,6 +1,220 @@
 use anyhow::{Context, Result, ensure};
 use handy_tts_core::{catalog, device::Device, dsp, protocol::Pcm, text::TextCursor};
-use std::{path::Path, sync::atomic::AtomicBool, time::Instant};
+use std::{
+    path::Path,
+    sync::{
+        Barrier,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+fn rss_mib(status: &str) -> Result<f64> {
+    let mut fields = status
+        .lines()
+        .find(|line| line.starts_with("VmRSS:"))
+        .context("worker VmRSS missing")?
+        .split_whitespace()
+        .skip(1);
+    let kib: u64 = fields
+        .next()
+        .context("worker VmRSS value missing")?
+        .parse()
+        .context("parse worker VmRSS")?;
+    ensure!(fields.next() == Some("kB"), "worker VmRSS unit must be kB");
+    Ok(kib as f64 / 1024.0)
+}
+
+fn resident_memory() -> Result<f64> {
+    rss_mib(
+        &std::fs::read_to_string(format!("/proc/{}/status", std::process::id()))
+            .context("read worker resident memory")?,
+    )
+}
+
+fn measurement_chunks(corpus: &Path) -> Result<Vec<handy_tts_core::text::TextChunk>> {
+    let source = std::fs::read_to_string(corpus).context("read explicit measurement corpus")?;
+    let mut cursor = TextCursor::new(&source, false)?;
+    let mut chunks = Vec::new();
+    while chunks.len() < 7 {
+        let Some(chunk) = cursor.next_chunk()? else {
+            break;
+        };
+        chunks.push(chunk);
+    }
+    ensure!(
+        chunks.len() >= 3,
+        "measurement corpus needs at least three chunks"
+    );
+    Ok(chunks)
+}
+
+fn concurrent_batch(
+    engines: Vec<Box<dyn crate::runtime::SynthEngine>>,
+    chunks: &[handy_tts_core::text::TextChunk],
+) -> Result<(f64, f64)> {
+    ensure!(
+        (1..=3).contains(&engines.len()),
+        "invalid measurement lanes"
+    );
+    let next = AtomicUsize::new(0);
+    let barrier = Barrier::new(engines.len() + 1);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for mut engine in engines {
+            let next = &next;
+            let barrier = &barrier;
+            handles.push(scope.spawn(move || -> Result<_> {
+                barrier.wait();
+                let mut audio_seconds = 0.0;
+                loop {
+                    let index = next.fetch_add(1, Ordering::SeqCst);
+                    let Some(chunk) = chunks.get(index) else {
+                        break;
+                    };
+                    let samples = crate::runtime::synthesize_bounded(
+                        engine.as_mut(),
+                        &chunk.text,
+                        Some(1.0),
+                        &AtomicBool::new(false),
+                    )?;
+                    let rate = engine.sample_rate();
+                    ensure!(
+                        rate > 0 && !samples.is_empty() && samples.iter().all(|v| v.is_finite()),
+                        "invalid lane PCM"
+                    );
+                    let trimmed = handy_tts_core::edges::trim(samples, rate);
+                    let pcm = dsp::stretch(
+                        Pcm {
+                            id: index as u64,
+                            sample_rate: rate,
+                            samples: trimmed.samples,
+                        },
+                        1.0,
+                        0.0,
+                    )?;
+                    let pause = handy_tts_core::edges::pause_samples(chunk.pause_ms, 1.0, rate);
+                    audio_seconds += (pcm.samples.len() + pause) as f64 / f64::from(rate);
+                }
+                Ok((audio_seconds, engine))
+            }));
+        }
+        let began = Instant::now();
+        barrier.wait();
+        let mut audio_seconds = 0.0;
+        let mut retained = Vec::new();
+        for handle in handles {
+            let (audio, engine) = handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("measurement lane panicked"))??;
+            audio_seconds += audio;
+            retained.push(engine);
+        }
+        let seconds = began.elapsed().as_secs_f64();
+        ensure!(audio_seconds > 0.0, "lane sweep contains no audio");
+        Ok((seconds, audio_seconds))
+    })
+}
+
+/// Measures one lane count in an isolated worker process at native 1.0x.
+pub fn lane_probe(
+    id: &str,
+    root: &Path,
+    device: Device,
+    cache: &Path,
+    corpus: &Path,
+    lanes: usize,
+) -> Result<()> {
+    let model = catalog::entry(id)?;
+    let chunks = measurement_chunks(corpus)?;
+    let base_rss_mib = resident_memory()?;
+    let mut engines = crate::runtime::load_adapters(
+        id,
+        root,
+        model.default_voice,
+        model.threads,
+        device,
+        cache,
+        lanes,
+    )?;
+    for engine in &mut engines {
+        crate::runtime::synthesize_bounded(
+            engine.as_mut(),
+            &chunks[0].text,
+            Some(1.0),
+            &AtomicBool::new(false),
+        )?;
+    }
+    let finished = AtomicBool::new(false);
+    let loaded_rss = resident_memory()?;
+    let (timing, peak) = std::thread::scope(|scope| -> Result<_> {
+        let sampler = scope.spawn(|| -> Result<f64> {
+            let mut peak = loaded_rss;
+            while !finished.load(Ordering::SeqCst) {
+                peak = peak.max(resident_memory()?);
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(peak)
+        });
+        let timing = concurrent_batch(engines, &chunks);
+        finished.store(true, Ordering::SeqCst);
+        let peak = sampler
+            .join()
+            .map_err(|_| anyhow::anyhow!("RSS sampler panicked"))??;
+        Ok((timing?, peak))
+    })?;
+    println!(
+        "{}",
+        serde_json::json!({"lanes":lanes, "seconds":timing.0, "audio_seconds":timing.1, "rtf":timing.0/timing.1, "base_rss_mib":base_rss_mib, "peak_rss_mib":peak, "chunks":chunks.len()})
+    );
+    Ok(())
+}
+
+fn lane_sweep(
+    id: &str,
+    root: &Path,
+    device: Device,
+    cache: &Path,
+    corpus: &Path,
+) -> Result<serde_json::Value> {
+    let mut rtfs = Vec::new();
+    let mut base: f64 = 0.0;
+    let mut per_lane: f64 = 0.0;
+    for lanes in 1..=3 {
+        let output = std::process::Command::new(
+            std::env::current_exe().context("locate measurement worker")?,
+        )
+        .arg("--measure-lanes")
+        .arg(id)
+        .arg(root)
+        .arg(
+            serde_json::to_value(device)?
+                .as_str()
+                .context("serialize measurement device")?,
+        )
+        .arg(cache)
+        .arg(corpus)
+        .arg(lanes.to_string())
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .context("run isolated lane measurement")?;
+        ensure!(output.status.success(), "lane measurement failed: {lanes}");
+        let row: serde_json::Value =
+            serde_json::from_slice(&output.stdout).context("decode lane measurement")?;
+        let number = |field: &str| -> Result<f64> {
+            row[field]
+                .as_f64()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .with_context(|| format!("invalid lane measurement {field}"))
+        };
+        rtfs.push(number("rtf")?);
+        base = base.max(number("base_rss_mib")?);
+        per_lane = per_lane
+            .max((number("peak_rss_mib")? - number("base_rss_mib")?).max(0.0) / lanes as f64);
+        eprintln!("LANE_SWEEP model={id} device={device:?} {row}");
+    }
+    Ok(serde_json::json!({"rtf_by_lanes":rtfs, "base_rss_mib":base, "lane_rss_mib":per_lane}))
+}
 
 fn quantile(values: &mut [f64], fraction: f64) -> Result<f64> {
     ensure!(!values.is_empty(), "measurement corpus contains no chunks");
@@ -101,19 +315,10 @@ pub fn run(
     first_audio_inputs: &Path,
 ) -> Result<()> {
     let model = catalog::entry(id)?;
-    let source = std::fs::read_to_string(corpus).context("read explicit measurement corpus")?;
-    let mut cursor = TextCursor::new(&source, false)?;
-    let mut chunks = Vec::new();
-    while chunks.len() < 7 {
-        let Some(chunk) = cursor.next_chunk()? else {
-            break;
-        };
-        chunks.push(chunk.text);
-    }
-    ensure!(
-        chunks.len() >= 3,
-        "measurement corpus needs at least three chunks"
-    );
+    let chunks = measurement_chunks(corpus)?
+        .into_iter()
+        .map(|chunk| chunk.text)
+        .collect::<Vec<_>>();
     let began = Instant::now();
     let engine =
         crate::runtime::load_adapter(id, root, model.default_voice, model.threads, device, cache)?;
@@ -196,15 +401,24 @@ pub fn run(
             );
         }
     }
-    println!(
-        "{}",
-        serde_json::json!({
-            "supported":true,"engine":if id=="kokoro-82m-int8"{"onnx-misaki-rs"}else{"ported-engine"},
-            "placement":placement,"first_audio_p95_s":quantile(&mut first_audio,0.95)?,
-            "rtf_1x":quantile(&mut one,0.5)?,"rtf_2x":quantile(&mut two,0.5)?,
-            "load_s_cold":cold,"load_s_cached":cached,"chunks":chunks.len(),"first_audio_inputs":first_audio.len()
-        })
-    );
+    drop(engine);
+    let mut result = serde_json::json!({
+        "supported":true,"engine":if id=="kokoro-82m-int8"{"onnx-misaki-rs"}else{"ported-engine"},
+        "placement":placement,"first_audio_p95_s":quantile(&mut first_audio,0.95)?,
+        "rtf_1x":quantile(&mut one,0.5)?,"rtf_2x":quantile(&mut two,0.5)?,
+        "load_s_cold":cold,"load_s_cached":cached,"chunks":chunks.len(),"first_audio_inputs":first_audio.len()
+    });
+    let lanes = lane_sweep(id, root, device, cache, corpus)?;
+    result
+        .as_object_mut()
+        .context("measurement result must be an object")?
+        .extend(
+            lanes
+                .as_object()
+                .context("lane result must be an object")?
+                .clone(),
+        );
+    println!("{result}");
     Ok(())
 }
 
@@ -293,6 +507,81 @@ mod measurement_tests {
 
 #[cfg(test)]
 mod tests {
+    mod lane_sweep {
+        use super::super::*;
+        use std::sync::{Arc, Mutex};
+
+        struct Fake {
+            start: Arc<Barrier>,
+            calls: Arc<Mutex<Vec<String>>>,
+            first: bool,
+        }
+        impl crate::runtime::SynthEngine for Fake {
+            fn synthesize(
+                &mut self,
+                text: &str,
+                speed: Option<f32>,
+                _: &AtomicBool,
+            ) -> Result<Vec<f32>> {
+                assert_eq!(speed, Some(1.0));
+                self.calls.lock().unwrap().push(text.to_owned());
+                if self.first {
+                    self.first = false;
+                    self.start.wait();
+                }
+                Ok(vec![0.5; 8000])
+            }
+            fn sample_rate(&self) -> u32 {
+                8000
+            }
+        }
+
+        #[test]
+        fn concurrent_lanes_measure_every_chunk_once_with_played_pauses() {
+            for lanes in 1..=3 {
+                let calls = Arc::new(Mutex::new(Vec::new()));
+                let start = Arc::new(Barrier::new(lanes));
+                let engines = (0..lanes)
+                    .map(|_| {
+                        Box::new(Fake {
+                            start: start.clone(),
+                            calls: calls.clone(),
+                            first: true,
+                        }) as Box<dyn crate::runtime::SynthEngine>
+                    })
+                    .collect();
+                let chunks = (0..7)
+                    .map(|index| handy_tts_core::text::TextChunk {
+                        index,
+                        text: index.to_string(),
+                        source_start: 0,
+                        source_end: 1,
+                        pause_ms: 280,
+                    })
+                    .collect::<Vec<_>>();
+                let (seconds, audio) = concurrent_batch(engines, &chunks).unwrap();
+                assert!(seconds > 0.0);
+                assert!((audio - 7.0 * 1.28).abs() < 1e-9);
+                let mut calls = calls.lock().unwrap().clone();
+                calls.sort();
+                assert_eq!(
+                    calls,
+                    (0..7).map(|index| index.to_string()).collect::<Vec<_>>()
+                );
+            }
+        }
+
+        #[test]
+        fn rss_uses_worker_resident_kibibytes() {
+            assert_eq!(
+                rss_mib("VmSize: 999999 kB\nVmRSS:\t2048 kB\n").unwrap(),
+                2.0
+            );
+            for status in ["VmSize: 2048 kB", "VmRSS: nope kB", "VmRSS: 2048 MB"] {
+                assert!(rss_mib(status).is_err());
+            }
+        }
+    }
     mod first_audio_tests {
         use super::super::{Pcm, TextCursor, first_audio_latency};
         use std::cell::Cell;
