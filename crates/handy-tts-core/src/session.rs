@@ -309,7 +309,13 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             )
             .map_err(|_| "tts.errors.audio".to_string())?;
         let old = self.queue.state;
+        let native = self.queue.playing.is_none().then(|| self.preserve_native());
         self.queue.play();
+        if let Some(native) = native
+            && self.queue.playing.is_some()
+        {
+            self.current_native = native;
+        }
         if old == PlaybackState::Paused {
             self.playback.resume();
         } else if !matches!(old, PlaybackState::Playing | PlaybackState::Buffering) {
@@ -765,6 +771,22 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         crate::selection::clamp_selection(chosen.clone())
             .map_err(|_| "tts.errors.audio".to_string())?;
         self.playback.pause();
+        let result = self.restretch_unstarted(chosen);
+        if let Some(audio) = &mut self.queue.playing
+            && self.started_sentence != Some(audio.ticket.index)
+            && !audio.native.is_empty()
+        {
+            self.current_native = std::mem::take(&mut audio.native);
+        }
+        if self.queue.state != PlaybackState::Paused {
+            self.playback.resume();
+        }
+        result?;
+        self.append_ahead()
+    }
+    fn restretch_unstarted(&mut self, chosen: Selection) -> Result<(), String> {
+        let speed = chosen.speed;
+        let pitch = chosen.pitch;
         self.output_events()?;
         let retracted = self.playback.retract_unstarted();
         self.output_events()?;
@@ -924,13 +946,6 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 self.queue.playing = None;
             }
         }
-        if !current_started && let Some(audio) = &mut self.queue.playing {
-            self.current_native = std::mem::take(&mut audio.native);
-        }
-        if self.queue.state != PlaybackState::Paused {
-            self.playback.resume();
-        }
-        self.append_ahead()?;
         Ok(())
     }
     /// Polls worker and output using a monotonic caller-supplied clock.
@@ -1315,6 +1330,7 @@ mod tests {
             paused: bool,
             trace: Vec<OutputEvent>,
             appended: Vec<(usize, usize)>,
+            expected_speech: Option<Vec<f32>>,
         }
         impl Default for Audio {
             fn default() -> Self {
@@ -1323,6 +1339,7 @@ mod tests {
                     paused: false,
                     trace: vec![],
                     appended: vec![],
+                    expected_speech: None,
                 }
             }
         }
@@ -1343,6 +1360,9 @@ mod tests {
                 Ok(())
             }
             fn append(&mut self, segment: Segment) -> Result<(), PlaybackError> {
+                if let Some(expected) = &self.expected_speech {
+                    assert_eq!(&segment.speech, expected);
+                }
                 self.appended.push((segment.index, segment.speech.len()));
                 self.feed.push(segment);
                 Ok(())
@@ -1378,6 +1398,7 @@ mod tests {
         struct Lanes {
             pending: VecDeque<Completion>,
             requests: Vec<(Ticket, f32)>,
+            texts: Vec<String>,
             cancelled: Vec<Ticket>,
             failed: Option<usize>,
             slow: bool,
@@ -1387,10 +1408,11 @@ mod tests {
             fn request(
                 &mut self,
                 ticket: Ticket,
-                _: &str,
+                text: &str,
                 selection: &Selection,
             ) -> Result<(), String> {
                 self.requests.push((ticket, selection.speed));
+                self.texts.push(text.to_owned());
                 self.pending.push_front(Completion {
                     ticket,
                     result: if self.failed == Some(ticket.index) {
@@ -1435,6 +1457,98 @@ mod tests {
             if s.queue.state == PlaybackState::Playing && !s.playback.output.paused {
                 s.playback.output.feed.pull(&mut vec![0.0; pull]);
             }
+        }
+        #[test]
+        fn resume_from_buffering_keeps_native_audio_until_started() {
+            let source =
+                "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(8);
+            for (speed, pitch) in [(2.0, 0.0), (1.0, 2.0), (2.0, 2.0)] {
+                let mut s = create(&source, 1.0);
+                s.tick(0.0).unwrap();
+                s.pause();
+                s.tick(0.01).unwrap();
+                assert!(s.queue.playing.is_none());
+                assert!(!s.queue.waiting.is_empty());
+                let epoch = s.queue.epoch;
+                s.play().unwrap();
+                s.tick(0.02).unwrap();
+                assert!(s.playback.current_index().is_none());
+                assert_eq!(s.playback.content_samples(), 0);
+                let native = crate::edges::trim(vec![0.25; 8000], 8000).samples;
+                let expected = dsp::stretch(
+                    Pcm {
+                        id: 0,
+                        sample_rate: 8000,
+                        samples: native,
+                    },
+                    speed,
+                    pitch,
+                )
+                .unwrap();
+                s.playback.output.expected_speech = Some(expected.samples.clone());
+                s.set_speed_pitch(speed, pitch).unwrap();
+                assert_eq!(s.queue.epoch, epoch);
+                assert!(!s.playback.output.paused);
+                assert_eq!(s.queue.state, PlaybackState::Playing);
+                for i in 2..2000 {
+                    pump(&mut s, f64::from(i) * 0.02, 160);
+                    if s.queue.state == PlaybackState::Finished {
+                        break;
+                    }
+                }
+                assert_eq!(s.queue.state, PlaybackState::Finished);
+                assert_eq!(s.snapshot().error, None);
+                let started: Vec<_> = s
+                    .playback
+                    .output
+                    .trace
+                    .iter()
+                    .filter_map(|event| match event {
+                        OutputEvent::Started(index) => Some(*index),
+                        _ => None,
+                    })
+                    .collect();
+                let finished: Vec<_> = s
+                    .playback
+                    .output
+                    .trace
+                    .iter()
+                    .filter_map(|event| match event {
+                        OutputEvent::Finished { index, delivered } => {
+                            assert_eq!(
+                                *delivered,
+                                expected.samples.len()
+                                    + crate::edges::pause_samples(450, speed, 8000)
+                            );
+                            Some(*index)
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(started, (0..8).collect::<Vec<_>>());
+                assert_eq!(finished, started);
+                assert_eq!(
+                    s.worker
+                        .texts
+                        .iter()
+                        .flat_map(|text| text.split_whitespace())
+                        .collect::<Vec<_>>(),
+                    source.split_whitespace().collect::<Vec<_>>()
+                );
+            }
+        }
+        #[test]
+        fn failed_control_render_resumes_output_before_returning_error() {
+            let source =
+                "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(8);
+            let mut s = create(&source, 1.0);
+            s.tick(0.0).unwrap();
+            s.tick(0.01).unwrap();
+            assert!(!s.current_native.is_empty());
+            s.current_native[0] = f32::NAN;
+            assert_eq!(s.set_speed_pitch(2.0, 0.0), Err("tts.errors.audio".into()));
+            assert_eq!(s.queue.state, PlaybackState::Playing);
+            assert!(!s.playback.output.paused);
         }
         #[test]
         fn twenty_minute_document_plays_gapless_at_2x_with_fast_worker() {
