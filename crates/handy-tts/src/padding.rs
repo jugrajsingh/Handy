@@ -3,10 +3,26 @@ use anyhow::{Context, Result, ensure};
 pub struct StaticCapacity;
 impl std::fmt::Display for StaticCapacity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("NPU static input capacity exceeded")
+        f.write_str("static input capacity exceeded")
     }
 }
 impl std::error::Error for StaticCapacity {}
+/// Static text and latent-frame capacity of one compiled Supertonic graph class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShapeClass {
+    pub text: i64,
+    pub frames: i64,
+}
+
+/// Selects the smallest class covering both original input dimensions.
+pub fn class_index(classes: &[ShapeClass], text: i64, frames: i64) -> Result<usize> {
+    ensure!(text >= 0 && frames >= 0, "invalid class dimensions");
+    classes
+        .iter()
+        .position(|class| text <= class.text && frames <= class.frames)
+        .ok_or_else(|| StaticCapacity.into())
+}
+
 pub fn pad<T: Default + Clone>(shape: &[i64], target: &[i64], data: &[T]) -> Result<Vec<T>> {
     ensure!(
         shape.len() == target.len() && shape.iter().chain(target).all(|d| *d >= 0),

@@ -12,6 +12,7 @@ use std::{
 };
 #[derive(Debug, Clone)]
 pub struct BackendConfig {
+    pub classes: Vec<crate::padding::ShapeClass>,
     pub model_id: String,
     pub device: Device,
     pub cache_dir: PathBuf,
@@ -56,11 +57,13 @@ impl Outputs {
 /// Cache used by the accelerated loader, with an injectable compiler and request factory.
 pub(crate) struct CompilationCache<C: crate::ov_graph::RequestFactory = openvino::CompiledModel> {
     graphs: BTreeMap<PathBuf, Arc<crate::ov_graph::CompiledGraph<C>>>,
+    prepared: BTreeMap<PathBuf, crate::ov_graph::GraphLane<C>>,
 }
 impl<C: crate::ov_graph::RequestFactory> Default for CompilationCache<C> {
     fn default() -> Self {
         Self {
             graphs: BTreeMap::new(),
+            prepared: BTreeMap::new(),
         }
     }
 }
@@ -71,6 +74,9 @@ impl<C: crate::ov_graph::RequestFactory> CompilationCache<C> {
         cancelled: Arc<std::sync::atomic::AtomicBool>,
         compile: impl FnOnce() -> Result<crate::ov_graph::CompiledGraph<C>>,
     ) -> Result<crate::ov_graph::GraphLane<C>> {
+        if let Some(lane) = self.prepared.remove(path) {
+            return Ok(lane);
+        }
         let cached = self.graphs.get(path).cloned();
         let compiled = match cached {
             Some(compiled) => compiled,
@@ -83,6 +89,66 @@ impl<C: crate::ov_graph::RequestFactory> CompilationCache<C> {
         compiled.lane(cancelled)
     }
 }
+impl CompilationCache {
+    fn prepare_classes(
+        &mut self,
+        path: &Path,
+        context: &BackendConfig,
+        threads: usize,
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<()> {
+        if self.prepared.contains_key(path) {
+            return Ok(());
+        }
+        let paths = context
+            .placement
+            .keys()
+            .map(|name| {
+                let path = path.with_file_name(format!("{name}.onnx"));
+                let graph = self.graphs.get(&path).cloned();
+                (path, graph)
+            })
+            .collect::<Vec<_>>();
+        let prepared = std::thread::scope(|scope| {
+            let handles = paths
+                .into_iter()
+                .map(|(path, cached)| {
+                    let cancelled = cancelled.clone();
+                    scope.spawn(move || {
+                        let compiled = match cached {
+                            Some(graph) => graph,
+                            None => Arc::new(crate::ov_graph::CompiledGraph::load_classes(
+                                &path,
+                                "GPU",
+                                &context.cache_dir,
+                                BTreeMap::new(),
+                                threads,
+                                false,
+                                &context.classes,
+                            )?),
+                        };
+                        let lane = compiled.lane(cancelled)?;
+                        Ok((path, compiled, lane))
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    handle
+                        .join()
+                        .map_err(|_| anyhow::anyhow!("GPU graph preparation thread panicked"))?
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        for (path, graph, lane) in prepared {
+            self.graphs.insert(path.clone(), graph);
+            self.prepared.insert(path, lane);
+        }
+        Ok(())
+    }
+}
+
 thread_local! {
     static COMPILED: RefCell<Option<CompilationCache>> = const { RefCell::new(None) };
 }
@@ -138,17 +204,28 @@ pub(crate) fn session_for_lane(
             let graph = COMPILED.with(|slot| {
                 let mut slot = slot.borrow_mut();
                 let compile = || {
-                    crate::ov_graph::CompiledGraph::load(
+                    crate::ov_graph::CompiledGraph::load_classes(
                         path,
                         if device == Device::Gpu { "GPU" } else { "NPU" },
                         &context.cache_dir,
                         fixed,
                         threads,
                         context.model_id == "pocket-en",
+                        &context.classes,
                     )
                 };
                 match slot.as_mut() {
-                    Some(cache) => cache.lane(path, cancellation.flag.clone(), compile),
+                    Some(cache) => {
+                        if !context.classes.is_empty() {
+                            cache.prepare_classes(
+                                path,
+                                &context,
+                                threads,
+                                cancellation.flag.clone(),
+                            )?;
+                        }
+                        cache.lane(path, cancellation.flag.clone(), compile)
+                    }
                     None => Arc::new(compile()?).lane(cancellation.flag.clone()),
                 }
             })?;
@@ -191,14 +268,42 @@ fn to_ov(value: &DynValue, target: Option<&Vec<i64>>) -> Result<openvino::Tensor
     convert!(bool, openvino::ElementType::Boolean);
     bail!("unsupported graph input dtype")
 }
-fn from_ov(tensor: &openvino::Tensor, crop: Option<(usize, i64)>) -> Result<DynValue> {
+fn crop_output<T: Clone>(
+    shape: &mut [i64],
+    index: usize,
+    original: &BTreeMap<String, Vec<i64>>,
+    data: Vec<T>,
+) -> Result<Vec<T>> {
+    let crop = if index == 0 && shape.len() == 3 {
+        if let Some(actual) = original.get("noisy_latent") {
+            Some((2, actual[2]))
+        } else if let Some(actual) = original.get("text_ids") {
+            Some((2, actual[1]))
+        } else {
+            original.get("token_ids").map(|actual| (1, actual[1]))
+        }
+    } else {
+        None
+    };
+    if let Some((axis, length)) = crop {
+        return crate::padding::crop_axis(shape, axis, length, &data);
+    }
+    Ok(data)
+}
+fn from_ov(
+    tensor: &openvino::Tensor,
+    index: usize,
+    original: &BTreeMap<String, Vec<i64>>,
+) -> Result<DynValue> {
     let mut shape = tensor.get_shape()?.get_dimensions().to_vec();
     macro_rules! convert {
         ($ty:ty) => {{
-            let mut data = tensor.get_data::<$ty>()?.to_vec();
-            if let Some((axis, len)) = crop {
-                data = crate::padding::crop_axis(&mut shape, axis, len, &data)?;
-            }
+            let data = crop_output(
+                &mut shape,
+                index,
+                original,
+                tensor.get_data::<$ty>()?.to_vec(),
+            )?;
             Ok(Tensor::from_array((shape, data))?.into_dyn())
         }};
     }
@@ -209,6 +314,7 @@ fn from_ov(tensor: &openvino::Tensor, crop: Option<(usize, i64)>) -> Result<DynV
         _ => bail!("unsupported graph output dtype"),
     }
 }
+
 impl Session {
     pub fn run_with_options<'i, 'v: 'i>(
         &mut self,
@@ -238,12 +344,29 @@ impl Session {
                 let SessionInputs::ValueMap(inputs) = inputs else {
                     bail!("OpenVINO graphs require named inputs");
                 };
+                let original = inputs
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        if let ort::value::ValueType::Tensor { shape, .. } = value.dtype() {
+                            Some((name.to_string(), shape.to_vec()))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let text = original
+                    .get("text_ids")
+                    .and_then(|s| s.get(1).copied())
+                    .or_else(|| original.get("text_mask").and_then(|s| s.get(2).copied()))
+                    .unwrap_or(0);
+                let frames = original
+                    .get("noisy_latent")
+                    .or_else(|| original.get("latent"))
+                    .and_then(|s| s.get(2).copied())
+                    .unwrap_or(0);
+                let graph = graph.select(text, frames)?;
                 let mut values = BTreeMap::new();
-                let mut original = BTreeMap::new();
                 for (name, value) in inputs {
-                    if let ort::value::ValueType::Tensor { shape, .. } = value.dtype() {
-                        original.insert(name.to_string(), shape.to_vec());
-                    }
                     values.insert(
                         name.to_string(),
                         to_ov(&value, graph.compiled.info.shapes.get(name.as_ref()))?,
@@ -252,24 +375,35 @@ impl Session {
                 let tensors = graph.infer(&values)?;
                 let mut result = Vec::new();
                 for (index, tensor) in tensors.iter().enumerate() {
-                    let shape = tensor.get_shape()?.get_dimensions().to_vec();
-                    let crop = if index == 0 && shape.len() == 3 {
-                        if let Some(actual) = original.get("noisy_latent") {
-                            Some((2, actual[2]))
-                        } else if let Some(actual) = original.get("text_ids") {
-                            Some((2, actual[1]))
-                        } else {
-                            original.get("token_ids").map(|actual| (1, actual[1]))
-                        }
-                    } else {
-                        None
-                    };
                     result.push((
                         graph.compiled.info.outputs[index].clone(),
-                        from_ov(tensor, crop)?,
+                        from_ov(tensor, index, &original)?,
                     ));
                 }
                 Ok(Outputs { values: result })
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    mod gpu_classes {
+        use super::*;
+        #[test]
+        fn crop_restores_original_dimensions() {
+            for (input, original, output, axis) in [
+                ("text_ids", vec![1, 3], vec![1, 2, 8], 2),
+                ("noisy_latent", vec![1, 2, 3], vec![1, 2, 8], 2),
+            ] {
+                let originals = BTreeMap::from([(input.into(), original)]);
+                let mut shape = output;
+                let data = (0..16).collect::<Vec<_>>();
+                let result = crop_output(&mut shape, 0, &originals, data).unwrap();
+                assert_eq!(shape, [1, 2, 3]);
+                assert_eq!(result, [0, 1, 2, 8, 9, 10]);
+                assert_eq!(shape[axis], 3);
             }
         }
     }

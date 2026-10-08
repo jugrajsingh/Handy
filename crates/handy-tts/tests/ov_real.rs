@@ -553,3 +553,160 @@ fn gpu_cancel_one_lane_other_completes() {
     assert!(child.0.wait().unwrap().success());
     println!("REAL_GPU_CANCEL lane_one=Ok lane_two=Cancelled retry_lanes=Ok");
 }
+
+#[test]
+#[ignore = "requires opt-in mounted Supertonic graphs and GPU"]
+fn gpu_classes_first_request_within_1_5x_repeat() {
+    let (root, cache, device) = paths();
+    assert_eq!(device, Device::Gpu);
+    let flag = AtomicBool::new(false);
+    let start = std::time::Instant::now();
+    let engine =
+        handy_tts::runtime::load_adapter("supertonic-3", &root, "F1", 2, device, &cache).unwrap();
+    println!(
+        "GPU_CLASSES initial_load_and_warm_seconds={:.6}",
+        start.elapsed().as_secs_f64()
+    );
+    drop(engine);
+    let start = std::time::Instant::now();
+    let mut engine =
+        handy_tts::runtime::load_adapter("supertonic-3", &root, "F1", 2, device, &cache).unwrap();
+    let cached_load = start.elapsed().as_secs_f64();
+    println!("GPU_CLASSES cached_load_and_warm_seconds={cached_load:.6}");
+    assert!(
+        cached_load <= 5.0,
+        "cached load plus warm-up exceeds 5 seconds: {cached_load}"
+    );
+    let fixture_root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../handy-tts-core/tests/fixtures/text");
+    let cases: BTreeMap<String, Vec<String>> =
+        serde_json::from_str(&std::fs::read_to_string(fixture_root.join("goldens.json")).unwrap())
+            .unwrap();
+    let mut first = vec![];
+    let mut repeat = vec![];
+    for name in cases.keys() {
+        let source = std::fs::read_to_string(fixture_root.join(name)).unwrap();
+        let mut cursor = handy_tts_core::text::TextCursor::new(&source, false).unwrap();
+        while let Some(chunk) = cursor.next_chunk().unwrap() {
+            let mut lengths = vec![];
+            for timings in [&mut first, &mut repeat] {
+                let start = std::time::Instant::now();
+                let pcm = handy_tts::runtime::synthesize_bounded(
+                    engine.as_mut(),
+                    &chunk.text,
+                    Some(1.0),
+                    &flag,
+                )
+                .unwrap();
+                timings.push(start.elapsed().as_secs_f64());
+                assert!(!pcm.is_empty());
+                assert!(pcm.iter().all(|sample| sample.is_finite()));
+                lengths.push(pcm.len());
+            }
+            assert_eq!(
+                lengths[0], lengths[1],
+                "static padding must preserve repeat dimensions: {}",
+                chunk.text
+            );
+        }
+        println!(
+            "GPU_CLASSES document={name} completed_chunks={}",
+            first.len()
+        );
+    }
+    fn p95(values: &mut [f64]) -> f64 {
+        values.sort_by(f64::total_cmp);
+        values[(values.len() * 95).div_ceil(100) - 1]
+    }
+    let first_p95 = p95(&mut first);
+    let repeat_p95 = p95(&mut repeat);
+    println!(
+        "GPU_CLASSES chunks={} cached_load_and_warm_seconds={cached_load:.6} first_p95_seconds={first_p95:.6} repeat_p95_seconds={repeat_p95:.6} ratio={:.6}",
+        first.len(),
+        first_p95 / repeat_p95
+    );
+
+    assert!(
+        first_p95 <= 1.5 * repeat_p95,
+        "GPU first requests exceed 1.5x warmed repeats"
+    );
+}
+
+#[test]
+#[ignore = "requires opt-in mounted Supertonic graphs and GPU"]
+fn gpu_static_padding_keeps_duration_predictor_deterministic() {
+    let (root, cache, device) = paths();
+    let cfg = handy_tts::backend_config::config("supertonic-3", &root, device, &cache).unwrap();
+    drop(
+        handy_tts::graph::with_config(cfg.clone(), || {
+            handy_tts::graph::session(&root.join("onnx/duration_predictor.onnx"), 2)
+        })
+        .unwrap(),
+    );
+    let mut graph = handy_tts::graph::with_config(cfg, || {
+        handy_tts::graph::session(&root.join("onnx/duration_predictor.onnx"), 2)
+    })
+    .unwrap();
+    let json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("voice_styles/F1.json")).unwrap()).unwrap();
+    let style: Vec<Vec<Vec<f32>>> =
+        serde_json::from_value(json["style_dp"]["data"].clone()).unwrap();
+    let style = ort::value::Tensor::from_array((
+        [1, 8, 16],
+        style.into_iter().flatten().flatten().collect::<Vec<_>>(),
+    ))
+    .unwrap();
+    let indexer: Vec<i64> =
+        serde_json::from_slice(&std::fs::read(root.join("onnx/unicode_indexer.json")).unwrap())
+            .unwrap();
+    let text = "<en>the application should begin speaking promptly in a calm and consistent voice, preserve the meaning of every paragraph, pronounce unfamiliar names carefully,</en>";
+    let ids = text
+        .chars()
+        .map(|c| indexer[c as usize])
+        .collect::<Vec<_>>();
+    let n = ids.len();
+    let ids = ort::value::Tensor::from_array(([1, n], ids)).unwrap();
+    let mask = ort::value::Tensor::from_array(([1, 1, n], vec![1.0f32; n])).unwrap();
+    let options = ort::session::RunOptions::new().unwrap();
+    let mut durations = vec![];
+    for _ in 0..6 {
+        let out = graph
+            .run_with_options(
+                ort::inputs!["text_ids"=>&ids,"text_mask"=>&mask,"style_dp"=>&style],
+                &options,
+            )
+            .unwrap();
+        durations.push(out.at(0).unwrap().try_extract_tensor::<f32>().unwrap().1[0]);
+    }
+    assert!(
+        durations
+            .iter()
+            .all(|duration| duration.is_finite() && *duration == durations[0]),
+        "static GPU padding must give stable duration predictions: {durations:?}"
+    );
+    println!(
+        "GPU_STATIC_DURATION repeats={} duration={:.6}",
+        durations.len(),
+        durations[0]
+    );
+}
+
+#[test]
+#[ignore = "requires opt-in mounted Supertonic graphs and GPU"]
+fn gpu_cached_load_and_warm_within_five_seconds() {
+    let (root, cache, device) = paths();
+    assert_eq!(device, Device::Gpu);
+    let engine =
+        handy_tts::runtime::load_adapter("supertonic-3", &root, "F1", 2, device, &cache).unwrap();
+    drop(engine);
+    let start = std::time::Instant::now();
+    let engine =
+        handy_tts::runtime::load_adapter("supertonic-3", &root, "F1", 2, device, &cache).unwrap();
+    let seconds = start.elapsed().as_secs_f64();
+    println!("GPU_CACHED_LOAD_AND_WARM seconds={seconds:.6}");
+    assert!(
+        seconds <= 5.0,
+        "cached load plus warm-up exceeds 5 seconds: {seconds}"
+    );
+    drop(engine);
+}

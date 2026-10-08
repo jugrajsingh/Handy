@@ -1,4 +1,5 @@
 use crate::graph::BackendConfig;
+use crate::padding::ShapeClass;
 use anyhow::{Context, Result};
 use handy_tts_core::device::Device;
 use std::{collections::BTreeMap, path::Path};
@@ -69,30 +70,10 @@ pub fn config(model_id: &str, root: &Path, device: Device, cache: &Path) -> Resu
             placement.insert(graph.into(), device);
         }
         if device == Device::Npu {
-            let text = [
-                ("text_ids".into(), vec![1, 512]),
-                ("text_mask".into(), vec![1, 1, 512]),
-            ];
-            let mut dp = BTreeMap::from(text.clone());
-            dp.insert("style_dp".into(), vec![1, 8, 16]);
-            let mut encoder = BTreeMap::from(text);
-            encoder.insert("style_ttl".into(), vec![1, 50, 256]);
-            let estimator = BTreeMap::from([
-                ("noisy_latent".into(), vec![1, 144, 512]),
-                ("text_emb".into(), vec![1, 256, 512]),
-                ("style_ttl".into(), vec![1, 50, 256]),
-                ("latent_mask".into(), vec![1, 1, 512]),
-                ("text_mask".into(), vec![1, 1, 512]),
-                ("current_step".into(), vec![1]),
-                ("total_step".into(), vec![1]),
-            ]);
-            shapes.insert("duration_predictor".into(), dp);
-            shapes.insert("text_encoder".into(), encoder);
-            shapes.insert("vector_estimator".into(), estimator);
-            shapes.insert(
-                "vocoder".into(),
-                BTreeMap::from([("latent".into(), vec![1, 144, 512])]),
-            );
+            shapes = supertonic_shapes(ShapeClass {
+                text: 512,
+                frames: 512,
+            });
         }
     } else if model_id == "kokoro-82m-int8" {
         placement.insert("model_quantized".into(), device);
@@ -115,8 +96,53 @@ pub fn config(model_id: &str, root: &Path, device: Device, cache: &Path) -> Resu
         cache_dir: cache.into(),
         placement,
         shapes,
+        classes: if model_id == "supertonic-3" && device == Device::Gpu {
+            [
+                (32, 48),
+                (80, 144),
+                (176, 208),
+                (224, 288),
+                (272, 336),
+                (304, 416),
+            ]
+            .into_iter()
+            .map(|(text, frames)| ShapeClass { text, frames })
+            .collect()
+        } else {
+            vec![]
+        },
     })
 }
+/// Input shapes for all four Supertonic graphs at a static capacity.
+pub fn supertonic_shapes(class: ShapeClass) -> BTreeMap<String, BTreeMap<String, Vec<i64>>> {
+    let mut shapes = BTreeMap::new();
+    let text = [
+        ("text_ids".into(), vec![1, class.text]),
+        ("text_mask".into(), vec![1, 1, class.text]),
+    ];
+    let mut dp = BTreeMap::from(text.clone());
+    dp.insert("style_dp".into(), vec![1, 8, 16]);
+    let mut encoder = BTreeMap::from(text);
+    encoder.insert("style_ttl".into(), vec![1, 50, 256]);
+    let estimator = BTreeMap::from([
+        ("noisy_latent".into(), vec![1, 144, class.frames]),
+        ("text_emb".into(), vec![1, 256, class.text]),
+        ("style_ttl".into(), vec![1, 50, 256]),
+        ("latent_mask".into(), vec![1, 1, class.frames]),
+        ("text_mask".into(), vec![1, 1, class.text]),
+        ("current_step".into(), vec![1]),
+        ("total_step".into(), vec![1]),
+    ]);
+    shapes.insert("duration_predictor".into(), dp);
+    shapes.insert("text_encoder".into(), encoder);
+    shapes.insert("vector_estimator".into(), estimator);
+    shapes.insert(
+        "vocoder".into(),
+        BTreeMap::from([("latent".into(), vec![1, 144, class.frames])]),
+    );
+    shapes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +178,57 @@ mod tests {
         )
         .unwrap();
         assert_eq!(kokoro.placement["model_quantized"], Device::Gpu);
+    }
+
+    mod gpu_classes {
+        use super::*;
+        #[test]
+        fn smallest_fitting_class_is_chosen() {
+            let cfg = config(
+                "supertonic-3",
+                Path::new("."),
+                Device::Gpu,
+                Path::new("cache"),
+            )
+            .unwrap();
+            assert_eq!(cfg.classes.len(), 6);
+            let first = supertonic_shapes(cfg.classes[0]);
+            assert_eq!(first["vector_estimator"]["text_emb"], [1, 256, 32]);
+            assert_eq!(first["vector_estimator"]["noisy_latent"], [1, 144, 48]);
+            assert_eq!(first["vector_estimator"]["text_mask"], [1, 1, 32]);
+            assert_eq!(first["vector_estimator"]["latent_mask"], [1, 1, 48]);
+            for (index, class) in cfg.classes.iter().enumerate() {
+                assert_eq!(
+                    crate::padding::class_index(&cfg.classes, class.text, class.frames).unwrap(),
+                    index
+                );
+            }
+            assert_eq!(
+                crate::padding::class_index(&cfg.classes, 70, 150).unwrap(),
+                2
+            );
+            assert_eq!(
+                crate::padding::class_index(&cfg.classes, 180, 100).unwrap(),
+                3
+            );
+            assert!(
+                crate::padding::class_index(&cfg.classes, 305, 1)
+                    .unwrap_err()
+                    .is::<crate::padding::StaticCapacity>()
+            );
+            assert!(
+                crate::padding::class_index(&cfg.classes, 1, 417)
+                    .unwrap_err()
+                    .is::<crate::padding::StaticCapacity>()
+            );
+            for device in [Device::Cpu, Device::Npu] {
+                assert!(
+                    config("supertonic-3", Path::new("."), device, Path::new("cache"))
+                        .unwrap()
+                        .classes
+                        .is_empty()
+                );
+            }
+        }
     }
 }

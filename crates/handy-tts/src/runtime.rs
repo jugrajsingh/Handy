@@ -90,8 +90,8 @@ pub fn memory_available() -> Result<u64> {
     }
 }
 
-/// Retries over-cap NPU inputs as ordered word-boundary parts with bounded PCM.
-pub(crate) fn synthesize_bounded(
+/// Retries over-cap static inputs as ordered word-boundary parts with bounded PCM.
+pub fn synthesize_bounded(
     engine: &mut dyn SynthEngine,
     text: &str,
     speed: Option<f32>,
@@ -110,17 +110,16 @@ pub(crate) fn synthesize_bounded(
                 samples.extend(pcm);
             }
             Err(error)
-                if engine.device() == handy_tts_core::device::Device::Npu
-                    && error
-                        .downcast_ref::<crate::padding::StaticCapacity>()
-                        .is_some() =>
+                if error
+                    .downcast_ref::<crate::padding::StaticCapacity>()
+                    .is_some() =>
             {
                 let split = part
                     .char_indices()
                     .filter(|(i, ch)| *i > 0 && ch.is_whitespace() && !part[*i..].trim().is_empty())
                     .min_by_key(|(i, _)| i.abs_diff(part.len() / 2))
                     .map(|(i, _)| i)
-                    .context("NPU input cannot split at a word boundary")?;
+                    .context("static input cannot split at a word boundary")?;
                 pending.push(part[split..].trim_start());
                 pending.push(part[..split].trim_end());
             }
@@ -1751,6 +1750,53 @@ mod tests {
             if expected_status == Status::Error {
                 assert_eq!(reply.message.as_deref(), Some("not_enough_memory"));
             }
+        }
+    }
+
+    mod gpu_classes {
+        use super::*;
+        struct Capped {
+            words: Vec<String>,
+        }
+        impl SynthEngine for Capped {
+            fn sample_rate(&self) -> u32 {
+                1
+            }
+            fn device(&self) -> handy_tts_core::device::Device {
+                handy_tts_core::device::Device::Gpu
+            }
+            fn synthesize(
+                &mut self,
+                text: &str,
+                _: Option<f32>,
+                _: &AtomicBool,
+            ) -> Result<Vec<f32>> {
+                if text.len() > 20 {
+                    return Err(crate::padding::StaticCapacity.into());
+                }
+                let words = text
+                    .split_whitespace()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let samples = words
+                    .iter()
+                    .map(|word| word.parse::<f32>().unwrap())
+                    .collect();
+                self.words.extend(words);
+                Ok(samples)
+            }
+        }
+        #[test]
+        fn over_cap_request_splits_and_keeps_all_words() {
+            let text = (1..=100)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut engine = Capped { words: vec![] };
+            let samples =
+                synthesize_bounded(&mut engine, &text, Some(1.0), &AtomicBool::new(false)).unwrap();
+            assert_eq!(engine.words.join(" "), text);
+            assert_eq!(samples, (1..=100).map(|n| n as f32).collect::<Vec<_>>());
         }
     }
 }
