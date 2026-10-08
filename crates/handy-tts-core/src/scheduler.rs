@@ -43,7 +43,7 @@ impl AudioChunk {
             as f64
             / f64::from(self.pcm.sample_rate)
     }
-    fn stored_seconds(&self) -> f64 {
+    pub(crate) fn stored_seconds(&self) -> f64 {
         (self.pcm.samples.len() + self.native.len()) as f64 / f64::from(self.pcm.sample_rate)
     }
     fn take_prefix(&mut self, played_budget: f64, stored_budget: f64) -> Option<Self> {
@@ -420,22 +420,17 @@ impl Queue {
                 || self.failed_index.is_some());
         let first = self.waiting.front().unwrap_or(&chunk);
         let released_seconds = if starts { first.seconds() } else { 0.0 };
-        let released_native = if starts {
-            first.native.len() as f64 / f64::from(first.pcm.sample_rate)
-        } else {
-            0.0
-        };
         let mut remainder = None;
         if self.queued_seconds() + seconds - released_seconds > QUEUED_AUDIO_CEILING + 0.00001
-            || self.stored_seconds() + chunk.stored_seconds() - released_native
-                > STORED_SECONDS_CEILING + 0.00001
+            || self.stored_seconds() + chunk.stored_seconds() > STORED_SECONDS_CEILING + 0.00001
         {
             if ticket.index == self.next_admit_index
                 && self.playing.is_none()
                 && self.state == PlaybackState::Buffering
-                && !self.waiting.is_empty()
             {
-                self.start_waiting();
+                if !self.waiting.is_empty() {
+                    self.start_waiting();
+                }
                 let played_budget = QUEUED_AUDIO_CEILING - self.queued_seconds();
                 let stored_budget = STORED_SECONDS_CEILING - self.stored_seconds();
                 if chunk.seconds() > played_budget || chunk.stored_seconds() > stored_budget {
@@ -538,6 +533,9 @@ impl Queue {
         self.state = PlaybackState::Playing;
         self.finish_buffering();
         self.playing = self.waiting.pop_front();
+    }
+    /// Releases native PCM only after the output pulls the current chunk's first sample.
+    pub fn playback_started(&mut self) {
         if let Some(audio) = &mut self.playing {
             audio.native = Vec::new();
         }
@@ -650,7 +648,11 @@ mod tests {
         q.complete(t, Ok(audio));
         assert_eq!(q.waiting.front().unwrap().native.len(), 24000);
         q.play();
+        assert_eq!(q.playing.as_ref().unwrap().native.len(), 24000);
+        assert_eq!(q.stored_seconds(), 2.0);
+        q.playback_started();
         assert!(q.playing.as_ref().unwrap().native.is_empty());
+        assert_eq!(q.stored_seconds(), 1.0);
     }
     #[test]
     fn buffering_clock_excludes_initial_wait_and_user_pause() {
@@ -800,6 +802,47 @@ mod tests {
     #[test]
     fn two_short_chunks_and_maximum_part_at_one_x_make_progress() {
         assert_admission_progress(1.0, 48_000, 2, 720_000, 1, 24_000);
+    }
+    #[test]
+    fn maximum_first_reply_splits_with_later_audio_ready_until_started() {
+        let mut q = Queue::with_speed(2.0);
+        q.set_lanes(3);
+        q.play();
+        let first = q.request_next().unwrap();
+        let later = q.request_next().unwrap();
+        let later_audio = chunk(later);
+        let later_pcm = later_audio.pcm.samples.clone();
+        assert!(q.complete(later, Ok(later_audio)).is_none());
+        let mut first_audio = chunk(first);
+        first_audio.pcm.samples = (0..480_000).map(|i| i as f32).collect();
+        first_audio.native = vec![0.25; 960_000];
+        first_audio.plan.requested = 2.0;
+        first_audio.plan.stretch = 2.0;
+        let first_pcm = first_audio.pcm.samples.clone();
+        let remainder = q.complete(first, Ok(first_audio));
+        assert!(q.stored_seconds() <= STORED_SECONDS_CEILING + 0.00001);
+        let mut remainder = remainder.unwrap();
+        assert!(q.playing.is_some());
+        assert!(!q.playing.as_ref().unwrap().native.is_empty());
+        assert!((q.stored_seconds() - STORED_SECONDS_CEILING).abs() < 0.00001);
+        remainder = q.complete(first, Ok(remainder)).unwrap();
+        q.playback_started();
+        assert!(q.complete(first, Ok(remainder)).is_none());
+        q.source_finished = true;
+        let mut delivered = Vec::new();
+        let mut indices = Vec::new();
+        for _ in 0..3 {
+            q.playback_started();
+            let playing = q.playing.as_ref().unwrap();
+            indices.push(playing.ticket.index);
+            delivered.extend_from_slice(&playing.pcm.samples);
+            assert!(q.stored_seconds() <= STORED_SECONDS_CEILING + 0.00001);
+            q.playback_finished();
+        }
+        assert_eq!(indices, [first.index, first.index, later.index]);
+        assert_eq!(delivered, [first_pcm, later_pcm].concat());
+        assert_eq!(q.stored_seconds(), 0.0);
+        assert_eq!(q.state, PlaybackState::Finished);
     }
     #[test]
     fn maximum_part_at_one_x_makes_progress_with_later_audio_ready() {
@@ -963,6 +1006,7 @@ mod tests {
                 pending = q.complete_timed(next, Ok(audio), elapsed);
             }
             conserved(&q, pending.as_ref(), &delivered);
+            q.playback_started();
             if let Some(audio) = &q.playing {
                 let index = delivered
                     .iter()
@@ -1061,7 +1105,8 @@ mod tests {
             stretch: 0.5,
         };
         q.complete(t, Ok(audio));
-        assert_eq!(q.stored_seconds(), 50.0);
+        assert_eq!(q.stored_seconds(), 60.0);
+        assert!(q.request_next().is_none());
         let t = Ticket {
             epoch: q.epoch,
             index: 2,

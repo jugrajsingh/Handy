@@ -187,7 +187,6 @@ pub struct Session<'a, W: Worker, O: Output> {
     retracted_segments: VecDeque<(usize, usize)>,
     seen_sentences: BTreeSet<usize>,
     next_part_index: usize,
-    current_native: Vec<f32>,
     audible_range: Option<(u32, u32)>,
     started_sentence: Option<usize>,
     request_plans: BTreeMap<usize, crate::speed::SpeedPlan>,
@@ -239,7 +238,6 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             retracted_segments: VecDeque::new(),
             seen_sentences: BTreeSet::new(),
             next_part_index: 0,
-            current_native: Vec::new(),
             audible_range: None,
             started_sentence: None,
             request_plans: BTreeMap::new(),
@@ -291,7 +289,6 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         self.retracted_segments.clear();
         self.seen_sentences.clear();
         self.next_part_index = 0;
-        self.current_native.clear();
         self.request_plans.clear();
         self.restart_from = None;
         self.started_sentence = None;
@@ -309,13 +306,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             )
             .map_err(|_| "tts.errors.audio".to_string())?;
         let old = self.queue.state;
-        let native = self.queue.playing.is_none().then(|| self.preserve_native());
         self.queue.play();
-        if let Some(native) = native
-            && self.queue.playing.is_some()
-        {
-            self.current_native = native;
-        }
         if old == PlaybackState::Paused {
             self.playback.resume();
         } else if !matches!(old, PlaybackState::Playing | PlaybackState::Buffering) {
@@ -366,7 +357,6 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         self.retracted_segments.clear();
         self.seen_sentences.clear();
         self.next_part_index = 0;
-        self.current_native.clear();
         self.request_plans.clear();
         self.restart_from = None;
         self.error = None;
@@ -395,7 +385,6 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         self.retracted_segments.clear();
         self.seen_sentences.clear();
         self.next_part_index = 0;
-        self.current_native.clear();
         self.request_plans.clear();
         self.restart_from = None;
         self.content_origin = self.playback.content_samples();
@@ -486,7 +475,6 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         self.retracted_segments.clear();
         self.seen_sentences.clear();
         self.next_part_index = 0;
-        self.current_native.clear();
         self.request_plans.clear();
         self.restart_from = None;
         self.content_origin = self.playback.content_samples();
@@ -578,13 +566,6 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             },
         );
     }
-    fn preserve_native(&self) -> Vec<f32> {
-        self.queue
-            .waiting
-            .front()
-            .map(|audio| audio.native.clone())
-            .unwrap_or_default()
-    }
     fn admit_parts(&mut self) {
         let indices: Vec<_> = self.parts.keys().copied().collect();
         for index in indices {
@@ -611,23 +592,12 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                     source_start: text.source_start,
                     source_end: text.source_end,
                 };
-                let native = if self.queue.playing.is_some() {
-                    Vec::new()
-                } else if self.queue.waiting.is_empty() {
-                    audio.native.clone()
-                } else {
-                    self.preserve_native()
-                };
-                let was_empty = self.queue.playing.is_none();
                 let remainder = self.queue.complete_part(
                     parts.ticket,
                     Ok(audio),
                     seconds * parts.elapsed_per_second,
                     last,
                 );
-                if was_empty && self.queue.playing.is_some() {
-                    self.current_native = native;
-                }
                 if let Some(audio) = remainder {
                     parts.samples.push_front((audio.pcm, audio.native));
                     self.parts.insert(index, parts);
@@ -637,16 +607,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         }
     }
     fn advance(&mut self) {
-        let was_empty = self.queue.playing.is_none();
-        let native = if was_empty {
-            self.preserve_native()
-        } else {
-            Vec::new()
-        };
         self.queue.advance_at(self.now);
-        if was_empty && self.queue.playing.is_some() {
-            self.current_native = native;
-        }
     }
     fn output_events(&mut self) -> Result<(), String> {
         for event in self
@@ -667,7 +628,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                         self.audible_range = Some((text.source_start, text.source_end));
                         self.reported_position.set(None);
                     }
-                    self.current_native.clear();
+                    self.queue.playback_started();
                     self.first_play.get_or_insert(self.now);
                 }
                 OutputEvent::Finished { index, delivered } => {
@@ -681,9 +642,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                         self.played_seconds += audio.seconds();
                         self.completed_chars = audio.source_end;
                     }
-                    let native = self.preserve_native();
                     self.queue.playback_finished();
-                    self.current_native = native;
                 }
                 OutputEvent::Underrun => {
                     if self.queue.state == PlaybackState::Playing && self.queue.playing.is_none() {
@@ -772,12 +731,6 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             .map_err(|_| "tts.errors.audio".to_string())?;
         self.playback.pause();
         let result = self.restretch_unstarted(chosen);
-        if let Some(audio) = &mut self.queue.playing
-            && self.started_sentence != Some(audio.ticket.index)
-            && !audio.native.is_empty()
-        {
-            self.current_native = std::mem::take(&mut audio.native);
-        }
         if self.queue.state != PlaybackState::Paused {
             self.playback.resume();
         }
@@ -810,9 +763,6 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 .is_some_and(|audio| audio.ticket.index == *index)
         });
         let current_started = audible_index.is_some();
-        if !current_started && let Some(audio) = &mut self.queue.playing {
-            audio.native = std::mem::take(&mut self.current_native);
-        }
         let mut restart = None;
         for audio in self
             .queue
@@ -889,14 +839,11 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             }
         }
         let mut played = 0.0;
-        let mut stored = self.queue.playing.as_ref().map_or(0.0, |audio| {
-            audio.pcm.samples.len() as f64 / f64::from(audio.pcm.sample_rate)
-        });
+        let mut stored = 0.0;
         for audio in self
             .queue
             .playing
             .iter()
-            .filter(|_| !current_started)
             .chain(self.queue.waiting.iter())
             .chain(self.queue.ready.values())
         {
@@ -907,9 +854,8 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 .is_some_and(|first| std::ptr::eq(first, audio));
             if !current {
                 played += audio.seconds();
-                stored += audio.pcm.samples.len() as f64 / f64::from(audio.pcm.sample_rate);
             }
-            stored += audio.native.len() as f64 / f64::from(audio.pcm.sample_rate);
+            stored += audio.stored_seconds();
             if played > QUEUED_AUDIO_CEILING + 0.00001
                 || stored > crate::scheduler::STORED_SECONDS_CEILING + 0.00001
             {
@@ -1538,14 +1484,111 @@ mod tests {
             }
         }
         #[test]
+        fn buffered_resume_charges_retained_native_to_storage_budget() {
+            let source =
+                "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(12);
+            let mut s = create(&source, 2.0);
+            let bounded = |s: &Session<'_, Lanes, Audio>| {
+                let retained: f64 = s
+                    .queue
+                    .playing
+                    .iter()
+                    .chain(s.queue.waiting.iter())
+                    .chain(s.queue.ready.values())
+                    .map(|audio| {
+                        (audio.pcm.samples.len() + audio.native.len()) as f64
+                            / f64::from(audio.pcm.sample_rate)
+                    })
+                    .sum();
+                assert!(
+                    retained <= crate::scheduler::STORED_SECONDS_CEILING + 0.00001,
+                    "retained PCM exceeds storage ceiling: {retained}"
+                );
+                assert!(s.queue.queued_seconds() <= QUEUED_AUDIO_CEILING + 0.00001);
+            };
+            s.worker.native_samples = Some(104_000);
+            s.tick(0.0).unwrap();
+            bounded(&s);
+            assert_eq!(s.worker.pending.len(), 3);
+            for completion in &mut s.worker.pending {
+                completion.synthesis_seconds = 60.0;
+            }
+            s.pause();
+            bounded(&s);
+            s.tick(0.01).unwrap();
+            bounded(&s);
+            assert!(s.queue.playing.is_none());
+            assert_eq!(s.queue.waiting.len(), 3);
+            assert!((s.queue.stored_seconds() - 58.5).abs() < 0.00001);
+            s.worker.native_samples = Some(24_000);
+            s.play().unwrap();
+            bounded(&s);
+            s.tick(0.02).unwrap();
+            bounded(&s);
+            assert_eq!(s.worker.pending.len(), 3);
+            s.tick(0.03).unwrap();
+            assert_eq!(s.playback.content_samples(), 0);
+            bounded(&s);
+            assert_eq!(s.queue.playing.as_ref().unwrap().native.len(), 104_000);
+            s.playback.output.feed.pull(&mut [0.0]);
+            bounded(&s);
+            s.tick(0.04).unwrap();
+            bounded(&s);
+            assert!(s.queue.playing.as_ref().unwrap().native.is_empty());
+            for i in 4..6000 {
+                pump(&mut s, f64::from(i) * 0.02, 160);
+                bounded(&s);
+                if s.queue.state == PlaybackState::Finished {
+                    break;
+                }
+            }
+            assert_eq!(s.queue.state, PlaybackState::Finished);
+            let started: Vec<_> = s
+                .playback
+                .output
+                .trace
+                .iter()
+                .filter_map(|event| match event {
+                    OutputEvent::Started(index) => Some(*index),
+                    _ => None,
+                })
+                .collect();
+            let finished: Vec<_> = s
+                .playback
+                .output
+                .trace
+                .iter()
+                .filter_map(|event| match event {
+                    OutputEvent::Finished { index, delivered } => {
+                        let speech = if *index < 3 { 52_000 } else { 12_000 };
+                        assert_eq!(*delivered, speech + 1800);
+                        Some(*index)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(started, (0..12).collect::<Vec<_>>());
+            assert_eq!(finished, started);
+            assert_eq!(s.queue.stored_seconds(), 0.0);
+            assert_eq!(
+                s.worker
+                    .texts
+                    .iter()
+                    .flat_map(|text| text.split_whitespace())
+                    .collect::<Vec<_>>(),
+                source.split_whitespace().collect::<Vec<_>>()
+            );
+        }
+        #[test]
         fn failed_control_render_resumes_output_before_returning_error() {
             let source =
                 "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(8);
             let mut s = create(&source, 1.0);
             s.tick(0.0).unwrap();
             s.tick(0.01).unwrap();
-            assert!(!s.current_native.is_empty());
-            s.current_native[0] = f32::NAN;
+            let native = &mut s.queue.playing.as_mut().unwrap().native;
+            assert!(!native.is_empty());
+            native[0] = f32::NAN;
             assert_eq!(s.set_speed_pitch(2.0, 0.0), Err("tts.errors.audio".into()));
             assert_eq!(s.queue.state, PlaybackState::Playing);
             assert!(!s.playback.output.paused);
