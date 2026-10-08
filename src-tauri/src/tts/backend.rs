@@ -202,6 +202,7 @@ impl WorkerBackend {
             model_dir: root.to_path_buf(),
             voice: voice.into(),
             threads: entry.threads,
+            lanes: 1,
             device,
             cache_dir: cache.to_path_buf(),
         })?;
@@ -480,6 +481,7 @@ for line in sys.stdin:
                 model_dir: fixture.path().into(),
                 voice: "alba".into(),
                 threads: 4,
+                lanes: 1,
                 device: Device::Cpu,
                 cache_dir: fixture.path().into(),
             })

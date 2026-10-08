@@ -13,6 +13,8 @@ pub enum Request {
         model_dir: PathBuf,
         voice: String,
         threads: usize,
+        #[serde(default = "one")]
+        lanes: usize,
         #[serde(default)]
         device: crate::device::Device,
         #[serde(default)]
@@ -27,7 +29,14 @@ pub enum Request {
     Cancel {
         id: u64,
     },
+    SetLanes {
+        lanes: usize,
+    },
     Shutdown,
+}
+
+fn one() -> usize {
+    1
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -159,6 +168,31 @@ pub fn write_reply(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    #[test]
+    fn legacy_load_defaults_to_one_lane_and_v2_controls_round_trip() {
+        let legacy: Request = serde_json::from_str(
+            r#"{"type":"load","model_dir":"fixture","voice":"alba","threads":4}"#,
+        )
+        .unwrap();
+        assert!(matches!(legacy, Request::Load { lanes: 1, .. }));
+        for lanes in 1..=3 {
+            for request in [
+                Request::Load {
+                    model_dir: "fixture".into(),
+                    voice: "alba".into(),
+                    threads: 4,
+                    device: crate::device::Device::Cpu,
+                    cache_dir: PathBuf::new(),
+                    lanes,
+                },
+                Request::SetLanes { lanes },
+            ] {
+                let mut bytes = Vec::new();
+                write_request(&mut bytes, &request).unwrap();
+                assert_eq!(serde_json::from_slice::<Request>(&bytes).unwrap(), request);
+            }
+        }
+    }
     #[test]
     fn header_status_rate_count_and_finite_guards_return_specific_errors_before_pcm_allocation() {
         let valid = Header {
@@ -332,6 +366,7 @@ mod tests {
                 model_dir: "/models/pocket-en".into(),
                 voice: "alba".into(),
                 threads: 4,
+                lanes: 1,
             },
             Request::Synthesize {
                 id: 1,

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use handy_tts_core::protocol::{Header, Request, Status, write_reply};
 use std::io::{BufRead, Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 
 #[derive(Debug)]
@@ -126,9 +126,99 @@ pub(crate) fn synthesize_bounded(
     Ok(samples)
 }
 
+type CancelFlags = Arc<std::sync::Mutex<std::collections::HashMap<u64, Arc<AtomicBool>>>>;
+
+struct Job {
+    id: u64,
+    text: String,
+    speed: Option<f32>,
+    cancel: Arc<AtomicBool>,
+}
+enum Event {
+    Control(Request, Option<Arc<AtomicBool>>),
+    Duplicate(u64),
+    Finished(usize, u64, Result<()>),
+    ReaderFailed(anyhow::Error),
+}
+struct Lane {
+    sender: Option<mpsc::SyncSender<Job>>,
+    busy: bool,
+}
+
+fn cancel_all(flags: &CancelFlags) {
+    if let Ok(flags) = flags.lock() {
+        for cancel in flags.values() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
+fn reply(writer: &std::sync::Mutex<impl Write>, header: &Header, samples: &[f32]) -> Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| anyhow::anyhow!("reply writer poisoned"))?;
+    write_reply(&mut *writer, header, samples).context("write worker reply")
+}
+
+fn error_reply(writer: &std::sync::Mutex<impl Write>, id: u64, message: &str) -> Result<()> {
+    reply(
+        writer,
+        &Header {
+            device: None,
+            placement: None,
+            id,
+            status: Status::Error,
+            sample_rate: None,
+            samples: None,
+            message: Some(message.into()),
+        },
+        &[],
+    )
+}
+
+fn chunk_reply(
+    writer: &std::sync::Mutex<impl Write>,
+    id: u64,
+    cancel: &AtomicBool,
+    result: Result<(u32, Vec<f32>)>,
+) -> Result<()> {
+    let mut writer = writer
+        .lock()
+        .map_err(|_| anyhow::anyhow!("reply writer poisoned"))?;
+    let mut header = Header {
+        device: None,
+        placement: None,
+        id,
+        status: Status::Error,
+        sample_rate: None,
+        samples: None,
+        message: None,
+    };
+    let mut pcm = Vec::new();
+    if id != 0 && cancel.load(Ordering::SeqCst) {
+        header.status = Status::Cancelled;
+        header.message = Some("cancelled".into());
+    } else {
+        match result {
+            Ok((rate, samples)) => {
+                header.status = Status::Ok;
+                header.sample_rate = Some(rate);
+                header.samples = Some(samples.len());
+                pcm = samples;
+            }
+            Err(error) => {
+                log_failure("chunk", &error);
+                header.message = Some("chunk_failed".into());
+            }
+        }
+    }
+    write_reply(&mut *writer, &header, &pcm).context("write chunk reply")
+}
+
+/// Dispatches bounded concurrent syntheses with independent cancellation and framed replies.
 pub fn run(
     reader: impl BufRead + Send + 'static,
-    mut writer: impl Write,
+    writer: impl Write + Send,
     mut load: impl FnMut(
         &Path,
         &str,
@@ -138,102 +228,193 @@ pub fn run(
     ) -> Result<Box<dyn SynthEngine>>,
     memory: impl Fn() -> Result<u64>,
 ) -> Result<()> {
-    let (tx, rx) = mpsc::sync_channel::<Request>(1);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let active_id = Arc::new(AtomicU64::new(0));
-    let cancelled_id = Arc::new(AtomicU64::new(0));
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let cancel_reader = Arc::clone(&cancel);
-    let active_reader = Arc::clone(&active_id);
-    let cancelled_reader = Arc::clone(&cancelled_id);
-    let shutdown_reader = Arc::clone(&shutdown);
+    let writer = std::sync::Mutex::new(writer);
+    let flags: CancelFlags = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let (tx, rx) = mpsc::sync_channel::<Event>(8);
+    let reader_flags = flags.clone();
+    let reader_tx = tx.clone();
     let controls = std::thread::Builder::new()
         .name("tts-controls".into())
-        .spawn(move || -> Result<()> {
-            let mut reader = reader;
-            loop {
-                let mut bytes = Vec::new();
-                let count = reader
-                    .by_ref()
-                    .take(16385)
-                    .read_until(b'\n', &mut bytes)
-                    .context("read control")?;
-                if count == 0 {
-                    shutdown_reader.store(true, Ordering::SeqCst);
-                    cancel_reader.store(true, Ordering::SeqCst);
-                    crate::cancel_inference();
-                    break;
-                }
-                ensure!(
-                    count <= 16384 && bytes.last() == Some(&b'\n'),
-                    "control line too long"
-                );
-                let request: Request = serde_json::from_slice(&bytes).context("decode control")?;
-                match request {
-                    Request::Cancel { id } => {
-                        cancelled_reader.store(id, Ordering::SeqCst);
-                        if active_reader.load(Ordering::SeqCst) == id {
-                            cancel_reader.store(true, Ordering::SeqCst);
-                            crate::cancel_inference();
-                        }
-                    }
-                    Request::Shutdown => {
-                        shutdown_reader.store(true, Ordering::SeqCst);
-                        cancel_reader.store(true, Ordering::SeqCst);
-                        crate::cancel_inference();
-                        let _ = tx.send(Request::Shutdown);
+        .spawn(move || {
+            let result = (|| -> Result<()> {
+                let mut reader = reader;
+                loop {
+                    let mut bytes = Vec::new();
+                    let count = reader
+                        .by_ref()
+                        .take(16385)
+                        .read_until(b'\n', &mut bytes)
+                        .context("read control")?;
+                    if count == 0 {
+                        cancel_all(&reader_flags);
+                        let _ = reader_tx.send(Event::Control(Request::Shutdown, None));
                         break;
                     }
-                    request => {
-                        if tx.send(request).is_err() {
-                            break;
+                    ensure!(
+                        count <= 16384 && bytes.last() == Some(&b'\n'),
+                        "control line too long"
+                    );
+                    let request: Request =
+                        serde_json::from_slice(&bytes).context("decode control")?;
+                    let cancel = match &request {
+                        Request::Synthesize { id, .. } => {
+                            let mut flags = reader_flags
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?;
+                            if flags.contains_key(id) {
+                                drop(flags);
+                                if reader_tx.send(Event::Duplicate(*id)).is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            let cancel = Arc::new(AtomicBool::new(false));
+                            flags.insert(*id, cancel.clone());
+                            Some(cancel)
                         }
+                        Request::Cancel { id } => {
+                            let flags = reader_flags
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?;
+                            if let Some(cancel) = flags.get(id) {
+                                cancel.store(true, Ordering::SeqCst);
+                            }
+                            continue;
+                        }
+                        Request::Shutdown => {
+                            cancel_all(&reader_flags);
+                            None
+                        }
+                        _ => None,
+                    };
+                    let shutdown = matches!(request, Request::Shutdown);
+                    if reader_tx.send(Event::Control(request, cancel)).is_err() || shutdown {
+                        break;
                     }
                 }
+                Ok(())
+            })();
+            if let Err(error) = result {
+                cancel_all(&reader_flags);
+                let _ = reader_tx.send(Event::ReaderFailed(error));
             }
-            Ok(())
         })
         .context("start control reader")?;
-    let mut engine: Option<Box<dyn SynthEngine>> = None;
-    for request in rx {
-        match request {
-            Request::Load {
-                model_dir,
-                voice,
-                threads,
-                device,
-                cache_dir,
-            } => {
-                if memory()? < handy_tts_core::memory::MIN_AVAILABLE_BYTES {
-                    write_reply(
-                        &mut writer,
-                        &Header {
-                            device: None,
-                            placement: None,
-                            id: 0,
-                            status: Status::Error,
-                            sample_rate: None,
-                            samples: None,
-                            message: Some("not_enough_memory".into()),
+    let result = std::thread::scope(|scope| {
+        let mut lanes: Vec<Lane> = Vec::new();
+        let mut active_lanes = 0;
+        let result = (|| -> Result<()> {
+            while let Ok(event) = rx.recv() {
+                match event {
+                    Event::ReaderFailed(error) => return Err(error),
+                    Event::Duplicate(id) => error_reply(&writer, id, "busy")?,
+                    Event::Finished(index, id, result) => {
+                        lanes[index].busy = false;
+                        flags
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?
+                            .remove(&id);
+                        result?;
+                    }
+                    Event::Control(
+                        Request::Load {
+                            model_dir,
+                            voice,
+                            threads,
+                            device,
+                            cache_dir,
+                            lanes: count,
                         },
-                        &[],
-                    )?;
-                    continue;
-                }
-                let loaded = (|| {
-                    ensure!((1..=8).contains(&threads), "invalid threads");
-                    load(&model_dir, &voice, threads, device, &cache_dir)
-                })();
-                match loaded {
-                    Ok(value) => {
-                        let actual_device = value.device();
-                        let actual_placement = value.placement();
-                        engine = Some(value);
-                        write_reply(
-                            &mut writer,
+                        _,
+                    ) => {
+                        if lanes.iter().any(|lane| lane.busy) {
+                            error_reply(&writer, 0, "busy")?;
+                            continue;
+                        }
+                        // Dropping each sender releases its previous engine.
+                        lanes.clear();
+                        active_lanes = 0;
+                        if memory()? < handy_tts_core::memory::MIN_AVAILABLE_BYTES {
+                            error_reply(&writer, 0, "not_enough_memory")?;
+                            continue;
+                        }
+                        let loaded = (|| -> Result<Vec<Box<dyn SynthEngine>>> {
+                            ensure!((1..=8).contains(&threads), "invalid threads");
+                            ensure!((1..=3).contains(&count), "invalid lanes");
+                            (0..count)
+                                .map(|_| load(&model_dir, &voice, threads, device, &cache_dir))
+                                .collect()
+                        })();
+                        match loaded {
+                            Ok(engines) => {
+                                let actual_device = engines[0].device();
+                                let actual_placement = engines[0].placement();
+                                for (index, mut engine) in engines.into_iter().enumerate() {
+                                    let (sender, jobs) = mpsc::sync_channel::<Job>(1);
+                                    let writer = &writer;
+                                    let tx = tx.clone();
+                                    std::thread::Builder::new().name(format!("tts-lane-{index}"))
+                                        .spawn_scoped(scope, move || {
+                                            for job in jobs {
+                                                let result = (|| {
+                                                    let samples = synthesize_bounded(engine.as_mut(), &job.text, job.speed, &job.cancel)?;
+                                                    ensure!(!samples.is_empty()
+                                                        && samples.len() <= handy_tts_core::protocol::MAX_SAMPLES
+                                                        && samples.iter().all(|v| v.is_finite()), "invalid PCM");
+                                                    ensure!((8000..=48000).contains(&engine.sample_rate()), "invalid sample rate");
+                                                    Ok((engine.sample_rate(), samples))
+                                                })();
+                                                let result = chunk_reply(writer, job.id, &job.cancel, result);
+                                                if tx.send(Event::Finished(index, job.id, result)).is_err() { break; }
+                                            }
+                                        }).context("start synthesis lane")?;
+                                    lanes.push(Lane {
+                                        sender: Some(sender),
+                                        busy: false,
+                                    });
+                                }
+                                active_lanes = count;
+                                reply(
+                                    &writer,
+                                    &Header {
+                                        device: Some(actual_device),
+                                        placement: Some(actual_placement),
+                                        id: 0,
+                                        status: Status::Ready,
+                                        sample_rate: None,
+                                        samples: Some(0),
+                                        message: None,
+                                    },
+                                    &[],
+                                )?;
+                            }
+                            Err(error) => {
+                                log_failure("load", &error);
+                                let message = if device == handy_tts_core::device::Device::Npu
+                                    && error.is::<crate::ov_graph::NpuCompileRejected>()
+                                {
+                                    "npu_compile_failed"
+                                } else {
+                                    "load_failed"
+                                };
+                                error_reply(&writer, 0, message)?;
+                            }
+                        }
+                    }
+                    Event::Control(Request::SetLanes { lanes: count }, _) => {
+                        if count == 0 || count > active_lanes {
+                            error_reply(&writer, 0, "invalid_lanes")?;
+                            continue;
+                        }
+                        for lane in &mut lanes[count..] {
+                            lane.sender.take();
+                        }
+                        active_lanes = count;
+                        reply(
+                            &writer,
                             &Header {
-                                device: Some(actual_device),
-                                placement: Some(actual_placement),
+                                device: None,
+                                placement: None,
                                 id: 0,
                                 status: Status::Ready,
                                 sample_rate: None,
@@ -243,116 +424,64 @@ pub fn run(
                             &[],
                         )?;
                     }
-                    Err(error) => {
-                        log_failure("load", &error);
-                        let message = if device == handy_tts_core::device::Device::Npu
-                            && error.is::<crate::ov_graph::NpuCompileRejected>()
+                    Event::Control(Request::Synthesize { id, text, speed }, cancel) => {
+                        let cancel = cancel.context("synthesis cancel flag missing")?;
+                        let valid = (|| -> Result<()> {
+                            ensure!(
+                                id != 0 && !text.trim().is_empty(),
+                                "invalid synthesis request"
+                            );
+                            if let Some(speed) = speed {
+                                ensure!((0.5..=2.0).contains(&speed), "invalid speed");
+                            }
+                            ensure!(active_lanes > 0, "model not loaded");
+                            Ok(())
+                        })();
+                        if let Err(error) = valid {
+                            chunk_reply(&writer, id, &cancel, Err(error))?;
+                            flags
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?
+                                .remove(&id);
+                        } else if let Some(lane) =
+                            lanes[..active_lanes].iter_mut().find(|lane| !lane.busy)
                         {
-                            "npu_compile_failed"
-                        } else {
-                            "load_failed"
-                        };
-                        write_reply(
-                            &mut writer,
-                            &Header {
-                                device: None,
-                                placement: None,
-                                id: 0,
-                                status: Status::Error,
-                                sample_rate: None,
-                                samples: None,
-                                message: Some(message.into()),
-                            },
-                            &[],
-                        )?;
-                    }
-                }
-            }
-            Request::Synthesize { id, text, speed } => {
-                active_id.store(id, Ordering::SeqCst);
-                cancel.store(
-                    cancelled_id.load(Ordering::SeqCst) == id || shutdown.load(Ordering::SeqCst),
-                    Ordering::SeqCst,
-                );
-                let result = (|| {
-                    ensure!(
-                        id != 0 && !text.trim().is_empty(),
-                        "invalid synthesis request"
-                    );
-                    if let Some(speed) = speed {
-                        ensure!((0.5..=2.0).contains(&speed), "invalid speed");
-                    }
-                    let engine = engine.as_mut().context("model not loaded")?;
-                    let samples = synthesize_bounded(engine.as_mut(), &text, speed, &cancel)?;
-                    ensure!(
-                        !samples.is_empty()
-                            && samples.len() <= handy_tts_core::protocol::MAX_SAMPLES
-                            && samples.iter().all(|v| v.is_finite()),
-                        "invalid PCM"
-                    );
-                    Ok::<_, anyhow::Error>((engine.sample_rate(), samples))
-                })();
-                if id != 0 && cancel.load(Ordering::SeqCst) {
-                    write_reply(
-                        &mut writer,
-                        &Header {
-                            device: None,
-                            placement: None,
-                            id,
-                            status: Status::Cancelled,
-                            sample_rate: None,
-                            samples: None,
-                            message: Some("cancelled".into()),
-                        },
-                        &[],
-                    )?;
-                } else {
-                    match result {
-                        Ok((rate, samples)) => write_reply(
-                            &mut writer,
-                            &Header {
-                                device: None,
-                                placement: None,
-                                id,
-                                status: Status::Ok,
-                                sample_rate: Some(rate),
-                                samples: Some(samples.len()),
-                                message: None,
-                            },
-                            &samples,
-                        )?,
-                        Err(error) => {
-                            log_failure("chunk", &error);
-                            write_reply(
-                                &mut writer,
-                                &Header {
-                                    device: None,
-                                    placement: None,
+                            lane.sender
+                                .as_ref()
+                                .context("lane was released")?
+                                .send(Job {
                                     id,
-                                    status: Status::Error,
-                                    sample_rate: None,
-                                    samples: None,
-                                    message: Some("chunk_failed".into()),
-                                },
-                                &[],
-                            )?;
+                                    text,
+                                    speed,
+                                    cancel,
+                                })
+                                .context("dispatch synthesis")?;
+                            lane.busy = true;
+                        } else {
+                            error_reply(&writer, id, "busy")?;
+                            flags
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?
+                                .remove(&id);
                         }
                     }
+                    Event::Control(Request::Shutdown, _) => break,
+                    Event::Control(Request::Cancel { .. }, _) => bail!("cancel reached dispatcher"),
                 }
-                active_id.store(0, Ordering::SeqCst);
-                let _ = cancelled_id.compare_exchange(id, 0, Ordering::SeqCst, Ordering::SeqCst);
             }
-            Request::Shutdown => break,
-            Request::Cancel { .. } => bail!("cancel reached synthesis loop"),
-        }
-    }
-    drop(engine);
+            Ok(())
+        })();
+        cancel_all(&flags);
+        drop(lanes);
+        drop(rx);
+        result
+    });
     if controls.is_finished() {
         controls
             .join()
-            .map_err(|_| anyhow::anyhow!("control reader panicked"))??;
+            .map_err(|_| anyhow::anyhow!("control reader panicked"))?;
     }
-    Ok(())
+    result
 }
 
 pub struct EngineAdapter {
@@ -417,6 +546,245 @@ pub fn parse_model(args: impl Iterator<Item = String>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    mod lanes {
+        use super::*;
+        use handy_tts_core::protocol::{read_header, read_pcm_after_header};
+        use std::io::BufReader;
+        use std::os::unix::net::UnixStream;
+        use std::sync::Mutex;
+        use std::time::Duration;
+
+        struct Scripted {
+            release: Arc<AtomicBool>,
+            started: Arc<AtomicBool>,
+        }
+        impl SynthEngine for Scripted {
+            fn synthesize(
+                &mut self,
+                text: &str,
+                _: Option<f32>,
+                cancelled: &AtomicBool,
+            ) -> Result<Vec<f32>> {
+                if text == "slow" {
+                    self.started.store(true, Ordering::SeqCst);
+                    for _ in 0..2000 {
+                        if self.release.load(Ordering::SeqCst) || cancelled.load(Ordering::SeqCst) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                } else {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                ensure!(!cancelled.load(Ordering::SeqCst), "cancelled");
+                Ok(vec![if text == "slow" { 0.25 } else { -0.5 }; 4096])
+            }
+            fn sample_rate(&self) -> u32 {
+                24000
+            }
+        }
+        struct YieldWriter {
+            stream: UnixStream,
+            release: Arc<AtomicBool>,
+            yield_header: bool,
+            headers: usize,
+        }
+        impl Write for YieldWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                let count = self.stream.write(bytes)?;
+                if bytes == b"\n" {
+                    self.headers += 1;
+                }
+                if self.yield_header && self.headers == 2 && bytes == b"\n" {
+                    self.yield_header = false;
+                    self.release.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.stream.flush()
+            }
+        }
+        struct Harness {
+            input: UnixStream,
+            output: BufReader<UnixStream>,
+            thread: Option<std::thread::JoinHandle<Result<()>>>,
+            release: Arc<AtomicBool>,
+            started: Arc<AtomicBool>,
+            loads: Arc<Mutex<usize>>,
+        }
+        impl Harness {
+            fn new(lanes: usize, yield_header: bool) -> Self {
+                let (input, reader) = UnixStream::pair().unwrap();
+                let (output, stream) = UnixStream::pair().unwrap();
+                output
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let release = Arc::new(AtomicBool::new(false));
+                let started = Arc::new(AtomicBool::new(false));
+                let loads = Arc::new(Mutex::new(0));
+                let state = (release.clone(), started.clone(), loads.clone());
+                let thread = std::thread::spawn(move || {
+                    run(
+                        BufReader::new(reader),
+                        YieldWriter {
+                            stream,
+                            release: state.0.clone(),
+                            yield_header,
+                            headers: 0,
+                        },
+                        move |_, _, _, _, _| {
+                            *state.2.lock().unwrap() += 1;
+                            Ok(Box::new(Scripted {
+                                release: state.0.clone(),
+                                started: state.1.clone(),
+                            }))
+                        },
+                        || Ok(u64::MAX),
+                    )
+                });
+                let mut harness = Self {
+                    input,
+                    output: BufReader::new(output),
+                    thread: Some(thread),
+                    release,
+                    started,
+                    loads,
+                };
+                harness.raw(serde_json::json!({"type":"load","model_dir":"fixture","voice":"alba","threads":4,"lanes":lanes}));
+                assert_eq!(harness.header().status, Status::Ready);
+                assert_eq!(*harness.loads.lock().unwrap(), lanes);
+                harness
+            }
+            fn raw(&mut self, request: serde_json::Value) {
+                writeln!(self.input, "{request}").unwrap();
+            }
+            fn synth(&mut self, id: u64, text: &str) {
+                self.raw(serde_json::json!({"type":"synthesize","id":id,"text":text}));
+            }
+            fn header(&mut self) -> Header {
+                read_header(&mut self.output).unwrap()
+            }
+            fn pcm(&mut self, id: u64) -> Vec<f32> {
+                let header = self.header();
+                read_pcm_after_header(&mut self.output, header, id)
+                    .unwrap()
+                    .samples
+            }
+            fn wait_started(&self) {
+                for _ in 0..2000 {
+                    if self.started.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                panic!("slow lane did not start");
+            }
+            fn shutdown(&mut self) {
+                self.raw(serde_json::json!({"type":"shutdown"}));
+                self.thread.take().unwrap().join().unwrap().unwrap();
+            }
+        }
+        impl Drop for Harness {
+            fn drop(&mut self) {
+                self.release.store(true, Ordering::SeqCst);
+                if self.thread.is_some() {
+                    let _ = writeln!(self.input, "{}", serde_json::json!({"type":"shutdown"}));
+                    let _ = self.output.get_ref().shutdown(std::net::Shutdown::Both);
+                    let _ = self.thread.take().unwrap().join();
+                }
+            }
+        }
+        #[test]
+        fn two_lanes_reply_out_of_order_with_intact_framing() {
+            let mut h = Harness::new(2, true);
+            assert_eq!(*h.loads.lock().unwrap(), 2);
+            h.synth(1, "slow");
+            h.wait_started();
+            h.synth(2, "fast");
+            assert_eq!(h.pcm(2), vec![-0.5; 4096]);
+            h.release.store(true, Ordering::SeqCst);
+            assert_eq!(h.pcm(1), vec![0.25; 4096]);
+            h.shutdown();
+        }
+        #[test]
+        fn request_beyond_lanes_is_busy() {
+            let mut h = Harness::new(1, false);
+            h.synth(1, "slow");
+            h.wait_started();
+            h.synth(2, "fast");
+            let header = h.header();
+            assert_eq!(
+                (header.id, header.status, header.message.as_deref()),
+                (2, Status::Error, Some("busy"))
+            );
+            h.release.store(true, Ordering::SeqCst);
+            assert_eq!(h.pcm(1).len(), 4096);
+        }
+        #[test]
+        fn cancel_one_id_keeps_other_lane_result() {
+            let mut h = Harness::new(2, false);
+            h.synth(1, "slow");
+            h.wait_started();
+            h.synth(2, "fast");
+            h.raw(serde_json::json!({"type":"cancel","id":1}));
+            let mut cancelled = false;
+            let mut intact = false;
+            for _ in 0..2 {
+                let header = h.header();
+                if header.id == 1 {
+                    assert_eq!(header.status, Status::Cancelled);
+                    assert_eq!(header.samples, None);
+                    cancelled = true;
+                } else {
+                    assert_eq!(
+                        read_pcm_after_header(&mut h.output, header, 2)
+                            .unwrap()
+                            .samples,
+                        vec![-0.5; 4096]
+                    );
+                    intact = true;
+                }
+            }
+            assert!(cancelled && intact);
+        }
+        #[test]
+        fn set_lanes_lowers_and_rejects_raise() {
+            let mut h = Harness::new(2, false);
+            h.raw(serde_json::json!({"type":"set_lanes","lanes":1}));
+            assert_eq!(h.header().status, Status::Ready);
+            h.raw(serde_json::json!({"type":"set_lanes","lanes":2}));
+            assert_eq!(h.header().message.as_deref(), Some("invalid_lanes"));
+            h.synth(1, "slow");
+            h.wait_started();
+            h.synth(2, "fast");
+            assert_eq!(h.header().message.as_deref(), Some("busy"));
+            h.release.store(true, Ordering::SeqCst);
+            assert_eq!(h.pcm(1).len(), 4096);
+        }
+        #[test]
+        fn shutdown_with_lanes_in_flight_exits() {
+            let mut h = Harness::new(3, false);
+            h.synth(1, "slow");
+            h.wait_started();
+            h.synth(2, "slow");
+            h.synth(3, "slow");
+            let start = std::time::Instant::now();
+            h.shutdown();
+            assert!(start.elapsed() < Duration::from_secs(1));
+            let mut ids = std::collections::BTreeSet::new();
+            for _ in 0..3 {
+                let header = h.header();
+                assert!(ids.insert(header.id));
+                assert_eq!(header.status, Status::Cancelled);
+                assert_eq!(header.samples, None);
+            }
+            assert_eq!(ids, [1, 2, 3].into());
+        }
+    }
     #[test]
     fn pocket_engine_refuses_native_speed_other_than_one() {
         let mut calls = 0;
@@ -464,6 +832,7 @@ mod tests {
                     model_dir: "/fixture".into(),
                     voice: "fixture".into(),
                     threads: 4,
+                    lanes: 1,
                     device,
                     cache_dir: "/fixture/cache".into(),
                 },
@@ -502,6 +871,7 @@ mod tests {
                     model_dir: "/fixture/private-parent".into(),
                     voice: "missing-voice".into(),
                     threads: 4,
+                    lanes: 1,
                     device: handy_tts_core::device::Device::Cpu,
                     cache_dir: "/fixture/cache".into(),
                 },
@@ -649,6 +1019,7 @@ mod tests {
                     model_dir: "/fixture/model".into(),
                     voice: "alba".into(),
                     threads: 4,
+                    lanes: 1,
                     device: handy_tts_core::device::Device::Cpu,
                     cache_dir: "/fixture/cache".into(),
                 },
