@@ -436,8 +436,22 @@ pub fn continuity(
     let source = std::fs::read_to_string(corpus).context("read explicit continuity corpus")?;
     let mut cursor = TextCursor::new(&source, false)?;
     let mut pauses = Vec::new();
+    let long_document = source.split_whitespace().count() >= 2000;
+    let mut coverage_words = Vec::new();
+    let mut coverage_end = 0;
     while let Some(chunk) = cursor.next_chunk()? {
+        if !long_document || coverage_words.len() < 500 {
+            coverage_words.extend(handy_tts_core::coverage::normalize_words(&chunk.text));
+            coverage_end = pauses.len();
+        }
         pauses.push(chunk.pause_ms);
+    }
+    if long_document {
+        ensure!(
+            coverage_words.len() >= 500,
+            "long corpus needs 500 prepared words"
+        );
+        coverage_words.truncate(500);
     }
     let expected_chunks = pauses.len();
     ensure!(expected_chunks > 0, "continuity corpus contains no speech");
@@ -460,6 +474,7 @@ pub fn continuity(
         )
     });
     ensure!((1..=3).contains(&lanes), "continuity lanes must be 1 to 3");
+    let parent_before = stable_parent_samples()?;
     let began = Instant::now();
     let worker = ProcessWorker::start(id, root, device, cache, lanes)?;
     let load_seconds = began.elapsed().as_secs_f64();
@@ -550,7 +565,24 @@ pub fn continuity(
     let worker_peak = session.worker.peak_rss;
     let combined_growth = session.worker.combined_growth;
     let rss = session.worker.rss_samples.clone();
+    let worker_before = rss_mib(&std::fs::read_to_string(format!(
+        "/proc/{}/status",
+        session.worker.child.id()
+    ))?)?;
     session.worker.shutdown()?;
+    let worker_exited = session.worker.child.try_wait()?.is_some();
+    let parent_after = stable_parent_samples()?;
+    let cleanup =
+        cleanup_memory_record(&parent_before, &parent_after, worker_before, worker_exited);
+    let coverage_wav = if long_document && !options.startup_only {
+        let samples =
+            chunks.get(coverage_end).context("coverage chunk missing")?["finished_sample"]
+                .as_u64()
+                .context("coverage sample position missing")?;
+        write_coverage_prefix(options.wav, samples)?
+    } else {
+        options.wav.to_path_buf()
+    };
     let after = crate::runtime::memory_available().context("read MemAvailable after unload")?;
     let mut record = serde_json::json!({
         "schema_version": 1, "startup_only": options.startup_only, "model": id, "device": device, "speed": options.speed,
@@ -561,7 +593,12 @@ pub fn continuity(
         "underrun_samples": capture.feed.underrun_samples(),
         "head_start_seconds": capture.chunks.first().and_then(|r| r["started_seconds"].as_f64()), "load_seconds": load_seconds,
         "worker_peak_rss_mib": worker_peak, "combined_growth_mib": combined_growth,
-        "rss_samples": rss, "unload_delta_mib": (before as f64 - after as f64) / 1048576.0,
+        "rss_samples": rss, "cleanup": cleanup,
+        "mem_available_before_bytes": before, "mem_available_after_bytes": after,
+        "coverage_input": {"model": id, "device": device, "speed": options.speed,
+            "corpus": corpus, "scope": if long_document { "first_500_words" } else { "owner" },
+            "wav": coverage_wav, "source_wav": options.wav, "expected_words": coverage_words},
+        "unload_delta_mib": (before as f64 - after as f64) / 1048576.0,
         "median_rtf": median,
     });
     if let Some(directory) = options.gpu_inputs {
@@ -588,6 +625,52 @@ pub fn continuity(
         ensure!(pass, "continuity long-document gate failed");
     }
     Ok(())
+}
+
+fn stable_parent_samples() -> Result<Vec<f64>> {
+    let mut samples = Vec::new();
+    for _ in 0..3 {
+        samples.push(resident_memory()?);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(samples)
+}
+
+fn cleanup_memory_record(
+    before: &[f64],
+    after: &[f64],
+    worker: f64,
+    exited: bool,
+) -> serde_json::Value {
+    serde_json::json!({"worker_exited": exited, "worker_rss_before_mib": worker,
+        "worker_rss_after_mib": if exited { 0.0 } else { worker },
+        "parent_before_mib": before, "parent_after_mib": after})
+}
+
+fn write_coverage_prefix(source: &Path, samples: u64) -> Result<std::path::PathBuf> {
+    use std::io::{Read, Write};
+    let stem = source
+        .file_stem()
+        .context("coverage WAV stem missing")?
+        .to_string_lossy();
+    let path = source.with_file_name(format!("{stem}-first-500.wav"));
+    let mut input = std::fs::File::open(source).context("open delivered coverage WAV")?;
+    let mut header = [0; 44];
+    input.read_exact(&mut header)?;
+    ensure!(
+        &header[..4] == b"RIFF" && &header[36..40] == b"data",
+        "unexpected capture WAV header"
+    );
+    let bytes = u32::try_from(samples * 4).context("coverage WAV exceeds size limit")?;
+    header[4..8].copy_from_slice(&(bytes + 36).to_le_bytes());
+    header[40..44].copy_from_slice(&bytes.to_le_bytes());
+    let mut output = std::fs::File::create(&path).context("create delivered coverage prefix")?;
+    output.write_all(&header)?;
+    ensure!(
+        std::io::copy(&mut input.take(u64::from(bytes)), &mut output)? == u64::from(bytes),
+        "coverage prefix truncated"
+    );
+    Ok(path)
 }
 
 /// Explicit output and concurrency controls for a continuity measurement.
@@ -1593,5 +1676,51 @@ mod quiet_capture_tests {
         assert_eq!(state.chunks[0]["delivered"], 800);
         assert!(state.chunks[0]["gap_after_ms"].is_null());
         assert_eq!(state.feed.content_samples(), 1600);
+    }
+}
+
+#[cfg(test)]
+mod cleanup_measurement_tests {
+    use super::*;
+
+    #[test]
+    fn coverage_prefix_contains_only_delivered_samples_through_the_selected_chunk() {
+        use handy_tts_core::{feed::Segment, playback::segment::Output};
+        let scratch = std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap();
+        let directory = std::path::PathBuf::from(scratch)
+            .join(format!("s15-coverage-prefix-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("delivered.wav");
+        let mut output = CaptureOutput::new(8000, Some(&path)).unwrap();
+        output
+            .append(Segment {
+                epoch: 0,
+                index: 0,
+                speech: vec![0.5; 800],
+                pause: 0,
+            })
+            .unwrap();
+        let mut state = output.state.lock().unwrap();
+        state.terminal = true;
+        state.pull(800).unwrap();
+        state.finish_wav().unwrap();
+        let prefix = write_coverage_prefix(&path, 400).unwrap();
+        let source = std::fs::read(path).unwrap();
+        let bytes = std::fs::read(prefix).unwrap();
+        assert_eq!(bytes.len(), 44 + 400 * 4);
+        assert_eq!(&bytes[44..], &source[44..44 + 400 * 4]);
+        assert_eq!(u32::from_le_bytes(bytes[40..44].try_into().unwrap()), 1600);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn cleanup_uses_local_samples_and_reaped_worker_not_host_memory() {
+        let before = [50.0, 50.0, 50.0];
+        let after = [55.0, 55.0, 55.0];
+        let first = cleanup_memory_record(&before, &after, 100.0, true);
+        assert_eq!(first["worker_rss_after_mib"], 0.0);
+        assert_eq!(first["worker_exited"], true);
+        assert_eq!(first["parent_before_mib"], serde_json::json!(before));
+        assert_eq!(first["parent_after_mib"], serde_json::json!(after));
     }
 }

@@ -27,6 +27,9 @@ struct Args {
     /// Require the plain-prose calibration recall threshold of 0.95.
     #[arg(long)]
     calibration: bool,
+    /// Bind each non-calibration WAV to its continuity measurement.
+    #[arg(long, num_args = 1..)]
+    continuity: Vec<PathBuf>,
     /// Write a concatenated WAV: destination followed by two or more input WAVs.
     #[arg(long, num_args = 3..)]
     concat: Vec<PathBuf>,
@@ -34,6 +37,9 @@ struct Args {
 
 #[derive(Serialize)]
 struct Report {
+    binding: Option<serde_json::Value>,
+    calibration: bool,
+    expected_words: Vec<String>,
     wav: PathBuf,
     transcript: String,
     #[serde(flatten)]
@@ -182,6 +188,9 @@ fn coverage_report(
     let calibration_ok = !calibration || calibration_passes(&coverage);
     let passed = passes(&coverage, baseline) && anchors_ok && calibration_ok;
     Report {
+        binding: None,
+        calibration,
+        expected_words: expected.to_vec(),
         wav: path.to_path_buf(),
         transcript,
         coverage,
@@ -225,8 +234,47 @@ fn exit_status(reports: &[Report]) -> u8 {
     }
 }
 
+fn coverage_binding(
+    paths: &[PathBuf],
+    wav: &Path,
+    expected: &[String],
+) -> Result<Option<serde_json::Value>> {
+    if paths.is_empty() {
+        return Ok(None);
+    }
+    let mut matched = Vec::new();
+    for path in paths {
+        let record: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+        let binding = &record["coverage_input"];
+        if binding["wav"].as_str() == wav.to_str() {
+            for key in ["model", "device", "speed", "corpus"] {
+                anyhow::ensure!(
+                    binding[key] == record[key],
+                    "coverage run metadata mismatch: {key}"
+                );
+            }
+            anyhow::ensure!(
+                binding["source_wav"] == record["wav"],
+                "coverage source WAV mismatch"
+            );
+            let words: Vec<String> = serde_json::from_value(binding["expected_words"].clone())?;
+            anyhow::ensure!(words == expected, "coverage expected text mismatch");
+            matched.push(binding.clone());
+        }
+    }
+    anyhow::ensure!(
+        matched.len() == 1,
+        "each coverage WAV needs exactly one continuity record"
+    );
+    Ok(matched.pop())
+}
+
 fn main() -> Result<ExitCode> {
     let args = Args::parse();
+    anyhow::ensure!(
+        !args.calibration || args.continuity.is_empty(),
+        "calibration cannot bind a continuity run"
+    );
     concatenate(&args.concat)?;
     let source = std::fs::read_to_string(&args.expected)
         .with_context(|| format!("read expected text {}", args.expected.display()))?;
@@ -248,12 +296,13 @@ fn main() -> Result<ExitCode> {
     transcribe_cpp::init_backends_default().context("initialize ASR backends")?;
     let mut reports: Vec<Report> = Vec::new();
     for path in &args.wav {
+        let binding = coverage_binding(&args.continuity, path, &expected)?;
         let (rate, pcm) = read_wav(path)?;
         let pcm = resample(rate, &pcm)?;
         let transcript = transcribe_cpp::transcribe(&args.model, &pcm, &RunOptions::default())
             .with_context(|| format!("transcribe {}", path.display()))?
             .text;
-        let report = append_report(
+        append_report(
             &mut reports,
             &expected,
             path,
@@ -261,6 +310,8 @@ fn main() -> Result<ExitCode> {
             &anchor_refs,
             args.calibration,
         );
+        let report = reports.last_mut().context("coverage report missing")?;
+        report.binding = binding;
         println!(
             "{}: recall={:.6} longest_missing_run={} longest_missing_loss_run={} anchors_ok={} calibration_ok={} passed={}",
             report.wav.display(),
@@ -281,6 +332,31 @@ fn main() -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_binding_rejects_wrong_text_identity_and_duplicate_records() {
+        let scratch = std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap();
+        let directory = tempfile::tempdir_in(scratch).unwrap();
+        let path = directory.path().join("run.json");
+        let wav = directory.path().join("delivered.wav");
+        let words = vec!["alpha".to_string(), "beta".to_string()];
+        let binding = serde_json::json!({"model":"pocket-en","device":"cpu","speed":2.0,
+            "corpus":"/fixture/owner.txt","wav":wav,"source_wav":wav,"scope":"owner",
+            "expected_words":words});
+        let mut record = binding.clone();
+        record["coverage_input"] = binding.clone();
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert_eq!(
+            coverage_binding(std::slice::from_ref(&path), &wav, &words).unwrap(),
+            Some(binding)
+        );
+        assert!(coverage_binding(&[path.clone(), path.clone()], &wav, &words).is_err());
+        assert!(coverage_binding(std::slice::from_ref(&path), &wav, &["wrong".into()]).is_err());
+        record["model"] = "kokoro-82m-int8".into();
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(coverage_binding(std::slice::from_ref(&path), &wav, &words).is_err());
+        assert!(coverage_binding(&[path], &directory.path().join("other.wav"), &words).is_err());
+    }
 
     fn wav_fixture<T: hound::Sample + Copy>(
         spec: hound::WavSpec,
