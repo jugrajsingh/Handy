@@ -126,6 +126,8 @@ pub(crate) fn synthesize_bounded(
     Ok(samples)
 }
 
+const CONTROL_CAPACITY: usize = 8;
+
 type CancelFlags = Arc<std::sync::Mutex<std::collections::HashMap<u64, Arc<AtomicBool>>>>;
 
 struct Job {
@@ -137,12 +139,12 @@ struct Job {
 enum Event {
     Control(Request, Option<Arc<AtomicBool>>),
     Duplicate(u64),
-    Finished(usize, u64, Result<()>),
+    Finished(Result<()>),
     ReaderFailed(anyhow::Error),
 }
 struct Lane {
     sender: Option<mpsc::SyncSender<Job>>,
-    busy: bool,
+    busy: Arc<AtomicBool>,
 }
 
 fn cancel_all(flags: &CancelFlags) {
@@ -181,10 +183,12 @@ fn chunk_reply(
     id: u64,
     cancel: &AtomicBool,
     result: Result<(u32, Vec<f32>)>,
+    completed: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
     let mut writer = writer
         .lock()
         .map_err(|_| anyhow::anyhow!("reply writer poisoned"))?;
+    completed()?;
     let mut header = Header {
         device: None,
         placement: None,
@@ -215,6 +219,41 @@ fn chunk_reply(
     write_reply(&mut *writer, &header, &pcm).context("write chunk reply")
 }
 
+fn lane_loop(
+    mut engine: Box<dyn SynthEngine>,
+    jobs: mpsc::Receiver<Job>,
+    writer: &std::sync::Mutex<impl Write>,
+    flags: &CancelFlags,
+    busy: &AtomicBool,
+    tx: &mpsc::SyncSender<Event>,
+) {
+    for job in jobs {
+        let result = (|| {
+            let samples = synthesize_bounded(engine.as_mut(), &job.text, job.speed, &job.cancel)?;
+            ensure!(
+                !samples.is_empty()
+                    && samples.len() <= handy_tts_core::protocol::MAX_SAMPLES
+                    && samples.iter().all(|v| v.is_finite()),
+                "invalid PCM"
+            );
+            ensure!(
+                (8000..=48000).contains(&engine.sample_rate()),
+                "invalid sample rate"
+            );
+            Ok((engine.sample_rate(), samples))
+        })();
+        let result = chunk_reply(writer, job.id, &job.cancel, result, || {
+            let mut flags = flags
+                .lock()
+                .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?;
+            flags.remove(&job.id);
+            busy.store(false, Ordering::SeqCst);
+            Ok(())
+        });
+        let _ = tx.send(Event::Finished(result));
+    }
+}
+
 /// Dispatches bounded concurrent syntheses with independent cancellation and framed replies.
 pub fn run(
     reader: impl BufRead + Send + 'static,
@@ -230,7 +269,7 @@ pub fn run(
 ) -> Result<()> {
     let writer = std::sync::Mutex::new(writer);
     let flags: CancelFlags = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let (tx, rx) = mpsc::sync_channel::<Event>(8);
+    let (tx, rx) = mpsc::sync_channel::<Event>(CONTROL_CAPACITY);
     let reader_flags = flags.clone();
     let reader_tx = tx.clone();
     let controls = std::thread::Builder::new()
@@ -308,14 +347,7 @@ pub fn run(
                 match event {
                     Event::ReaderFailed(error) => return Err(error),
                     Event::Duplicate(id) => error_reply(&writer, id, "busy")?,
-                    Event::Finished(index, id, result) => {
-                        lanes[index].busy = false;
-                        flags
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?
-                            .remove(&id);
-                        result?;
-                    }
+                    Event::Finished(result) => result?,
                     Event::Control(
                         Request::Load {
                             model_dir,
@@ -327,7 +359,7 @@ pub fn run(
                         },
                         _,
                     ) => {
-                        if lanes.iter().any(|lane| lane.busy) {
+                        if lanes.iter().any(|lane| lane.busy.load(Ordering::SeqCst)) {
                             error_reply(&writer, 0, "busy")?;
                             continue;
                         }
@@ -349,28 +381,29 @@ pub fn run(
                             Ok(engines) => {
                                 let actual_device = engines[0].device();
                                 let actual_placement = engines[0].placement();
-                                for (index, mut engine) in engines.into_iter().enumerate() {
+                                for (index, engine) in engines.into_iter().enumerate() {
                                     let (sender, jobs) = mpsc::sync_channel::<Job>(1);
                                     let writer = &writer;
                                     let tx = tx.clone();
-                                    std::thread::Builder::new().name(format!("tts-lane-{index}"))
+                                    let flags = flags.clone();
+                                    let busy = Arc::new(AtomicBool::new(false));
+                                    let worker_busy = busy.clone();
+                                    std::thread::Builder::new()
+                                        .name(format!("tts-lane-{index}"))
                                         .spawn_scoped(scope, move || {
-                                            for job in jobs {
-                                                let result = (|| {
-                                                    let samples = synthesize_bounded(engine.as_mut(), &job.text, job.speed, &job.cancel)?;
-                                                    ensure!(!samples.is_empty()
-                                                        && samples.len() <= handy_tts_core::protocol::MAX_SAMPLES
-                                                        && samples.iter().all(|v| v.is_finite()), "invalid PCM");
-                                                    ensure!((8000..=48000).contains(&engine.sample_rate()), "invalid sample rate");
-                                                    Ok((engine.sample_rate(), samples))
-                                                })();
-                                                let result = chunk_reply(writer, job.id, &job.cancel, result);
-                                                if tx.send(Event::Finished(index, job.id, result)).is_err() { break; }
-                                            }
-                                        }).context("start synthesis lane")?;
+                                            lane_loop(
+                                                engine,
+                                                jobs,
+                                                writer,
+                                                &flags,
+                                                &worker_busy,
+                                                &tx,
+                                            );
+                                        })
+                                        .context("start synthesis lane")?;
                                     lanes.push(Lane {
                                         sender: Some(sender),
-                                        busy: false,
+                                        busy,
                                     });
                                 }
                                 active_lanes = count;
@@ -438,31 +471,42 @@ pub fn run(
                             Ok(())
                         })();
                         if let Err(error) = valid {
-                            chunk_reply(&writer, id, &cancel, Err(error))?;
+                            chunk_reply(&writer, id, &cancel, Err(error), || Ok(()))?;
                             flags
                                 .lock()
                                 .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?
                                 .remove(&id);
-                        } else if let Some(lane) =
-                            lanes[..active_lanes].iter_mut().find(|lane| !lane.busy)
-                        {
-                            lane.sender
-                                .as_ref()
-                                .context("lane was released")?
-                                .send(Job {
-                                    id,
-                                    text,
-                                    speed,
-                                    cancel,
-                                })
-                                .context("dispatch synthesis")?;
-                            lane.busy = true;
                         } else {
-                            error_reply(&writer, id, "busy")?;
-                            flags
-                                .lock()
-                                .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?
-                                .remove(&id);
+                            let in_flight = lanes
+                                .iter()
+                                .filter(|lane| lane.busy.load(Ordering::SeqCst))
+                                .count();
+                            let available = if in_flight < active_lanes {
+                                lanes[..active_lanes]
+                                    .iter_mut()
+                                    .find(|lane| !lane.busy.load(Ordering::SeqCst))
+                            } else {
+                                None
+                            };
+                            if let Some(lane) = available {
+                                lane.busy.store(true, Ordering::SeqCst);
+                                lane.sender
+                                    .as_ref()
+                                    .context("lane was released")?
+                                    .send(Job {
+                                        id,
+                                        text,
+                                        speed,
+                                        cancel,
+                                    })
+                                    .context("dispatch synthesis")?;
+                            } else {
+                                error_reply(&writer, id, "busy")?;
+                                flags
+                                    .lock()
+                                    .map_err(|_| anyhow::anyhow!("cancel flags poisoned"))?
+                                    .remove(&id);
+                            }
                         }
                     }
                     Event::Control(Request::Shutdown, _) => break,
@@ -697,6 +741,529 @@ mod tests {
                     let _ = self.thread.take().unwrap().join();
                 }
             }
+        }
+        mod coordinated {
+            use super::*;
+            use std::collections::BTreeSet;
+            use std::sync::Condvar;
+
+            #[derive(Default)]
+            pub struct Trace {
+                pub calls: Vec<(usize, u64)>,
+                pub released: BTreeSet<u64>,
+                pub dropped: BTreeSet<usize>,
+            }
+            #[derive(Default)]
+            pub struct State {
+                pub trace: Mutex<Trace>,
+                changed: Condvar,
+            }
+            impl State {
+                pub fn wait(&self, predicate: impl Fn(&Trace) -> bool, message: &str) {
+                    let trace = self.trace.lock().unwrap();
+                    let (trace, timeout) = self
+                        .changed
+                        .wait_timeout_while(trace, Duration::from_secs(3), |trace| {
+                            !predicate(trace)
+                        })
+                        .unwrap();
+                    let satisfied = !timeout.timed_out() || predicate(&trace);
+                    drop(trace);
+                    assert!(satisfied, "{message}");
+                }
+                pub fn release(&self, id: u64) {
+                    self.trace.lock().unwrap().released.insert(id);
+                    self.changed.notify_all();
+                }
+            }
+            struct Engine {
+                lane: usize,
+                state: Arc<State>,
+            }
+            impl Drop for Engine {
+                fn drop(&mut self) {
+                    self.state.trace.lock().unwrap().dropped.insert(self.lane);
+                    self.state.changed.notify_all();
+                }
+            }
+            impl SynthEngine for Engine {
+                fn synthesize(
+                    &mut self,
+                    text: &str,
+                    _: Option<f32>,
+                    cancelled: &AtomicBool,
+                ) -> Result<Vec<f32>> {
+                    let id: u64 = text.parse()?;
+                    let mut trace = self.state.trace.lock().unwrap();
+                    trace.calls.push((self.lane, id));
+                    self.state.changed.notify_all();
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while !trace.released.contains(&id) && !cancelled.load(Ordering::SeqCst) {
+                        ensure!(
+                            std::time::Instant::now() < deadline,
+                            "fixture engine deadline"
+                        );
+                        trace = self
+                            .state
+                            .changed
+                            .wait_timeout(trace, Duration::from_millis(10))
+                            .unwrap()
+                            .0;
+                    }
+                    ensure!(!cancelled.load(Ordering::SeqCst), "cancelled");
+                    Ok(vec![id as f32; 32])
+                }
+                fn sample_rate(&self) -> u32 {
+                    24000
+                }
+            }
+            type Accepted = Arc<(Mutex<usize>, Condvar)>;
+            struct ObservedReader {
+                reader: BufReader<UnixStream>,
+                consumed: usize,
+                accepted: Accepted,
+            }
+            impl Read for ObservedReader {
+                fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                    self.reader.read(bytes)
+                }
+            }
+            impl BufRead for ObservedReader {
+                fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+                    *self.accepted.0.lock().unwrap() = self.consumed;
+                    self.accepted.1.notify_all();
+                    self.reader.fill_buf()
+                }
+                fn consume(&mut self, amount: usize) {
+                    self.consumed += self.reader.buffer()[..amount]
+                        .iter()
+                        .filter(|byte| **byte == b'\n')
+                        .count();
+                    self.reader.consume(amount);
+                }
+            }
+            struct CoordinatedWriter {
+                stream: UnixStream,
+                flushes: usize,
+                hold: Option<(usize, usize)>,
+                accepted: Accepted,
+            }
+            impl Write for CoordinatedWriter {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.stream.write(bytes)
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    self.stream.flush()?;
+                    self.flushes += 1;
+                    if let Some((flush, lines)) = self.hold
+                        && self.flushes == flush
+                    {
+                        let accepted = self.accepted.0.lock().unwrap();
+                        let (accepted, timeout) = self
+                            .accepted
+                            .1
+                            .wait_timeout_while(accepted, Duration::from_secs(3), |count| {
+                                *count < lines
+                            })
+                            .unwrap();
+                        if timeout.timed_out() && *accepted < lines {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::TimedOut,
+                                "reader did not accept coordinated control",
+                            ));
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            pub struct Fixture {
+                pub state: Arc<State>,
+                input: Option<UnixStream>,
+                pub output: BufReader<UnixStream>,
+                thread: Option<std::thread::JoinHandle<()>>,
+                exited: mpsc::Receiver<Result<()>>,
+                accepted: Accepted,
+            }
+            impl Fixture {
+                pub fn new(lanes: usize, hold: Option<(usize, usize)>) -> Self {
+                    let (input, reader) = UnixStream::pair().unwrap();
+                    let (output, stream) = UnixStream::pair().unwrap();
+                    output
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let state = Arc::new(State::default());
+                    let worker_state = state.clone();
+                    let accepted: Accepted = Arc::new((Mutex::new(0), Condvar::new()));
+                    let reader_accepted = accepted.clone();
+                    let writer_accepted = accepted.clone();
+                    let (done, exited) = mpsc::channel();
+                    let thread = std::thread::spawn(move || {
+                        let mut next_lane = 0;
+                        let result = run(
+                            ObservedReader {
+                                reader: BufReader::new(reader),
+                                consumed: 0,
+                                accepted: reader_accepted,
+                            },
+                            CoordinatedWriter {
+                                stream,
+                                flushes: 0,
+                                hold,
+                                accepted: writer_accepted,
+                            },
+                            |_, _, _, _, _| {
+                                let lane = next_lane;
+                                next_lane += 1;
+                                Ok(Box::new(Engine {
+                                    lane,
+                                    state: worker_state.clone(),
+                                }))
+                            },
+                            || Ok(u64::MAX),
+                        );
+                        let _ = done.send(result);
+                    });
+                    let mut fixture = Self {
+                        state,
+                        input: Some(input),
+                        output: BufReader::new(output),
+                        thread: Some(thread),
+                        exited,
+                        accepted,
+                    };
+                    fixture.raw(serde_json::json!({"type":"load","model_dir":"fixture","voice":"alba","threads":4,"lanes":lanes}));
+                    assert_eq!(fixture.header().status, Status::Ready);
+                    fixture
+                }
+                pub fn raw(&mut self, request: serde_json::Value) {
+                    writeln!(self.input.as_mut().unwrap(), "{request}").unwrap();
+                }
+                pub fn synth(&mut self, id: u64) {
+                    self.raw(
+                        serde_json::json!({"type":"synthesize","id":id,"text":id.to_string()}),
+                    );
+                }
+                pub fn header(&mut self) -> Header {
+                    read_header(&mut self.output).unwrap()
+                }
+                pub fn pcm(&mut self, id: u64) {
+                    let header = self.header();
+                    assert_eq!(
+                        header.status,
+                        Status::Ok,
+                        "completed request must leave admission capacity available"
+                    );
+                    assert_eq!(
+                        read_pcm_after_header(&mut self.output, header, id)
+                            .unwrap()
+                            .samples,
+                        vec![id as f32; 32]
+                    );
+                }
+                pub fn started(&self, id: u64) {
+                    self.state.wait(
+                        |trace| trace.calls.iter().any(|(_, called)| *called == id),
+                        "engine request did not start",
+                    );
+                }
+                pub fn close_input(&mut self) {
+                    self.input
+                        .take()
+                        .unwrap()
+                        .shutdown(std::net::Shutdown::Write)
+                        .unwrap();
+                }
+                pub fn finish(&mut self) {
+                    let result = self.exited.recv_timeout(Duration::from_secs(3));
+                    assert!(
+                        result.is_ok(),
+                        "runtime did not exit within the EOF/shutdown deadline"
+                    );
+                    result.unwrap().unwrap();
+                    self.thread.take().unwrap().join().unwrap();
+                }
+                pub fn shutdown(&mut self) {
+                    self.raw(serde_json::json!({"type":"shutdown"}));
+                    self.finish();
+                }
+            }
+            impl Drop for Fixture {
+                fn drop(&mut self) {
+                    if let Some(mut input) = self.input.take() {
+                        let _ = writeln!(input, "{}", serde_json::json!({"type":"shutdown"}));
+                        let _ = input.shutdown(std::net::Shutdown::Write);
+                    }
+                    let _ = self.output.get_ref().shutdown(std::net::Shutdown::Both);
+                    self.state.trace.lock().unwrap().released.extend(1..=10);
+                    self.state.changed.notify_all();
+                    *self.accepted.0.lock().unwrap() = usize::MAX;
+                    self.accepted.1.notify_all();
+                    if let Some(thread) = self.thread.take()
+                        && (self.exited.recv_timeout(Duration::from_secs(3)).is_ok()
+                            || thread.is_finished())
+                    {
+                        thread.join().unwrap();
+                    }
+                }
+            }
+        }
+        #[test]
+        fn closed_dispatcher_still_replies_to_every_accepted_job() {
+            struct HeldReply {
+                bytes: Arc<Mutex<Vec<u8>>>,
+                published: mpsc::Sender<()>,
+                resume: mpsc::Receiver<()>,
+                first: bool,
+            }
+            impl Write for HeldReply {
+                fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                    self.bytes.lock().unwrap().extend_from_slice(bytes);
+                    Ok(bytes.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    if self.first {
+                        self.first = false;
+                        self.published.send(()).unwrap();
+                        self.resume.recv_timeout(Duration::from_secs(3)).unwrap();
+                    }
+                    Ok(())
+                }
+            }
+            let (jobs, receiver) = mpsc::sync_channel(1);
+            let (events, dispatcher) = mpsc::sync_channel(8);
+            let (published, publication) = mpsc::channel();
+            let (resume, resume_reply) = mpsc::channel();
+            let (done, exited) = mpsc::channel();
+            let bytes = Arc::new(Mutex::new(Vec::new()));
+            let writer = Mutex::new(HeldReply {
+                bytes: bytes.clone(),
+                published,
+                resume: resume_reply,
+                first: true,
+            });
+            let cancelled = Arc::new(AtomicBool::new(true));
+            let flags: CancelFlags = Arc::new(Mutex::new(
+                [(1, cancelled.clone()), (2, cancelled.clone())].into(),
+            ));
+            let busy = Arc::new(AtomicBool::new(true));
+            jobs.send(Job {
+                id: 1,
+                text: "slow".into(),
+                speed: None,
+                cancel: cancelled.clone(),
+            })
+            .unwrap();
+            let worker_busy = busy.clone();
+            let worker = std::thread::spawn(move || {
+                lane_loop(
+                    Box::new(Scripted {
+                        release: Arc::new(AtomicBool::new(false)),
+                        started: Arc::new(AtomicBool::new(false)),
+                    }),
+                    receiver,
+                    &writer,
+                    &flags,
+                    &worker_busy,
+                    &events,
+                );
+                done.send(()).unwrap();
+            });
+            publication.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(!busy.load(Ordering::SeqCst));
+            busy.store(true, Ordering::SeqCst);
+            jobs.send(Job {
+                id: 2,
+                text: "slow".into(),
+                speed: None,
+                cancel: cancelled,
+            })
+            .unwrap();
+            drop(jobs);
+            drop(dispatcher);
+            resume.send(()).unwrap();
+            exited.recv_timeout(Duration::from_secs(3)).unwrap();
+            worker.join().unwrap();
+            let mut replies = std::io::Cursor::new(bytes.lock().unwrap().clone());
+            for id in 1..=2 {
+                let header = read_header(&mut replies).unwrap();
+                assert_eq!(
+                    (header.id, header.status, header.samples),
+                    (id, Status::Cancelled, None)
+                );
+            }
+            assert_eq!(replies.position() as usize, replies.get_ref().len());
+        }
+        #[test]
+        fn next_request_after_complete_reply_is_not_busy() {
+            let mut h = coordinated::Fixture::new(1, Some((2, 3 + CONTROL_CAPACITY)));
+            h.state.release(1);
+            h.state.release(2);
+            h.synth(1);
+            h.pcm(1);
+            h.synth(2);
+            for _ in 0..CONTROL_CAPACITY {
+                h.raw(serde_json::json!({"type":"set_lanes","lanes":1}));
+            }
+            let mut completed = false;
+            let mut acknowledged = 0;
+            for _ in 0..=CONTROL_CAPACITY {
+                let header = h.header();
+                assert_ne!(
+                    header.message.as_deref(),
+                    Some("busy"),
+                    "completed request must leave admission capacity available"
+                );
+                if header.id == 2 {
+                    assert!(!completed);
+                    assert_eq!(
+                        read_pcm_after_header(&mut h.output, header, 2)
+                            .unwrap()
+                            .samples,
+                        vec![2.0; 32]
+                    );
+                    completed = true;
+                } else {
+                    assert_eq!((header.id, header.status), (0, Status::Ready));
+                    acknowledged += 1;
+                }
+            }
+            assert!(completed);
+            assert_eq!(acknowledged, CONTROL_CAPACITY);
+            assert_eq!(h.state.trace.lock().unwrap().calls, [(0, 1), (0, 2)]);
+            h.shutdown();
+        }
+        #[test]
+        fn next_load_after_complete_reply_is_not_busy() {
+            let mut h = coordinated::Fixture::new(1, Some((2, 3 + CONTROL_CAPACITY)));
+            h.state.release(1);
+            h.synth(1);
+            h.pcm(1);
+            h.raw(serde_json::json!({"type":"load","model_dir":"fixture","voice":"alba","threads":4,"lanes":1}));
+            for _ in 0..CONTROL_CAPACITY {
+                h.raw(serde_json::json!({"type":"set_lanes","lanes":1}));
+            }
+            for _ in 0..=CONTROL_CAPACITY {
+                let header = h.header();
+                assert_eq!(
+                    (header.id, header.status),
+                    (0, Status::Ready),
+                    "completed request must allow reloading"
+                );
+            }
+            h.state.wait(
+                |trace| trace.dropped.contains(&0),
+                "reloaded engine was retained",
+            );
+            h.state.release(2);
+            h.synth(2);
+            h.pcm(2);
+            assert_eq!(h.state.trace.lock().unwrap().calls, [(0, 1), (1, 2)]);
+            h.shutdown();
+        }
+        #[test]
+        fn lowering_busy_lanes_blocks_new_work_until_retired_jobs_finish() {
+            let mut h = coordinated::Fixture::new(2, None);
+            h.synth(1);
+            h.started(1);
+            h.synth(2);
+            h.started(2);
+            h.state.release(1);
+            h.pcm(1);
+            h.raw(serde_json::json!({"type":"set_lanes","lanes":1}));
+            assert_eq!(h.header().status, Status::Ready);
+            h.state.release(3);
+            h.synth(3);
+            let header = h.header();
+            assert_eq!(
+                (header.id, header.status, header.message.as_deref()),
+                (3, Status::Error, Some("busy"))
+            );
+            assert_eq!(h.state.trace.lock().unwrap().calls, [(0, 1), (1, 2)]);
+            h.state.release(2);
+            h.pcm(2);
+            h.state.release(4);
+            h.synth(4);
+            h.pcm(4);
+            assert_eq!(
+                h.state.trace.lock().unwrap().calls,
+                [(0, 1), (1, 2), (0, 4)]
+            );
+            h.shutdown();
+        }
+        #[test]
+        fn lowering_lanes_releases_idle_and_drained_engines_before_shutdown() {
+            for busy in [false, true] {
+                let mut h = coordinated::Fixture::new(2, None);
+                if busy {
+                    h.synth(1);
+                    h.started(1);
+                    h.synth(2);
+                    h.started(2);
+                }
+                h.raw(serde_json::json!({"type":"set_lanes","lanes":1}));
+                assert_eq!(h.header().status, Status::Ready);
+                if busy {
+                    assert!(h.state.trace.lock().unwrap().dropped.is_empty());
+                    h.state.release(2);
+                    h.pcm(2);
+                }
+                h.state.wait(
+                    |trace| trace.dropped.contains(&1),
+                    "retired engine was retained before shutdown",
+                );
+                assert!(!h.state.trace.lock().unwrap().dropped.contains(&0));
+                if busy {
+                    h.state.release(1);
+                    h.pcm(1);
+                }
+                h.shutdown();
+                assert_eq!(h.state.trace.lock().unwrap().dropped, [0, 1].into());
+            }
+        }
+        #[test]
+        fn eof_with_busy_lanes_cancels_and_exits() {
+            let mut h = coordinated::Fixture::new(3, None);
+            for id in 1..=3 {
+                h.synth(id);
+                h.started(id);
+            }
+            h.close_input();
+            let mut ids = std::collections::BTreeSet::new();
+            for _ in 0..3 {
+                let header = h.header();
+                assert_eq!(header.status, Status::Cancelled);
+                assert_eq!(header.samples, None);
+                assert!(ids.insert(header.id));
+            }
+            assert_eq!(ids, [1, 2, 3].into());
+            h.finish();
+            assert_eq!(h.state.trace.lock().unwrap().dropped, [0, 1, 2].into());
+        }
+        #[test]
+        fn cancellation_before_lane_start_never_calls_engine() {
+            let mut h = coordinated::Fixture::new(1, Some((1, 4)));
+            h.synth(1);
+            h.raw(serde_json::json!({"type":"cancel","id":1}));
+            h.raw(serde_json::json!({"type":"set_lanes","lanes":1}));
+            let mut cancelled = false;
+            let mut ready = false;
+            for _ in 0..2 {
+                let header = h.header();
+                match header.status {
+                    Status::Cancelled => {
+                        assert_eq!(header.id, 1);
+                        cancelled = true;
+                    }
+                    Status::Ready => {
+                        assert_eq!(header.id, 0);
+                        ready = true;
+                    }
+                    other => panic!("unexpected pre-start reply {other:?}"),
+                }
+            }
+            assert!(cancelled && ready);
+            assert!(h.state.trace.lock().unwrap().calls.is_empty());
+            h.shutdown();
         }
         #[test]
         fn two_lanes_reply_out_of_order_with_intact_framing() {
