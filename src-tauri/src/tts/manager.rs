@@ -43,14 +43,16 @@ pub struct ManagerSnapshot {
     pub ready: Option<WorkerReady>,
     pub fallback_from: Option<Device>,
 }
-struct Checks {
-    memory: fn() -> Result<u64, TtsError>,
-    downloaded: fn(&Path, &catalog::ModelEntry) -> bool,
+pub(super) struct Checks {
+    pub(super) memory: fn() -> Result<u64, TtsError>,
+    pub(super) downloaded: fn(&Path, &catalog::ModelEntry) -> bool,
 }
 struct Inner<B: Transport> {
     backend: B,
     lifecycle: Lifecycle,
     key: Option<WorkerKey>,
+    generation: u64,
+    loaded_lanes: usize,
     config: ManagerConfig,
     last_failure: Option<(Instant, TtsError)>,
 }
@@ -66,7 +68,10 @@ pub struct TtsManager<B: Transport = WorkerBackend> {
     checks: Checks,
     started: Instant,
     cached: Mutex<ManagerSnapshot>,
-    cancelled_id: std::sync::atomic::AtomicU64,
+    cancelled_ids: Mutex<std::collections::BTreeSet<u64>>,
+    lanes: std::sync::atomic::AtomicUsize,
+    low_memory: std::sync::atomic::AtomicBool,
+    requests: std::sync::atomic::AtomicUsize,
     interruption: AtomicU64,
     activity: AtomicU64,
     invalid: Arc<Mutex<BTreeMap<String, Vec<Device>>>>,
@@ -90,7 +95,7 @@ impl TtsManager {
     }
 }
 impl<B: Transport> TtsManager<B> {
-    fn with_backend(
+    pub(super) fn with_backend(
         config: ManagerConfig,
         backend: B,
         checks: Checks,
@@ -118,6 +123,8 @@ impl<B: Transport> TtsManager<B> {
                 backend,
                 lifecycle: Lifecycle::default(),
                 key: None,
+                generation: 0,
+                loaded_lanes: 1,
                 config,
                 last_failure: None,
             }),
@@ -127,7 +134,10 @@ impl<B: Transport> TtsManager<B> {
             status_changed: Mutex::new(None),
             checks,
             started: Instant::now(),
-            cancelled_id: std::sync::atomic::AtomicU64::new(0),
+            cancelled_ids: Mutex::default(),
+            lanes: std::sync::atomic::AtomicUsize::new(1),
+            low_memory: std::sync::atomic::AtomicBool::new(false),
+            requests: std::sync::atomic::AtomicUsize::new(0),
             interruption: AtomicU64::new(0),
             activity: AtomicU64::new(0),
             invalid,
@@ -231,9 +241,35 @@ impl<B: Transport> TtsManager<B> {
     }
     pub fn cancel(&self, id: u64) {
         self.activity.fetch_add(1, Ordering::AcqRel);
-        self.cancelled_id
-            .store(id, std::sync::atomic::Ordering::Release);
+        self.cancelled_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id);
         self.control.cancel(id);
+    }
+    fn cancelled(&self, id: u64) -> bool {
+        self.cancelled_ids
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&id)
+    }
+    pub(super) fn available_lanes(&self) -> usize {
+        self.lanes.load(Ordering::Acquire)
+    }
+    pub(super) fn lower_lanes(&self) {
+        self.low_memory.store(true, Ordering::Release);
+        if self.lanes.swap(1, Ordering::AcqRel) > 1 {
+            let mut inner = match self.inner.try_lock() {
+                Ok(inner) => inner,
+                Err(TryLockError::Poisoned(error)) => error.into_inner(),
+                Err(TryLockError::WouldBlock) => return,
+            };
+            if inner.backend.set_lanes(1).is_err() {
+                self.control.kill();
+            } else {
+                inner.loaded_lanes = 1;
+            }
+        }
     }
     pub fn interrupt(&self) {
         self.interruption.fetch_add(1, Ordering::AcqRel);
@@ -247,6 +283,8 @@ impl<B: Transport> TtsManager<B> {
         inner.lifecycle.stopping();
         self.publish(State::Stopping, Preparation::Idle);
         inner.backend.stop();
+        self.lanes.store(1, Ordering::Release);
+        self.low_memory.store(false, Ordering::Release);
         inner.key = None;
         inner.lifecycle.stopped();
         if failed {
@@ -320,6 +358,10 @@ impl<B: Transport> TtsManager<B> {
                 && key.voice == selection.voice
                 && inner.backend.alive()
             {
+                if self.low_memory.load(Ordering::Acquire) && inner.loaded_lanes > 1 {
+                    inner.backend.set_lanes(1)?;
+                    inner.loaded_lanes = 1;
+                }
                 inner.lifecycle.touch(self.started.elapsed());
                 self.wake_idle();
                 if interrupted() {
@@ -384,6 +426,26 @@ impl<B: Transport> TtsManager<B> {
             let root = config.root.join(entry.id);
             let cache = config.cache.join(entry.id).join(format!("{device:?}"));
             log::info!("TTS worker starting: {} on {device:?}", entry.id);
+            let bytes = |value: Option<f64>| {
+                value
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .map(|v| (v * 1024.0 * 1024.0) as u64)
+            };
+            let sizing = &rating
+                .devices
+                .get(&device)
+                .ok_or(DeviceError::InvalidRatings)?
+                .lanes;
+            let lanes = if self.low_memory.load(Ordering::Acquire) {
+                1
+            } else if let (Some(base), Some(lane)) =
+                (bytes(sizing.base_rss_mib), bytes(sizing.lane_rss_mib))
+            {
+                handy_tts_core::memory::lanes_for(available, base, lane, sizing.best_lanes)
+            } else {
+                1
+            };
+            inner.generation = inner.generation.wrapping_add(1);
             let result = inner.backend.start(&LoadSpec {
                 binary: &config.binary,
                 root: &root,
@@ -392,6 +454,7 @@ impl<B: Transport> TtsManager<B> {
                 device,
                 cache: &cache,
                 home: &config.home,
+                lanes,
             });
             if interrupted() && (discard_cancelled_ready || result.is_err()) {
                 inner.backend.stop();
@@ -421,6 +484,16 @@ impl<B: Transport> TtsManager<B> {
                     return Err(TtsError::Memory);
                 }
                 Ok(ready) if ready.device == device && !ready.placement.is_empty() => {
+                    let active_lanes = if self.low_memory.load(Ordering::Acquire) {
+                        1
+                    } else {
+                        lanes
+                    };
+                    if active_lanes < lanes {
+                        inner.backend.set_lanes(active_lanes)?;
+                    }
+                    inner.loaded_lanes = active_lanes;
+                    self.lanes.store(active_lanes, Ordering::Release);
                     log::info!("TTS worker ready: {} on {device:?}", entry.id);
                     inner.lifecycle.ready(self.started.elapsed());
                     inner.key = Some(WorkerKey {
@@ -494,16 +567,25 @@ impl<B: Transport> TtsManager<B> {
     }
     pub fn synthesize(&self, selection: &Selection, id: u64, text: &str) -> Result<Pcm, TtsError> {
         let _idle_wake = IdleWake(&self.idle_wake);
+        self.requests.fetch_add(1, Ordering::AcqRel);
+        struct RequestDone<'a, B: Transport>(&'a TtsManager<B>, u64);
+        impl<B: Transport> Drop for RequestDone<'_, B> {
+            fn drop(&mut self) {
+                self.0.requests.fetch_sub(1, Ordering::AcqRel);
+                self.0
+                    .cancelled_ids
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&self.1);
+            }
+        }
+        let _request = RequestDone(self, id);
         for attempt in 0..2 {
-            if self.cancelled_id.load(std::sync::atomic::Ordering::Acquire) == id {
+            if self.cancelled(id) {
                 return Err(TtsError::Cancelled);
             }
-            self.ensure_with(
-                selection,
-                || self.cancelled_id.load(Ordering::Acquire) == id,
-                false,
-            )?;
-            if self.cancelled_id.load(std::sync::atomic::Ordering::Acquire) == id {
+            self.ensure_with(selection, || self.cancelled(id), false)?;
+            if self.cancelled(id) {
                 let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
                 if !inner.backend.alive() {
                     inner.backend.stop();
@@ -513,38 +595,65 @@ impl<B: Transport> TtsManager<B> {
                 }
                 return Err(TtsError::Cancelled);
             }
-            let result = {
+            let (receive, timeout, generation) = {
                 let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                let cancelled = self.cancelled_ids.lock().unwrap_or_else(|p| p.into_inner());
+                if cancelled.contains(&id)
+                    || !inner.key.as_ref().is_some_and(|key| {
+                        key.model == selection.model_id && key.voice == selection.voice
+                    })
+                {
+                    return Err(TtsError::Cancelled);
+                }
                 inner.lifecycle.touch(self.started.elapsed());
-                inner.backend.synthesize(
-                    id,
-                    text,
-                    Some(
-                        handy_tts_core::speed::plan(
-                            selection.speed,
-                            handy_tts_core::catalog::entry(&selection.model_id)
-                                .map_err(|_| TtsError::Worker)?
-                                .native_speed,
-                        )
+                let native = handy_tts_core::speed::plan(
+                    selection.speed,
+                    catalog::entry(&selection.model_id)
                         .map_err(|_| TtsError::Worker)?
-                        .native,
-                    ),
+                        .native_speed,
+                )
+                .map_err(|_| TtsError::Worker)?
+                .native;
+                (
+                    inner.backend.submit(id, text, Some(native))?,
+                    inner.backend.synthesis_timeout(),
+                    inner.generation,
                 )
             };
+            let result = match receive.recv_timeout(timeout) {
+                Ok(result) => result,
+                Err(_) => {
+                    let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                    if inner.generation == generation {
+                        inner.backend.stop();
+                        inner.key = None;
+                        inner.lifecycle.stopped();
+                        self.publish(State::Unloaded, Preparation::Idle);
+                    }
+                    Err(TtsError::Worker)
+                }
+            };
             self.wake_idle();
-            if self.cancelled_id.load(std::sync::atomic::Ordering::Acquire) == id {
+            if self.cancelled(id) {
                 return Err(TtsError::Cancelled);
             }
-            let alive = self
-                .inner
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .backend
-                .alive();
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let same_worker = inner.generation == generation;
+            let alive = if same_worker {
+                inner.backend.alive()
+            } else {
+                false
+            };
             if result.is_ok() || alive {
                 return result;
             }
-            self.unload();
+            if same_worker {
+                inner.backend.stop();
+                inner.key = None;
+                inner.lifecycle.stopped();
+                self.publish(State::Unloaded, Preparation::Idle);
+            }
+            drop(inner);
             if attempt == 1 {
                 return result;
             }
@@ -562,7 +671,7 @@ impl<B: Transport> TtsManager<B> {
                 Err(TryLockError::WouldBlock) => return,
             };
             let was_busy = inner.lifecycle.busy;
-            inner.lifecycle.busy = busy();
+            inner.lifecycle.busy = busy() || self.requests.load(Ordering::Acquire) > 0;
             if was_busy || inner.lifecycle.busy {
                 inner.lifecycle.touch(self.started.elapsed());
             }
@@ -583,7 +692,7 @@ impl<B: Transport> TtsManager<B> {
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
             Err(TryLockError::WouldBlock) => return,
         };
-        inner.lifecycle.busy = busy();
+        inner.lifecycle.busy = busy() || self.requests.load(Ordering::Acquire) > 0;
         if self.activity.load(Ordering::Acquire) != generation
             || inner.lifecycle.last_used != last_used
             || !inner
@@ -605,7 +714,10 @@ impl<B: Transport> TtsManager<B> {
             Err(TryLockError::Poisoned(error)) => error.into_inner(),
             Err(TryLockError::WouldBlock) => return None,
         };
-        if inner.lifecycle.state != State::Ready || busy {
+        if inner.lifecycle.state != State::Ready
+            || busy
+            || self.requests.load(Ordering::Acquire) > 0
+        {
             return None;
         }
         match timeout {
@@ -672,6 +784,7 @@ mod tests {
     struct Trace {
         starts: Vec<Device>,
         speeds: Vec<Option<f32>>,
+        load_lanes: Vec<usize>,
         stopped: usize,
         fail_all: bool,
         fail_npu: bool,
@@ -703,6 +816,7 @@ mod tests {
         fn start(&mut self, spec: &LoadSpec<'_>) -> Result<WorkerReady, TtsError> {
             let mut trace = self.trace.lock().unwrap();
             trace.starts.push(spec.device);
+            trace.load_lanes.push(spec.lanes);
             if let Some(gate) = &trace.start_gate {
                 gate.wait();
                 gate.wait();
@@ -722,13 +836,24 @@ mod tests {
                 placement: BTreeMap::from([("main".into(), spec.device)]),
             })
         }
-        fn synthesize(&mut self, id: u64, _: &str, speed: Option<f32>) -> Result<Pcm, TtsError> {
+        fn submit(
+            &mut self,
+            id: u64,
+            _: &str,
+            speed: Option<f32>,
+        ) -> Result<mpsc::Receiver<Result<Pcm, TtsError>>, TtsError> {
             self.trace.lock().unwrap().speeds.push(speed);
-            Ok(Pcm {
+            let (send, receive) = mpsc::channel();
+            send.send(Ok(Pcm {
                 id,
                 sample_rate: 24000,
                 samples: vec![0.0; 24],
-            })
+            }))
+            .unwrap();
+            Ok(receive)
+        }
+        fn set_lanes(&mut self, _: usize) -> Result<(), TtsError> {
+            Ok(())
         }
         fn alive(&mut self) -> bool {
             let gate = self.trace.lock().unwrap().alive_gate.take();
@@ -752,6 +877,7 @@ mod tests {
                     (
                         d,
                         DeviceRating {
+                            lanes: device::LaneSizing::default(),
                             supported: true,
                             placement: BTreeMap::from([("main".into(), d)]),
                             first_audio_p95_s: Some(1.0),
@@ -1446,6 +1572,74 @@ for line in sys.stdin:
         m.synthesize(&s, 2, "Two.").unwrap();
         assert_eq!(trace.lock().unwrap().starts, [Device::Cpu]);
         assert_eq!(trace.lock().unwrap().speeds, [Some(1.0), Some(1.0)]);
+    }
+    #[test]
+    fn load_lanes_use_selected_device_measurements_and_legacy_defaults() {
+        for (device, choice, mem, expected) in [
+            (Device::Cpu, RunOn::Cpu, 8 * 1024 * 1024 * 1024, 3),
+            (Device::Gpu, RunOn::Gpu, 8 * 1024 * 1024 * 1024, 2),
+            (Device::Npu, RunOn::Npu, 8 * 1024 * 1024 * 1024, 1),
+            (Device::Cpu, RunOn::Cpu, 1400 * 1024 * 1024, 1),
+        ] {
+            let trace = Arc::new(Mutex::new(Trace::default()));
+            let memory: fn() -> Result<u64, TtsError> =
+                if mem < handy_tts_core::memory::LANE_RESERVE_BYTES {
+                    || Ok(1400 * 1024 * 1024)
+                } else {
+                    || Ok(8 * 1024 * 1024 * 1024)
+                };
+            let m = manager(choice, trace.clone(), memory);
+            {
+                let mut inner = m.inner.lock().unwrap();
+                let model = inner.config.ratings.models.get_mut("supertonic-3").unwrap();
+                for (d, rating) in &mut model.devices {
+                    if *d == Device::Npu {
+                        continue;
+                    }
+                    rating.lanes = device::LaneSizing {
+                        best_lanes: if *d == Device::Cpu { 3 } else { 2 },
+                        base_rss_mib: Some(100.0),
+                        lane_rss_mib: Some(100.0),
+                    };
+                }
+            }
+            m.ensure(&selection()).unwrap();
+            assert_eq!(trace.lock().unwrap().starts, [device]);
+            assert_eq!(trace.lock().unwrap().load_lanes, [expected]);
+            assert_eq!(m.available_lanes(), expected);
+        }
+        for missing_base in [true, false] {
+            let trace = Arc::new(Mutex::new(Trace::default()));
+            let m = manager(RunOn::Cpu, trace.clone(), || Ok(8 * 1024 * 1024 * 1024));
+            m.inner
+                .lock()
+                .unwrap()
+                .config
+                .ratings
+                .models
+                .get_mut("supertonic-3")
+                .unwrap()
+                .devices
+                .get_mut(&Device::Cpu)
+                .unwrap()
+                .lanes = device::LaneSizing {
+                best_lanes: 3,
+                base_rss_mib: if missing_base { None } else { Some(100.0) },
+                lane_rss_mib: if missing_base { Some(100.0) } else { None },
+            };
+            m.ensure(&selection()).unwrap();
+            assert_eq!(
+                trace.lock().unwrap().load_lanes,
+                [1],
+                "partial measurements use one lane"
+            );
+        }
+        let legacy: device::DeviceRating =
+            serde_json::from_str(r#"{"supported":false,"placement":{},"recommended":false}"#)
+                .unwrap();
+        assert_eq!(legacy.lanes.best_lanes, 1);
+        assert_eq!(legacy.lanes.base_rss_mib, None);
+        assert_eq!(legacy.lanes.lane_rss_mib, None);
     }
     #[test]
     fn pocket_requests_explicit_unity_native_speed_at_two_times() {

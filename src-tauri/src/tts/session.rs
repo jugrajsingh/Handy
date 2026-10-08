@@ -20,25 +20,66 @@ struct Work {
 }
 type CompletionWake = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
-#[derive(Clone)]
-pub(super) struct ManagerWorker {
-    manager: Arc<TtsManager>,
+type MemoryProbe = Arc<dyn Fn() -> Result<u64, TtsError> + Send + Sync>;
+type ActiveRequests = Arc<Mutex<std::collections::BTreeMap<(u64, usize), u64>>>;
+type CancelledTickets = Arc<Mutex<std::collections::BTreeSet<(u64, usize)>>>;
+
+pub(super) struct ManagerWorker<B: super::backend::Transport = super::backend::WorkerBackend> {
+    manager: Arc<TtsManager<B>>,
     tx: mpsc::SyncSender<Work>,
     rx: Arc<Mutex<mpsc::Receiver<Completion>>>,
     next: Arc<AtomicU64>,
-    active: Arc<AtomicU64>,
+    active: ActiveRequests,
+    cancelled: CancelledTickets,
     wake: CompletionWake,
+    memory: MemoryProbe,
 }
-impl ManagerWorker {
-    pub(super) fn new(manager: Arc<TtsManager>) -> Self {
-        let (tx, jobs) = mpsc::sync_channel::<Work>(1);
-        let (results, rx) = mpsc::sync_channel(1);
-        let active = Arc::new(AtomicU64::new(0));
+impl<B: super::backend::Transport> Clone for ManagerWorker<B> {
+    fn clone(&self) -> Self {
+        Self {
+            manager: self.manager.clone(),
+            tx: self.tx.clone(),
+            rx: self.rx.clone(),
+            next: self.next.clone(),
+            active: self.active.clone(),
+            cancelled: self.cancelled.clone(),
+            wake: self.wake.clone(),
+            memory: self.memory.clone(),
+        }
+    }
+}
+impl<B: super::backend::Transport> ManagerWorker<B> {
+    pub(super) fn new(manager: Arc<TtsManager<B>>) -> Self {
+        Self::with_memory_probe(manager, Arc::new(super::memory_available))
+    }
+    fn with_memory_probe(manager: Arc<TtsManager<B>>, memory: MemoryProbe) -> Self {
+        let lanes = manager
+            .configuration()
+            .ratings
+            .models
+            .values()
+            .flat_map(|model| model.devices.values())
+            .map(|rating| rating.lanes.best_lanes.clamp(1, 3))
+            .max()
+            .unwrap_or(1);
+        let (tx, jobs) = mpsc::sync_channel::<Work>(lanes);
+        let jobs = Arc::new(Mutex::new(jobs));
+        let (results, rx) = mpsc::sync_channel(lanes);
+        let active: ActiveRequests = Arc::default();
+        let cancelled: CancelledTickets = Arc::default();
         let wake: CompletionWake = Arc::new(Mutex::new(None));
-        let notify = wake.clone();
-        let engine = manager.clone();
-        std::thread::spawn(move || {
-            for job in jobs {
+        for _ in 0..3 {
+            let jobs = jobs.clone();
+            let results = results.clone();
+            let notify = wake.clone();
+            let engine = manager.clone();
+            let active = active.clone();
+            let cancelled = cancelled.clone();
+            std::thread::spawn(move || loop {
+                let job = jobs.lock().unwrap_or_else(|p| p.into_inner()).recv();
+                let Ok(job) = job else {
+                    break;
+                };
                 let start = Instant::now();
                 let result = engine
                     .synthesize(&job.selection, job.id, &job.text)
@@ -46,6 +87,15 @@ impl ManagerWorker {
                 if let Err(error) = &result {
                     log::error!("TTS synthesis failed: {}: {error}", job.selection.model_id);
                 }
+                let key = (job.ticket.epoch, job.ticket.index);
+                active
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&key);
+                cancelled
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&key);
                 if results
                     .send(Completion {
                         ticket: job.ticket,
@@ -60,30 +110,43 @@ impl ManagerWorker {
                 if let Some(wake) = wake {
                     wake();
                 }
-            }
-        });
+            });
+        }
         Self {
             manager,
             tx,
             rx: Arc::new(Mutex::new(rx)),
             next: Arc::new(AtomicU64::new(1)),
             active,
+            cancelled,
             wake,
+            memory,
         }
     }
 }
-impl Worker for ManagerWorker {
+impl<B: super::backend::Transport> Worker for ManagerWorker<B> {
     fn request(&mut self, ticket: Ticket, text: &str, selection: &Selection) -> Result<(), String> {
+        let key = (ticket.epoch, ticket.index);
+        let mut active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        if active.contains_key(&key) || active.len() >= self.manager.available_lanes() {
+            return Err("tts.errors.busy".into());
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
-        self.active.store(id, Ordering::Release);
-        self.tx
+        active.insert(key, id);
+        if self
+            .tx
             .try_send(Work {
                 ticket,
                 text: text.into(),
                 selection: selection.clone(),
                 id,
             })
-            .map_err(|_| "tts.errors.busy".into())
+            .is_err()
+        {
+            active.remove(&key);
+            return Err("tts.errors.busy".into());
+        }
+        Ok(())
     }
     fn poll(&mut self) -> Option<Completion> {
         self.rx
@@ -92,11 +155,30 @@ impl Worker for ManagerWorker {
             .try_recv()
             .ok()
     }
-    fn cancel(&mut self, _: Ticket) {
-        let id = self.active.swap(0, Ordering::AcqRel);
-        if id != 0 {
-            self.manager.cancel(id);
+    fn cancel(&mut self, ticket: Ticket) {
+        let key = (ticket.epoch, ticket.index);
+        let active = self.active.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(&id) = active.get(&key) {
+            if self
+                .cancelled
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(key)
+            {
+                self.manager.cancel(id);
+            }
         }
+    }
+    fn available_lanes(&mut self) -> Option<usize> {
+        if !(self.memory)().is_ok_and(|bytes| bytes >= handy_tts_core::memory::LANE_RESERVE_BYTES) {
+            self.manager.lower_lanes();
+        }
+        let cancelled = self
+            .cancelled
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len();
+        Some(self.manager.available_lanes().saturating_sub(cancelled))
     }
     fn selection_changed(&mut self) {
         self.manager.selected();
@@ -540,6 +622,222 @@ pub(super) mod tests {
         fn cancel(&mut self, _: Ticket) {}
         fn selection_changed(&mut self) {}
     }
+    #[derive(Clone, Default)]
+    struct LaneControl {
+        cancelled: Arc<Mutex<Vec<u64>>>,
+        limits: Arc<Mutex<Vec<usize>>>,
+    }
+    impl super::super::backend::Control for LaneControl {
+        fn cancel(&self, id: u64) {
+            self.cancelled.lock().unwrap().push(id);
+        }
+        fn kill(&self) {}
+    }
+    struct LaneTransport {
+        control: LaneControl,
+        submitted: mpsc::Sender<(
+            u64,
+            mpsc::Sender<Result<handy_tts_core::protocol::Pcm, TtsError>>,
+        )>,
+    }
+    impl super::super::backend::Transport for LaneTransport {
+        type Control = LaneControl;
+        fn control(&self) -> LaneControl {
+            self.control.clone()
+        }
+        fn start(
+            &mut self,
+            spec: &super::super::backend::LoadSpec<'_>,
+        ) -> Result<super::super::backend::WorkerReady, TtsError> {
+            assert_eq!(spec.lanes, 3);
+            Ok(super::super::backend::WorkerReady {
+                device: spec.device,
+                placement: std::collections::BTreeMap::from([("main".into(), spec.device)]),
+            })
+        }
+        fn submit(
+            &mut self,
+            id: u64,
+            _: &str,
+            _: Option<f32>,
+        ) -> Result<mpsc::Receiver<Result<handy_tts_core::protocol::Pcm, TtsError>>, TtsError>
+        {
+            let (send, receive) = mpsc::channel();
+            self.submitted.send((id, send)).unwrap();
+            Ok(receive)
+        }
+        fn set_lanes(&mut self, lanes: usize) -> Result<(), TtsError> {
+            self.control.limits.lock().unwrap().push(lanes);
+            Ok(())
+        }
+        fn alive(&mut self) -> bool {
+            true
+        }
+        fn stop(&mut self) {}
+    }
+    type LaneReply = (
+        u64,
+        mpsc::Sender<Result<handy_tts_core::protocol::Pcm, TtsError>>,
+    );
+    fn lane_worker() -> (
+        ManagerWorker<LaneTransport>,
+        LaneControl,
+        mpsc::Receiver<LaneReply>,
+    ) {
+        let (submitted, replies) = mpsc::channel();
+        let control = LaneControl::default();
+        let mut config = manager().configuration();
+        for model in config.ratings.models.values_mut() {
+            let rating = model
+                .devices
+                .get_mut(&handy_tts_core::device::Device::Cpu)
+                .unwrap();
+            rating.lanes.best_lanes = 3;
+            rating.lanes.base_rss_mib = Some(100.0);
+            rating.lanes.lane_rss_mib = Some(100.0);
+        }
+        let manager = TtsManager::with_backend(
+            config,
+            LaneTransport {
+                control: control.clone(),
+                submitted,
+            },
+            super::super::manager::Checks {
+                memory: || Ok(8 * 1024 * 1024 * 1024),
+                downloaded: |_, _| true,
+            },
+        )
+        .unwrap();
+        manager.ensure(&selection()).unwrap();
+        (
+            ManagerWorker::with_memory_probe(manager, Arc::new(|| Ok(8 * 1024 * 1024 * 1024))),
+            control,
+            replies,
+        )
+    }
+    fn ticket(index: usize) -> Ticket {
+        Ticket { epoch: 7, index }
+    }
+    #[test]
+    fn cancel_targets_only_that_ticket() {
+        let (mut worker, control, submitted) = lane_worker();
+        for i in 0..3 {
+            worker.request(ticket(i), "sentence", &selection()).unwrap();
+        }
+        let mut replies = Vec::new();
+        for _ in 0..3 {
+            replies.push(submitted.recv_timeout(Duration::from_secs(3)).unwrap());
+        }
+        let target = worker.active.lock().unwrap()[&(7, 1)];
+        worker.cancel(ticket(1));
+        assert_eq!(*control.cancelled.lock().unwrap(), [target]);
+        worker.cancel(ticket(99));
+        assert_eq!(*control.cancelled.lock().unwrap(), [target]);
+        for (id, send) in replies {
+            let _ = send.send(Ok(handy_tts_core::protocol::Pcm {
+                id,
+                sample_rate: 24000,
+                samples: vec![id as f32],
+            }));
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut completed = std::collections::BTreeMap::new();
+        while completed.len() < 3 && Instant::now() < deadline {
+            if let Some(result) = worker.poll() {
+                completed.insert(result.ticket.index, result.result);
+            }
+            std::thread::yield_now();
+        }
+        assert_eq!(completed.len(), 3);
+        assert!(completed[&0].is_ok());
+        assert_eq!(completed[&1], Err(TtsError::Cancelled.to_string()));
+        assert!(completed[&2].is_ok());
+        assert!(worker.active.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn low_memory_lowers_lanes_before_next_request() {
+        let (mut worker, control, submitted) = lane_worker();
+        let probes = Arc::new(AtomicU64::new(0));
+        let observed = probes.clone();
+        worker.memory = Arc::new(move || {
+            let n = observed.fetch_add(1, Ordering::Relaxed);
+            Ok(if n == 0 {
+                8 * 1024 * 1024 * 1024
+            } else {
+                1400 * 1024 * 1024
+            })
+        });
+        let source =
+            "Every sentence contains enough characters for its own speech chunk.\n\n".repeat(12);
+        let mut session =
+            Session::new(&source, selection(), worker, Audio::default(), None).unwrap();
+        session.play().unwrap();
+        session.tick(0.0).unwrap();
+        assert_eq!(session.queue.lanes, 1);
+        assert_eq!(session.queue.in_flight.len(), 1);
+        assert_eq!(*control.limits.lock().unwrap(), [1]);
+        assert!(probes.load(Ordering::Relaxed) >= 2);
+        let (id, send) = submitted.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(submitted.try_recv().is_err());
+        send.send(Ok(handy_tts_core::protocol::Pcm {
+            id,
+            sample_rate: 24000,
+            samples: vec![0.1; 24000],
+        }))
+        .unwrap();
+        session.stop();
+    }
+    #[test]
+    fn dictation_start_with_three_lanes_in_flight_is_not_delayed() {
+        use handy_tts_core::referee::{Activity, Effect, Event, Referee};
+        let (worker, control, submitted) = lane_worker();
+        let source =
+            "Every sentence contains enough characters for its own speech chunk.\n\n".repeat(12);
+        let mut session =
+            Session::new(&source, selection(), worker, Audio::default(), None).unwrap();
+        session.play().unwrap();
+        session.tick(0.0).unwrap();
+        assert_eq!(session.queue.in_flight.len(), 3);
+        let replies: Vec<_> = (0..3)
+            .map(|_| submitted.recv_timeout(Duration::from_secs(3)).unwrap())
+            .collect();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            for (id, send) in replies {
+                let _ = send.send(Ok(handy_tts_core::protocol::Pcm {
+                    id,
+                    sample_rate: 24000,
+                    samples: vec![0.1; 24000],
+                }));
+            }
+        });
+        let mut referee = Referee {
+            activity: Activity::Reading,
+            popup_open: true,
+            ..Default::default()
+        };
+        let mut recorder_started = false;
+        let start = Instant::now();
+        for effect in referee.apply(Event::DictationStart) {
+            match effect {
+                Effect::StopReading => session.stop(),
+                Effect::StartDictation => recorder_started = true,
+                Effect::ClosePopup => {}
+                _ => panic!("unexpected effect"),
+            }
+        }
+        let elapsed = start.elapsed();
+        release.join().unwrap();
+        assert!(recorder_started);
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "dictation start waited {elapsed:?}"
+        );
+        assert_eq!(control.cancelled.lock().unwrap().len(), 3);
+        session.tick(1.0).unwrap();
+        assert!(!session.playback.output.active);
+        assert_eq!(session.queue.state, PlaybackState::Waiting);
+    }
     #[test]
     fn worker_completion_notifies_actor_after_result_is_available() {
         let mut worker = ManagerWorker::new(manager());
@@ -582,6 +880,7 @@ pub(super) mod tests {
                 (
                     device,
                     DeviceRating {
+                        lanes: handy_tts_core::device::LaneSizing::default(),
                         supported: cpu,
                         placement: BTreeMap::from([("main".into(), device)]),
                         first_audio_p95_s: cpu.then_some(1.0),

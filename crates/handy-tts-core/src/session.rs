@@ -90,6 +90,11 @@ pub struct Completion {
 pub trait Worker {
     fn request(&mut self, ticket: Ticket, text: &str, selection: &Selection) -> Result<(), String>;
     fn poll(&mut self) -> Option<Completion>;
+    /// Supplies an optional request limit before each new request, including memory adapt-down.
+    fn available_lanes(&mut self) -> Option<usize> {
+        None
+    }
+
     fn cancel(&mut self, ticket: Ticket);
     fn selection_changed(&mut self);
     /// Clears a failed worker latch after an explicit selection.
@@ -921,6 +926,12 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             self.restart_from = None;
         }
         while self.restart_from.is_none() {
+            if let Some(lanes) = self.worker.available_lanes() {
+                self.queue.set_lanes(lanes);
+                if lanes == 0 {
+                    break;
+                }
+            }
             let Some(ticket) = self.queue.request_next() else {
                 break;
             };

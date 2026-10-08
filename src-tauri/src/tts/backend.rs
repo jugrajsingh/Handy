@@ -7,7 +7,7 @@ use std::io::BufReader;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 pub struct LoadSpec<'a> {
     pub binary: &'a Path,
@@ -17,6 +17,7 @@ pub struct LoadSpec<'a> {
     pub device: handy_tts_core::device::Device,
     pub cache: &'a Path,
     pub home: &'a Path,
+    pub lanes: usize,
 }
 #[derive(Debug, Clone, serde::Serialize, specta::Type)]
 pub struct WorkerReady {
@@ -34,7 +35,16 @@ pub trait Transport: Send + 'static {
     type Control: Control;
     fn control(&self) -> Self::Control;
     fn start(&mut self, spec: &LoadSpec<'_>) -> Result<WorkerReady, TtsError>;
-    fn synthesize(&mut self, id: u64, text: &str, speed: Option<f32>) -> Result<Pcm, TtsError>;
+    fn submit(
+        &mut self,
+        id: u64,
+        text: &str,
+        speed: Option<f32>,
+    ) -> Result<mpsc::Receiver<Result<Pcm, TtsError>>, TtsError>;
+    fn set_lanes(&mut self, lanes: usize) -> Result<(), TtsError>;
+    fn synthesis_timeout(&self) -> Duration {
+        Duration::from_secs(60)
+    }
     fn alive(&mut self) -> bool;
     fn stop(&mut self);
 }
@@ -71,11 +81,14 @@ struct Reply {
     header: Header,
     pcm: Option<Pcm>,
 }
+type PendingReplies =
+    Arc<Mutex<std::collections::BTreeMap<u64, mpsc::Sender<Result<Pcm, TtsError>>>>>;
+
 #[derive(Default)]
 pub struct WorkerBackend {
     control: WorkerControl,
     replies: Option<mpsc::Receiver<Result<Reply, TtsError>>>,
-    abandoned: std::collections::BTreeSet<u64>,
+    pending: PendingReplies,
     #[cfg(test)]
     synthesis_timeout: Option<Duration>,
 }
@@ -85,7 +98,7 @@ impl WorkerBackend {
         Self {
             control: WorkerControl::default(),
             replies: None,
-            abandoned: std::collections::BTreeSet::new(),
+            pending: Arc::default(),
             synthesis_timeout: Some(timeout),
         }
     }
@@ -101,8 +114,10 @@ impl WorkerBackend {
             device,
             cache,
             home,
+            lanes,
         } = *spec;
         self.stop();
+        self.pending = Arc::default();
         self.control
             .preparation
             .lock()
@@ -172,13 +187,14 @@ impl WorkerBackend {
                 })
                 .map_err(|_| TtsError::Start)?;
         }
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::channel();
+        let pending = self.pending.clone();
         std::thread::Builder::new()
             .name("tts-replies".into())
             .spawn(move || {
                 let mut reader = BufReader::new(output);
                 loop {
-                    let result = (|| {
+                    let result: Result<Reply, TtsError> = (|| {
                         let header = read_header(&mut reader).map_err(|_| TtsError::Protocol)?;
                         let pcm = if header.status == Status::Ok {
                             Some(
@@ -191,7 +207,37 @@ impl WorkerBackend {
                         Ok(Reply { header, pcm })
                     })();
                     let failed = result.is_err();
-                    if tx.send(result).is_err() || failed {
+                    match result {
+                        Ok(reply) if reply.header.id == 0 => {
+                            if tx.send(Ok(reply)).is_err() {
+                                break;
+                            }
+                        }
+                        Ok(reply) => {
+                            let sender = pending
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .remove(&reply.header.id);
+                            if let Some(sender) = sender {
+                                let result = if reply.header.status == Status::Ok {
+                                    reply.pcm.ok_or(TtsError::Protocol)
+                                } else {
+                                    Err(TtsError::Worker)
+                                };
+                                let _ = sender.send(result);
+                            }
+                        }
+                        Err(error) => {
+                            let requests = std::mem::take(
+                                &mut *pending.lock().unwrap_or_else(|p| p.into_inner()),
+                            );
+                            for sender in requests.into_values() {
+                                let _ = sender.send(Err(error.clone()));
+                            }
+                            let _ = tx.send(Err(error));
+                        }
+                    }
+                    if failed {
                         break;
                     }
                 }
@@ -202,7 +248,7 @@ impl WorkerBackend {
             model_dir: root.to_path_buf(),
             voice: voice.into(),
             threads: entry.threads,
-            lanes: 1,
+            lanes: lanes.clamp(1, 3),
             device,
             cache_dir: cache.to_path_buf(),
         })?;
@@ -243,13 +289,44 @@ impl WorkerBackend {
             .recv_timeout(timeout)
             .map_err(|_| TtsError::Worker)?
     }
-    pub fn synthesize(&mut self, id: u64, text: &str, speed: Option<f32>) -> Result<Pcm, TtsError> {
-        #[cfg(test)]
-        let timeout = self.synthesis_timeout.unwrap_or(Duration::from_secs(60));
-        #[cfg(not(test))]
-        let timeout = Duration::from_secs(60);
-        self.synthesize_with_timeout(id, text, speed, timeout)
+    /// Submits one request and returns its dedicated PCM reply channel.
+    pub fn submit(
+        &mut self,
+        id: u64,
+        text: &str,
+        speed: Option<f32>,
+    ) -> Result<mpsc::Receiver<Result<Pcm, TtsError>>, TtsError> {
+        if id == 0 {
+            return Err(TtsError::Protocol);
+        }
+        let (send, receive) = mpsc::channel();
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
+            if pending.contains_key(&id) || pending.len() >= 3 {
+                return Err(TtsError::Protocol);
+            }
+            pending.insert(id, send);
+        }
+        if let Err(error) = self.send(&Request::Synthesize {
+            id,
+            text: text.into(),
+            speed,
+        }) {
+            self.pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id);
+            return Err(error);
+        }
+        Ok(receive)
     }
+    /// Sends a lane reduction to the loaded worker.
+    pub fn set_lanes(&mut self, lanes: usize) -> Result<(), TtsError> {
+        self.send(&Request::SetLanes {
+            lanes: lanes.clamp(1, 3),
+        })
+    }
+    #[cfg(test)]
     fn synthesize_with_timeout(
         &mut self,
         id: u64,
@@ -257,38 +334,14 @@ impl WorkerBackend {
         speed: Option<f32>,
         timeout: Duration,
     ) -> Result<Pcm, TtsError> {
-        if self.abandoned.contains(&id) {
-            return Err(TtsError::Worker);
-        }
-        self.send(&Request::Synthesize {
-            id,
-            text: text.into(),
-            speed,
-        })?;
-        let deadline = Instant::now() + timeout;
-        let reply = loop {
-            let result = if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-                self.receive(remaining)
-            } else {
+        let receive = self.submit(id, text, speed)?;
+        match receive.recv_timeout(timeout) {
+            Ok(result) => result,
+            Err(_) => {
+                self.stop();
                 Err(TtsError::Worker)
-            };
-            let reply = match result {
-                Ok(reply) => reply,
-                Err(error) => {
-                    self.stop();
-                    return Err(error);
-                }
-            };
-            if reply.header.id != id {
-                self.abandoned.remove(&reply.header.id);
-                continue;
             }
-            break reply;
-        };
-        if reply.header.id != id || reply.header.status != Status::Ok {
-            return Err(TtsError::Worker);
         }
-        reply.pcm.ok_or(TtsError::Protocol)
     }
     pub fn alive(&mut self) -> bool {
         let mut guard = self.control.child.lock().unwrap_or_else(|p| p.into_inner());
@@ -318,7 +371,10 @@ impl WorkerBackend {
             .unwrap_or_else(|p| p.into_inner())
             .take();
         self.replies = None;
-        self.abandoned.clear();
+        let requests = std::mem::take(&mut *self.pending.lock().unwrap_or_else(|p| p.into_inner()));
+        for sender in requests.into_values() {
+            let _ = sender.send(Err(TtsError::Cancelled));
+        }
     }
 }
 impl Drop for WorkerBackend {
@@ -348,8 +404,23 @@ impl Transport for WorkerBackend {
     fn start(&mut self, spec: &LoadSpec<'_>) -> Result<WorkerReady, TtsError> {
         WorkerBackend::start(self, spec)
     }
-    fn synthesize(&mut self, id: u64, text: &str, speed: Option<f32>) -> Result<Pcm, TtsError> {
-        WorkerBackend::synthesize(self, id, text, speed)
+    fn submit(
+        &mut self,
+        id: u64,
+        text: &str,
+        speed: Option<f32>,
+    ) -> Result<mpsc::Receiver<Result<Pcm, TtsError>>, TtsError> {
+        WorkerBackend::submit(self, id, text, speed)
+    }
+    fn set_lanes(&mut self, lanes: usize) -> Result<(), TtsError> {
+        WorkerBackend::set_lanes(self, lanes)
+    }
+    fn synthesis_timeout(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(timeout) = self.synthesis_timeout {
+            return timeout;
+        }
+        Duration::from_secs(60)
     }
     fn alive(&mut self) -> bool {
         WorkerBackend::alive(self)
@@ -361,6 +432,57 @@ impl Transport for WorkerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn reader_routes_out_of_order_replies_by_id() {
+        use handy_tts_core::device::Device;
+        use std::os::unix::fs::PermissionsExt;
+        let fixture =
+            tempfile::tempdir_in(std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap()).unwrap();
+        let binary = fixture.path().join("out-of-order.py");
+        std::fs::write(&binary, r#"#!/usr/bin/python3
+import json, struct, sys
+pending = []
+for line in sys.stdin:
+    request = json.loads(line)
+    if request['type'] == 'load':
+        assert request['lanes'] == 3
+        print(json.dumps({'id': 0, 'status': 'ready', 'device': 'cpu', 'placement': {'main': 'cpu'}, 'samples': 0}), flush=True)
+    elif request['type'] == 'synthesize':
+        pending.append(request['id'])
+        if len(pending) == 3:
+            for id in [pending[2], pending[0], pending[1]]:
+                print(json.dumps({'id': id, 'status': 'ok', 'sample_rate': 24000, 'samples': id}), flush=True)
+                sys.stdout.buffer.write(struct.pack('<' + 'f' * id, *([float(id)] * id)))
+                sys.stdout.buffer.flush()
+"#).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut backend = WorkerBackend::default();
+        backend
+            .start(&LoadSpec {
+                binary: &binary,
+                root: fixture.path(),
+                entry: handy_tts_core::catalog::entry("pocket-en").unwrap(),
+                voice: "alba",
+                device: Device::Cpu,
+                cache: fixture.path(),
+                home: fixture.path(),
+                lanes: 3,
+            })
+            .unwrap();
+        let receivers: Vec<_> = (1..=3)
+            .map(|id| backend.submit(id, "sentence", Some(1.0)).unwrap())
+            .collect();
+        for (index, receive) in receivers.into_iter().enumerate() {
+            let id = index as u64 + 1;
+            let pcm = receive
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap();
+            assert_eq!(pcm.id, id);
+            assert_eq!(pcm.samples, vec![id as f32; id as usize]);
+        }
+        assert!(backend.alive());
+    }
     #[test]
     fn cancelled_reply_is_drained_before_retry_and_worker_stays_alive() {
         use handy_tts_core::device::Device;
@@ -403,6 +525,7 @@ for line in sys.stdin:
                 device: Device::Cpu,
                 cache: fixture.path(),
                 home: fixture.path(),
+                lanes: 1,
             })
             .unwrap();
         let child = backend.control.child.lock().unwrap().as_ref().unwrap().id();
@@ -413,7 +536,6 @@ for line in sys.stdin:
                 speed: None,
             })
             .unwrap();
-        backend.abandoned.insert(1);
         backend.control.cancel(1);
         let (mut gate, _) = listener.accept().unwrap();
         gate.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -463,6 +585,7 @@ for line in sys.stdin:
                 device: Device::Cpu,
                 cache: fixture.path(),
                 home: fixture.path(),
+                lanes: 1,
             })
             .unwrap();
         let control = backend.control();
@@ -531,6 +654,7 @@ for line in sys.stdin:
             device: Device::Cpu,
             cache: fixture.path(),
             home: fixture.path(),
+            lanes: 1,
         });
         assert!(matches!(result, Err(TtsError::Memory)));
         assert!(!backend.alive());

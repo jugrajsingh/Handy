@@ -20,8 +20,33 @@ pub enum RunOn {
     Gpu,
     Npu,
 }
+/// Measured resident memory and recommended concurrency for one model and device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LaneSizing {
+    #[serde(default = "single_lane")]
+    pub best_lanes: usize,
+    #[serde(default)]
+    pub base_rss_mib: Option<f64>,
+    #[serde(default)]
+    pub lane_rss_mib: Option<f64>,
+}
+fn single_lane() -> usize {
+    1
+}
+impl Default for LaneSizing {
+    fn default() -> Self {
+        Self {
+            best_lanes: 1,
+            base_rss_mib: None,
+            lane_rss_mib: None,
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize, specta::Type)]
 pub struct DeviceRating {
+    #[serde(flatten)]
+    #[specta(skip)]
+    pub lanes: LaneSizing,
     pub supported: bool,
     pub placement: BTreeMap<String, Device>,
     pub first_audio_p95_s: Option<f64>,
@@ -231,6 +256,7 @@ mod tests {
                     (
                         d,
                         DeviceRating {
+                            lanes: LaneSizing::default(),
                             supported: true,
                             placement: BTreeMap::from([("main".into(), d)]),
                             first_audio_p95_s: Some(1.0),
