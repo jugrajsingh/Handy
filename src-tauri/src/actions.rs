@@ -31,6 +31,32 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tauri_specta::Event;
 
+fn paste_failure_notice(error: String) -> Notice {
+    // Only fixed ASCII summaries enter notices; tool output can contain transcript fragments.
+    let detail = [
+        ("Failed to execute wtype:", "Failed to execute wtype"),
+        ("wtype failed:", "wtype failed"),
+        ("Failed to execute xdotool:", "Failed to execute xdotool"),
+        ("xdotool failed:", "xdotool failed"),
+        ("Failed to execute dotool:", "Failed to execute dotool"),
+        ("dotool failed:", "dotool failed"),
+        ("Failed to execute ydotool:", "Failed to execute ydotool"),
+        ("ydotool failed:", "ydotool failed"),
+        ("Failed to execute kwtype:", "Failed to execute kwtype"),
+        ("kwtype failed:", "kwtype failed"),
+        ("Failed to execute wl-copy:", "Failed to execute wl-copy"),
+        ("wl-copy failed:", "wl-copy failed"),
+        (
+            "Failed to execute external script",
+            "Failed to execute external script",
+        ),
+        ("External script ", "External script failed"),
+    ]
+    .into_iter()
+    .find_map(|(prefix, summary)| error.starts_with(prefix).then(|| summary.to_owned()));
+    Notice::new(NoticeCode::PasteFailed, NoticeSource::Dictation).with_detail(detail)
+}
+
 /// How a dictation ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
 #[serde(rename_all = "lowercase")]
@@ -1092,13 +1118,7 @@ impl ShortcutAction for TranscribeAction {
                                                 error!("Failed to paste transcription");
                                                 (
                                                     TranscriptionOutcome::Failed,
-                                                    Some(
-                                                        Notice::new(
-                                                            NoticeCode::PasteFailed,
-                                                            NoticeSource::Dictation,
-                                                        )
-                                                        .with_detail(error),
-                                                    ),
+                                                    Some(paste_failure_notice(error)),
                                                 )
                                             }
                                         };
@@ -1282,6 +1302,38 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn followup_paste_notice_never_contains_tool_output() {
+        for error in [
+            format!(
+                "xdotool failed: {}\nfixture transcript\rsecond line",
+                "語".repeat(22000)
+            ),
+            "Failed to execute dotool: fixture transcript\0fragment".into(),
+            "External script '/private/fixture' failed: fixture transcript".into(),
+            "unrecognized failure: fixture transcript".into(),
+        ] {
+            let notice = super::paste_failure_notice(error);
+            assert_eq!(notice.code, crate::notices::NoticeCode::PasteFailed);
+            if let Some(detail) = notice.detail {
+                assert!(
+                    detail.len() <= 512 && !detail.chars().any(char::is_control),
+                    "paste notice detail must be one short line"
+                );
+                assert!(
+                    !detail.contains("fixture") && !detail.contains('語'),
+                    "paste notice must not include transcript or path fragments"
+                );
+            }
+        }
+        assert_eq!(
+            super::paste_failure_notice("xdotool failed: fixture transcript".into())
+                .detail
+                .as_deref(),
+            Some("xdotool failed")
+        );
+    }
+
     use super::{
         cleanup_provenance, complete_unless_cancelled, is_blank_transcription,
         non_blank_post_processed_text, post_process_route, post_process_transcription,

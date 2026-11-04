@@ -25,6 +25,113 @@ const PASTE_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 mod wbfix3 {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn followup_xdotool_cleans_up_every_typing_outcome() {
+        use std::os::unix::process::ExitStatusExt;
+        for outcome in ["success", "nonzero", "killed", "spawn"] {
+            let mut calls = Vec::new();
+            let result = type_text_via_xdotool_with("fixture text", |cmd, input, timeout| {
+                assert_eq!(cmd.get_program(), "xdotool");
+                assert!(input.is_none());
+                let args: Vec<_> = cmd
+                    .get_args()
+                    .map(|s| s.to_str().unwrap().to_owned())
+                    .collect();
+                calls.push(args.clone());
+                if args[0] == "keyup" {
+                    assert_eq!(timeout, PASTE_TOOL_TIMEOUT);
+                    return Err(std::io::Error::other("cleanup failure"));
+                }
+                assert_eq!(args, ["type", "--clearmodifiers", "--", "fixture text"]);
+                assert_eq!(timeout, typing_timeout("fixture text"));
+                match outcome {
+                    "spawn" => Err(std::io::Error::other("spawn failure")),
+                    "killed" => paste_tool_with_timeout(
+                        Command::new("sh").args(["-c", "exec sleep 30"]),
+                        None,
+                        Duration::from_millis(100),
+                    ),
+                    _ => Ok(std::process::Output {
+                        status: std::process::ExitStatus::from_raw(if outcome == "success" {
+                            0
+                        } else {
+                            9 << 8
+                        }),
+                        stdout: Vec::new(),
+                        stderr: b"typing failure".to_vec(),
+                    }),
+                }
+            });
+            assert_eq!(
+                calls.len(),
+                2,
+                "every typing outcome must release modifiers"
+            );
+            assert_eq!(
+                calls[1],
+                [
+                    "keyup",
+                    "Control_L",
+                    "Control_R",
+                    "Shift_L",
+                    "Shift_R",
+                    "Alt_L",
+                    "Alt_R",
+                    "Super_L",
+                    "Super_R"
+                ]
+            );
+            match outcome {
+                "success" => assert_eq!(result, Ok(())),
+                "nonzero" => assert_eq!(result.unwrap_err(), "xdotool failed: typing failure"),
+                "spawn" => assert_eq!(
+                    result.unwrap_err(),
+                    "Failed to execute xdotool: spawn failure"
+                ),
+                _ => assert_eq!(
+                    result.unwrap_err(),
+                    format!(
+                        "Failed to execute xdotool: {}",
+                        std::io::Error::from(std::io::ErrorKind::TimedOut)
+                    ),
+                    "cleanup must preserve the original timeout error"
+                ),
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn followup_dotool_keys_use_direct_stdin() {
+        use std::os::unix::process::ExitStatusExt;
+        for (method, script) in [
+            (PasteMethod::CtrlV, "key ctrl+v\n"),
+            (PasteMethod::ShiftInsert, "key shift+insert\n"),
+            (PasteMethod::CtrlShiftV, "key ctrl+shift+v\n"),
+        ] {
+            let result = send_key_combo_via_dotool_with(&method, |cmd, input| {
+                assert_eq!(
+                    cmd.get_program(),
+                    "dotool",
+                    "key combinations must spawn dotool directly"
+                );
+                assert_eq!(cmd.get_args().count(), 0);
+                assert_eq!(
+                    input.as_deref(),
+                    Some(script.as_bytes()),
+                    "dotool must receive the original keystrokes on stdin"
+                );
+                Ok(std::process::Output {
+                    status: std::process::ExitStatus::from_raw(9 << 8),
+                    stdout: Vec::new(),
+                    stderr: b"fixture failure".to_vec(),
+                })
+            });
+            assert_eq!(result.unwrap_err(), "dotool failed: fixture failure");
+        }
+    }
+
     #[test]
     fn typing_and_watchdog_budgets_scale_with_characters() {
         for count in [0, 30, 3000] {
@@ -965,16 +1072,28 @@ fn type_text_via_wtype(text: &str) -> Result<(), String> {
 /// Type text directly via xdotool on X11.
 #[cfg(target_os = "linux")]
 fn type_text_via_xdotool(text: &str) -> Result<(), String> {
-    let output = typing_tool(
+    type_text_via_xdotool_with(text, paste_tool_with_timeout)
+}
+
+#[cfg(target_os = "linux")]
+fn type_text_via_xdotool_with(
+    text: &str,
+    mut run: impl FnMut(
+        &mut Command,
+        Option<Vec<u8>>,
+        Duration,
+    ) -> std::io::Result<std::process::Output>,
+) -> Result<(), String> {
+    let output = run(
         Command::new("xdotool")
             .arg("type")
             .arg("--clearmodifiers")
             .arg("--")
             .arg(text),
         None,
-        text,
+        typing_timeout(text),
     )
-    .map_err(|e| format!("Failed to execute xdotool: {}", e))?;
+    .map_err(|e| format!("Failed to execute xdotool: {}", e));
 
     // `--clearmodifiers` restores the modifiers that were held when xdotool
     // started. If the user releases one while xdotool is typing, that synthetic
@@ -991,7 +1110,7 @@ fn type_text_via_xdotool(text: &str) -> Result<(), String> {
     // changed modifier state before returning an error. Cleanup remains
     // best-effort because the text may already have been partially or fully
     // typed, but failures are logged so they can be diagnosed.
-    match paste_tool(
+    match run(
         Command::new("xdotool").arg("keyup").args([
             "Control_L",
             "Control_R",
@@ -1003,6 +1122,7 @@ fn type_text_via_xdotool(text: &str) -> Result<(), String> {
             "Super_R",
         ]),
         None,
+        PASTE_TOOL_TIMEOUT,
     ) {
         Ok(cleanup_output) if !cleanup_output.status.success() => {
             log::warn!(
@@ -1014,6 +1134,7 @@ fn type_text_via_xdotool(text: &str) -> Result<(), String> {
         _ => {}
     }
 
+    let output = output?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("xdotool failed: {}", stderr));
@@ -1145,21 +1266,23 @@ fn send_key_combo_via_wtype(paste_method: &PasteMethod) -> Result<(), String> {
 /// Send a key combination (e.g., Ctrl+V) via dotool.
 #[cfg(target_os = "linux")]
 fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), String> {
-    let command;
-    match paste_method {
-        PasteMethod::CtrlV => command = "echo key ctrl+v | dotool",
-        PasteMethod::ShiftInsert => command = "echo key shift+insert | dotool",
-        PasteMethod::CtrlShiftV => command = "echo key ctrl+shift+v | dotool",
+    send_key_combo_via_dotool_with(paste_method, paste_tool)
+}
+
+#[cfg(target_os = "linux")]
+fn send_key_combo_via_dotool_with(
+    paste_method: &PasteMethod,
+    run: impl FnOnce(&mut Command, Option<Vec<u8>>) -> std::io::Result<std::process::Output>,
+) -> Result<(), String> {
+    let command = match paste_method {
+        PasteMethod::CtrlV => "key ctrl+v\n",
+        PasteMethod::ShiftInsert => "key shift+insert\n",
+        PasteMethod::CtrlShiftV => "key ctrl+shift+v\n",
         _ => return Err("Unsupported paste method".into()),
-    }
-    use std::process::Stdio;
-    let output = paste_tool(
-        Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null()),
-        None,
+    };
+    let output = run(
+        &mut Command::new("dotool"),
+        Some(command.as_bytes().to_vec()),
     )
     .map_err(|e| format!("Failed to execute dotool: {}", e))?;
     if !output.status.success() {
