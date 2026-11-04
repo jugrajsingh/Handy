@@ -158,3 +158,206 @@ togglePopupPlayback({
 assert.equal(toggles, 1);
 assert.equal(editingMode, false, "Play leaves edit mode");
 console.log("popup mode, time, controls and edit/paste seam assertions passed");
+
+const { registerPopupPaste, restorePopupEditor, routePopupPaste } =
+  await import("./presentation");
+const { createPopupAdapter } = await import("./adapter");
+const { routePopupKey } = await import("./actions");
+const listeners = new Set<
+  (event: import("./presentation").PopupPasteEvent) => void
+>();
+const pasteWindow = {
+  addEventListener: (
+    _type: "paste",
+    listener: (event: import("./presentation").PopupPasteEvent) => void,
+  ) => {
+    listeners.add(listener);
+  },
+  removeEventListener: (
+    _type: "paste",
+    listener: (event: import("./presentation").PopupPasteEvent) => void,
+  ) => {
+    listeners.delete(listener);
+  },
+};
+const editorTarget = {};
+const bodyTarget = {};
+let view = {
+  ...snapshot,
+  state: "waiting" as SessionSnapshot["state"],
+  text: "old text",
+};
+let explicitEdit = true;
+let editorMounted = true;
+let selection: { start: number; end: number } | null = null;
+let pendingCaret: number | null = null;
+let editingWrite = Promise.resolve();
+const pasteTrace: string[] = [];
+const replacements: { text: string; revision: number }[] = [];
+const adapter = createPopupAdapter(
+  () => view,
+  (next) => {
+    view = next;
+  },
+  {
+    play: async () => {
+      pasteTrace.push("play");
+    },
+    pause: async () => {},
+    stop: async () => {
+      pasteTrace.push("stop");
+    },
+    replaceText: async (text, revision) => {
+      replacements.push({ text, revision });
+    },
+    close: async () => {},
+    error: () => assert.fail("unexpected paste error"),
+  },
+);
+const detachPaste = registerPopupPaste(pasteWindow, {
+  isEditorTarget: (target) => editorMounted && target === editorTarget,
+  getText: () => view.text,
+  getSelection: () => selection,
+  enterEdit: (text, caret) => {
+    pendingCaret = caret;
+    enterPopupEdit(text, {
+      setEditing: (value) => {
+        explicitEdit = value;
+      },
+      edit: (value) => {
+        editingWrite = adapter.edit(value);
+      },
+    });
+  },
+});
+routePopupKey(
+  {
+    key: "Enter",
+    ctrlKey: true,
+    defaultPrevented: false,
+    preventDefault: () => {},
+  },
+  {
+    close: () => {},
+    toggle: () =>
+      togglePopupPlayback({
+        toggle: () => {
+          editingWrite = adapter.toggle();
+        },
+        setEditing: (value) => {
+          explicitEdit = value;
+        },
+      }),
+  },
+);
+await editingWrite;
+view = { ...view, state: "playing" };
+editorMounted = false;
+assert.equal(popupMode(view.state, explicitEdit), "reading");
+const dispatchPaste = (target: unknown, text: string) => {
+  let prevented = false;
+  const event = {
+    target,
+    defaultPrevented: false,
+    clipboardData: { getData: () => text },
+    preventDefault: () => {
+      prevented = true;
+    },
+  };
+  for (const listener of listeners) listener(event);
+  return prevented;
+};
+assert.equal(
+  dispatchPaste(bodyTarget, "new text"),
+  true,
+  "window registration captures body paste after keyboard Play",
+);
+await editingWrite;
+assert.deepEqual(pasteTrace, ["play", "stop"]);
+assert.deepEqual(replacements, [{ text: "new text", revision: 1 }]);
+assert.equal(explicitEdit, true);
+assert.equal(view.text, "new text");
+assert.equal(
+  pendingCaret,
+  8,
+  "body paste prepares editor focus/caret at inserted text end",
+);
+editorMounted = true;
+selection = { start: 4, end: 8 };
+assert.equal(
+  dispatchPaste(editorTarget, "words"),
+  false,
+  "Textarea paste retains native insertion",
+);
+assert.equal(
+  replacements.length,
+  1,
+  "window listener does not also insert Textarea paste",
+);
+// The native input change sends its resulting value through the existing edit path.
+await adapter.edit(pasteText(view.text, "words", 4, 8));
+assert.deepEqual(
+  replacements,
+  [
+    { text: "new text", revision: 1 },
+    { text: "new words", revision: 2 },
+  ],
+  "Textarea paste inserts exactly once with one client revision",
+);
+selection = { start: 4, end: 9 };
+assert.equal(dispatchPaste(bodyTarget, "text"), true);
+await editingWrite;
+assert.equal(
+  view.text,
+  "new text",
+  "non-Textarea paste uses the retained editor selection",
+);
+assert.equal(pendingCaret, 8);
+detachPaste();
+assert.equal(
+  listeners.size,
+  0,
+  "cleanup removes the registered window listener",
+);
+assert.equal(dispatchPaste(bodyTarget, "ignored"), false);
+assert.equal(view.text, "new text", "unmounted listener cannot edit");
+console.log(
+  "window paste: keyboard Play/body target, revision, native exactly-once, caret and cleanup assertions passed",
+);
+
+const restored: (string | number[])[] = [];
+restorePopupEditor(
+  {
+    focus: () => {
+      restored.push("focus");
+    },
+    setSelectionRange: (start, end) => {
+      restored.push([start, end]);
+    },
+  },
+  { start: 8, end: 8 },
+);
+assert.deepEqual(
+  restored,
+  ["focus", [8, 8]],
+  "pending paste caret restores editor focus and selection",
+);
+for (const event of [
+  { defaultPrevented: true, clipboardData: { getData: () => "ignored" } },
+  { defaultPrevented: false, clipboardData: null },
+]) {
+  routePopupPaste(
+    {
+      ...event,
+      target: bodyTarget,
+      preventDefault: () =>
+        assert.fail("must not intercept unavailable/handled paste"),
+    },
+    {
+      isEditorTarget: () => false,
+      getText: () => "",
+      getSelection: () => null,
+      enterEdit: () => assert.fail("must not edit unavailable/handled paste"),
+    },
+  );
+}

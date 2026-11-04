@@ -11,7 +11,8 @@ import {
   progressPresentation,
   popupMode,
   formatTime,
-  pasteText,
+  registerPopupPaste,
+  restorePopupEditor,
 } from "./presentation";
 export interface PopupProps {
   text: string;
@@ -57,10 +58,9 @@ export function ReadAloudPopup({
   );
   useLayoutEffect(() => {
     if (mode !== "editing" || !caret.current || !editor.current) return;
-    editor.current.focus();
-    editor.current.setSelectionRange(caret.current.start, caret.current.end);
+    restorePopupEditor(editor.current, caret.current);
     caret.current = null;
-  }, [mode, text]);
+  });
   const textSelection = () => {
     const selection = window.getSelection();
     const root = preview.current;
@@ -77,31 +77,30 @@ export function ReadAloudPopup({
     const start = prefix.toString().length;
     return { start, end: start + selected.toString().length };
   };
+  useEffect(() =>
+    registerPopupPaste(window, {
+      isEditorTarget: (target) => target === editor.current,
+      getText: () => text,
+      getSelection: () =>
+        mode === "reading"
+          ? textSelection()
+          : editor.current
+            ? {
+                start: editor.current.selectionStart,
+                end: editor.current.selectionEnd,
+              }
+            : null,
+      enterEdit: (next, position) => {
+        caret.current = { start: position, end: position };
+        enterEdit(next);
+      },
+    }),
+  );
   return (
     <section
       className="h-screen flex flex-col overflow-hidden rounded-xl border border-line bg-background text-text text-sm"
       aria-label={t("tts.title")}
       onKeyDown={(event) => routePopupKey(event, { close, toggle })}
-      onPaste={(event) => {
-        if (event.target === editor.current) return;
-        event.preventDefault();
-        const range =
-          mode === "reading"
-            ? textSelection()
-            : editor.current
-              ? {
-                  start: editor.current.selectionStart,
-                  end: editor.current.selectionEnd,
-                }
-              : null;
-        const pasted = event.clipboardData.getData("text/plain");
-        const next = range
-          ? pasteText(text, pasted, range.start, range.end)
-          : pasteText(text, pasted);
-        const position = (range?.start ?? 0) + pasted.length;
-        caret.current = { start: position, end: position };
-        enterEdit(next);
-      }}
     >
       <header className="flex shrink-0 items-center justify-between gap-2 border-b border-line px-3 py-1">
         <span className="truncate font-medium">{modelName}</span>
