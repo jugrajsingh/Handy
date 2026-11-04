@@ -76,7 +76,13 @@ pub fn create_manager(app: &AppHandle) -> Arc<LocalLlmManager> {
         }),
     };
     let manager = Arc::new(LocalLlmManager::new(
-        Box::new(LlamaServerBackend::new()),
+        Box::new(LlamaServerBackend::with_data_dir(
+            models_root
+                .as_ref()
+                .and_then(|root| root.parent())
+                .and_then(|root| root.parent())
+                .map(std::path::Path::to_path_buf),
+        )),
         models_root,
         hooks,
         ManagerConfig::default(),

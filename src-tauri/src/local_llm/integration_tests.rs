@@ -4,7 +4,7 @@
 
 #![cfg(target_os = "linux")]
 
-use super::llama_server::{loopback_client, LlamaServerBackend};
+use super::llama_server::{socket_client, LlamaServerBackend};
 use super::manager::{IdleInputs, LocalLlmManager, ManagerConfig, ManagerHooks};
 use super::registry;
 use crate::settings::{get_default_settings, ModelUnloadTimeout, LOCAL_LLM_PROVIDER_ID};
@@ -67,7 +67,9 @@ fn real_server_matches_goldens_and_is_gone_after_unload() {
     std::os::unix::fs::symlink(&model, &dest).unwrap();
 
     let manager = Arc::new(LocalLlmManager::new(
-        Box::new(LlamaServerBackend::new()),
+        Box::new(LlamaServerBackend::with_data_dir(Some(
+            root.path().to_path_buf(),
+        ))),
         Some(root.path().to_path_buf()),
         ManagerHooks {
             idle_inputs: Box::new(|| IdleInputs {
@@ -110,19 +112,15 @@ fn real_server_matches_goldens_and_is_gone_after_unload() {
     let cmdline = std::fs::read(format!("/proc/{}/cmdline", children[0])).unwrap();
     let args: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
     assert!(!args.contains(&b"--api-key".as_slice()));
-    let port = args
+    assert!(!args.contains(&b"--port".as_slice()));
+    let socket = args
         .windows(2)
-        .find(|pair| pair[0] == b"--port")
-        .map(|pair| {
-            std::str::from_utf8(pair[1])
-                .unwrap()
-                .parse::<u16>()
-                .unwrap()
-        })
-        .expect("server command must specify its port");
-    let response = loopback_client()
+        .find(|pair| pair[0] == b"--host")
+        .map(|pair| PathBuf::from(std::str::from_utf8(pair[1]).unwrap()))
+        .expect("server command must specify its socket");
+    let response = socket_client(&socket)
         .unwrap()
-        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .post("http://localhost/v1/chat/completions")
         .bearer_auth("wrong")
         .timeout(Duration::from_secs(10))
         .json(&serde_json::json!({
@@ -181,7 +179,9 @@ fn plain_system_prompt_real_server() {
     std::fs::create_dir_all(dest.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink(std::fs::canonicalize(file).unwrap(), dest).unwrap();
     let manager = LocalLlmManager::new(
-        Box::new(LlamaServerBackend::new()),
+        Box::new(LlamaServerBackend::with_data_dir(Some(
+            root.path().to_path_buf(),
+        ))),
         Some(root.path().to_path_buf()),
         ManagerHooks {
             idle_inputs: Box::new(|| IdleInputs {

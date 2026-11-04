@@ -1,5 +1,5 @@
 //! `LlamaServerBackend`: runs llama.cpp's `llama-server` as a child process on
-//! a loopback port with a per-spawn API key.
+//! a private Unix socket with a per-spawn API key.
 
 use super::backend::{BackendOpts, GenerateRequest, KillSwitch, TextModelBackend};
 use super::registry::ModelEntry;
@@ -12,13 +12,12 @@ use std::ffi::OsString;
 use std::io::{self, Read};
 #[cfg(test)]
 use std::io::{BufRead, BufReader};
-use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 #[cfg(test)]
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 /// Dev-only override for the binary path.
@@ -28,7 +27,7 @@ pub const INSTALLED_BINARY: &str = "/usr/lib/Handy/llm/llama-server";
 
 const HEALTH_POLL: Duration = Duration::from_millis(100);
 const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
-/// Retry an early child exit once with a new port.
+/// Retry an early child exit once with a new socket.
 const SPAWN_ATTEMPTS: u32 = 2;
 
 fn binary_file_name(path: &Path) -> String {
@@ -55,13 +54,14 @@ pub fn resolve_binary(
 }
 
 /// Command-line arguments for one spawn.
-pub fn server_args(model_path: &Path, port: u16, threads: u8, ctx: u32) -> Vec<OsString> {
-    let mut args: Vec<OsString> = vec!["-m".into(), model_path.as_os_str().to_owned()];
+pub fn server_args(model_path: &Path, socket: &Path, threads: u8, ctx: u32) -> Vec<OsString> {
+    let mut args: Vec<OsString> = vec![
+        "-m".into(),
+        model_path.as_os_str().to_owned(),
+        "--host".into(),
+        socket.as_os_str().to_owned(),
+    ];
     let rest = [
-        "--host".to_string(),
-        "127.0.0.1".to_string(),
-        "--port".to_string(),
-        port.to_string(),
         "-t".to_string(),
         threads.max(1).to_string(),
         "-c".to_string(),
@@ -79,21 +79,86 @@ pub fn server_args(model_path: &Path, port: u16, threads: u8, ctx: u32) -> Vec<O
     args
 }
 
-fn build_command(binary: &Path, opts: &BackendOpts, port: u16, api_key: &str) -> Command {
+fn build_command(binary: &Path, opts: &BackendOpts, socket: &Path, api_key: &str) -> Command {
     let mut cmd = Command::new(binary);
-    cmd.args(server_args(&opts.model_path, port, opts.threads, opts.ctx))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    cmd.args(server_args(
+        &opts.model_path,
+        socket,
+        opts.threads,
+        opts.ctx,
+    ))
+    .stdin(Stdio::null())
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
     cmd.env("LLAMA_API_KEY", api_key);
     #[cfg(target_os = "linux")]
     set_parent_death_signal(&mut cmd);
     cmd
 }
 
-/// A currently free loopback port; `ensure_loaded` retries an early exit once.
-pub fn pick_port() -> io::Result<u16> {
-    Ok(TcpListener::bind(("127.0.0.1", 0))?.local_addr()?.port())
+struct PrivateSocket {
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+fn validate_private_dir(path: &Path, uid: u32) -> Result<(), LocalLlmError> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| LocalLlmError::StartFailed("private socket directory unavailable".into()))?;
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o7777 != 0o700 {
+        return Err(LocalLlmError::StartFailed(
+            "socket directory must be owned by this user with mode 0700".into(),
+        ));
+    }
+    Ok(())
+}
+
+impl PrivateSocket {
+    #[cfg(unix)]
+    fn create(root: &Path) -> Result<Self, LocalLlmError> {
+        use std::os::unix::{ffi::OsStrExt, fs::DirBuilderExt};
+        // SAFETY: geteuid has no preconditions.
+        validate_private_dir(root, unsafe { libc::geteuid() })?;
+        let directory = root.join(format!("hllm-{}", &random_api_key()?[..12]));
+        let path = directory.join("s.sock");
+        // SAFETY: an all-zero sockaddr_un is a valid value for inspecting sun_path.
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        if path.as_os_str().as_bytes().len() >= address.sun_path.len() {
+            return Err(LocalLlmError::StartFailed(
+                "private socket path exceeds the Unix socket length limit".into(),
+            ));
+        }
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&directory)
+            .map_err(|_| {
+                LocalLlmError::StartFailed("cannot create private socket directory".into())
+            })?;
+        let socket = Self { path };
+        // SAFETY: geteuid has no preconditions.
+        validate_private_dir(&directory, unsafe { libc::geteuid() })?;
+        Ok(socket)
+    }
+
+    #[cfg(not(unix))]
+    fn create(_: &Path) -> Result<Self, LocalLlmError> {
+        Err(LocalLlmError::StartFailed(
+            "local LLM requires Unix sockets on this platform".into(),
+        ))
+    }
+
+    fn cleanup(&self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(directory) = self.path.parent() {
+            let _ = std::fs::remove_dir(directory);
+        }
+    }
+}
+
+impl Drop for PrivateSocket {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
 }
 
 /// 32 hex chars from the OS RNG.
@@ -117,23 +182,21 @@ pub enum HealthError {
 #[cfg(test)]
 pub fn wait_healthy(
     client: &reqwest::blocking::Client,
-    port: u16,
     child: &mut Child,
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<(), HealthError> {
-    wait_healthy_inner(client, port, child, deadline, cancel, None)
+    wait_healthy_inner(client, child, deadline, cancel, None)
 }
 
 fn wait_healthy_inner(
     client: &reqwest::blocking::Client,
-    port: u16,
     child: &mut Child,
     deadline: Instant,
     cancel: &AtomicBool,
     kill: Option<&ChildKillSwitch>,
 ) -> Result<(), HealthError> {
-    let url = format!("http://127.0.0.1:{port}/health");
+    let url = "http://localhost/health";
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Err(HealthError::Cancelled);
@@ -152,9 +215,18 @@ fn wait_healthy_inner(
             return Err(HealthError::Timeout);
         }
         let per_try = (deadline - now).min(HEALTH_REQUEST_TIMEOUT);
-        if let Ok(resp) = client.get(&url).timeout(per_try).send() {
+        if let Ok(resp) = client.get(url).timeout(per_try).send() {
             if resp.status().is_success() {
-                return Ok(());
+                let alive = match kill {
+                    Some(kill) => kill.try_wait(child),
+                    None => child.try_wait(),
+                };
+                return match alive {
+                    Ok(None) if !cancel.load(Ordering::SeqCst) => Ok(()),
+                    Ok(None) => Err(HealthError::Cancelled),
+                    Ok(Some(status)) => Err(HealthError::Exited(status.to_string())),
+                    Err(error) => Err(HealthError::Exited(error.to_string())),
+                };
             }
         }
         std::thread::sleep(HEALTH_POLL.min(deadline.saturating_duration_since(Instant::now())));
@@ -164,7 +236,6 @@ fn wait_healthy_inner(
 /// `POST /v1/chat/completions`, returning `choices[0].message.content`.
 pub fn post_chat(
     client: &reqwest::blocking::Client,
-    port: u16,
     api_key: &str,
     req: &GenerateRequest,
 ) -> Result<String, LocalLlmError> {
@@ -176,7 +247,7 @@ pub fn post_chat(
         "chat_template_kwargs": { "enable_thinking": false },
     });
     let resp = client
-        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .post("http://localhost/v1/chat/completions")
         .bearer_auth(api_key)
         .timeout(req.timeout)
         .json(&body)
@@ -217,12 +288,24 @@ pub fn post_chat(
         })
 }
 
-/// A client that never routes loopback traffic (or the API key) through a user proxy.
-pub fn loopback_client() -> Result<reqwest::blocking::Client, LocalLlmError> {
-    reqwest::blocking::Client::builder()
-        .no_proxy()
-        .build()
-        .map_err(|e| LocalLlmError::StartFailed(format!("http client: {e}")))
+/// A local client restricted to one socket, without proxies or redirects.
+pub fn socket_client(socket: &Path) -> Result<reqwest::blocking::Client, LocalLlmError> {
+    #[cfg(unix)]
+    {
+        reqwest::blocking::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .unix_socket(socket.to_path_buf())
+            .build()
+            .map_err(|_| LocalLlmError::StartFailed("cannot create private socket client".into()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = socket;
+        Err(LocalLlmError::StartFailed(
+            "local LLM requires Unix sockets on this platform".into(),
+        ))
+    }
 }
 
 /// Serializes signalling with PID publication and reaping.
@@ -231,6 +314,7 @@ struct ChildKillSwitch {
     gate: Mutex<()>,
     cancel: Mutex<Arc<AtomicBool>>,
     triggered: AtomicBool,
+    socket: Mutex<Weak<PrivateSocket>>,
 }
 
 impl ChildKillSwitch {
@@ -240,6 +324,7 @@ impl ChildKillSwitch {
             gate: Mutex::new(()),
             cancel: Mutex::new(Arc::new(AtomicBool::new(false))),
             triggered: AtomicBool::new(false),
+            socket: Mutex::new(Weak::new()),
         }
     }
 
@@ -297,6 +382,9 @@ impl KillSwitch for ChildKillSwitch {
         lock(&self.cancel).store(true, Ordering::SeqCst);
         let _guard = lock(&self.gate);
         self.signal_locked();
+        if let Some(socket) = lock(&self.socket).upgrade() {
+            socket.cleanup();
+        }
     }
 }
 
@@ -309,7 +397,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Running {
     child: Child,
-    port: u16,
+    _socket: Arc<PrivateSocket>,
     api_key: String,
     model_path: PathBuf,
     client: reqwest::blocking::Client,
@@ -325,6 +413,8 @@ enum StartOutcome {
 pub struct LlamaServerBackend {
     binary_env: Option<OsString>,
     installed: PathBuf,
+    data_dir: Option<PathBuf>,
+    runtime_dir: Option<PathBuf>,
     running: Option<Running>,
     kill: Arc<ChildKillSwitch>,
 }
@@ -341,6 +431,10 @@ impl LlamaServerBackend {
         Self {
             binary_env: std::env::var_os(BINARY_ENV),
             installed: PathBuf::from(INSTALLED_BINARY),
+            data_dir: None,
+            runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
             running: None,
             kill: Arc::new(ChildKillSwitch::new()),
         }
@@ -351,10 +445,43 @@ impl LlamaServerBackend {
     pub fn with_binary(binary: PathBuf) -> Self {
         Self {
             binary_env: None,
+            data_dir: binary.parent().map(Path::to_path_buf),
+            runtime_dir: None,
             installed: binary,
             running: None,
             kill: Arc::new(ChildKillSwitch::new()),
         }
+    }
+
+    /// Uses the app data directory when XDG_RUNTIME_DIR is absent.
+    pub fn with_data_dir(data_dir: Option<PathBuf>) -> Self {
+        let mut backend = Self::new();
+        backend.data_dir = data_dir;
+        backend
+    }
+
+    fn socket_root(&self) -> Result<PathBuf, LocalLlmError> {
+        if let Some(root) = &self.runtime_dir {
+            return Ok(root.clone());
+        }
+        let data = self.data_dir.as_ref().ok_or_else(|| {
+            LocalLlmError::StartFailed("private app data directory unavailable".into())
+        })?;
+        let root = data.join("llm-runtime");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            match std::fs::DirBuilder::new().mode(0o700).create(&root) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(_) => {
+                    return Err(LocalLlmError::StartFailed(
+                        "cannot create private runtime directory".into(),
+                    ))
+                }
+            }
+        }
+        Ok(root)
     }
 
     fn spawn_child(&self, cmd: Command) -> io::Result<Child> {
@@ -364,23 +491,23 @@ impl LlamaServerBackend {
     }
 
     fn start_once(&self, binary: &Path, opts: &BackendOpts, deadline: Instant) -> StartOutcome {
-        let port = match pick_port() {
-            Ok(p) => p,
-            Err(e) => {
-                return StartOutcome::Error(LocalLlmError::StartFailed(format!(
-                    "no free port: {e}"
-                )))
-            }
+        let socket = match self
+            .socket_root()
+            .and_then(|root| PrivateSocket::create(&root))
+        {
+            Ok(socket) => Arc::new(socket),
+            Err(error) => return StartOutcome::Error(error),
         };
+        *lock(&self.kill.socket) = Arc::downgrade(&socket);
         let api_key = match random_api_key() {
             Ok(k) => k,
             Err(e) => return StartOutcome::Error(e),
         };
-        let client = match loopback_client() {
+        let client = match socket_client(&socket.path) {
             Ok(c) => c,
             Err(e) => return StartOutcome::Error(e),
         };
-        let cmd = build_command(binary, opts, port, &api_key);
+        let cmd = build_command(binary, opts, &socket.path, &api_key);
         let mut child = match self.spawn_child(cmd) {
             Ok(c) => c,
             Err(e) => {
@@ -392,7 +519,6 @@ impl LlamaServerBackend {
         };
         match wait_healthy_inner(
             &client,
-            port,
             &mut child,
             deadline,
             &opts.cancel,
@@ -400,13 +526,13 @@ impl LlamaServerBackend {
         ) {
             Ok(()) => StartOutcome::Ready(Running {
                 child,
-                port,
+                _socket: socket,
                 api_key,
                 model_path: opts.model_path.clone(),
                 client,
             }),
             Err(HealthError::Exited(status)) => {
-                let _ = child.wait();
+                self.kill.stop(&mut child);
                 StartOutcome::ExitedEarly(format!("llama-server exited during start ({status})"))
             }
             Err(HealthError::Timeout) => {
@@ -454,8 +580,8 @@ impl TextModelBackend for LlamaServerBackend {
             match self.start_once(&binary, opts, deadline) {
                 StartOutcome::Ready(running) => {
                     info!(
-                        "local-llm: llama-server ready for {} on port {}",
-                        model.id, running.port
+                        "local-llm: llama-server ready for {} on private socket",
+                        model.id
                     );
                     self.running = Some(running);
                     return Ok(());
@@ -476,9 +602,14 @@ impl TextModelBackend for LlamaServerBackend {
     fn generate(&mut self, req: &GenerateRequest) -> Result<String, LocalLlmError> {
         let running = self
             .running
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| LocalLlmError::Failed("llama-server is not running".into()))?;
-        post_chat(&running.client, running.port, &running.api_key, req)
+        if !matches!(self.kill.try_wait(&mut running.child), Ok(None)) {
+            return Err(LocalLlmError::Transport(
+                "llama-server exited before request".into(),
+            ));
+        }
+        post_chat(&running.client, &running.api_key, req)
     }
 
     fn unload(&mut self) {
@@ -508,7 +639,7 @@ impl Drop for LlamaServerBackend {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::local_llm::prompt::ChatMessage;
@@ -517,9 +648,11 @@ mod tests {
     use std::sync::Arc;
 
     /// Serves scripted responses and returns the raw request headers and bodies.
-    fn serve(responses: Vec<(u16, String)>) -> (u16, std::thread::JoinHandle<Vec<String>>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let port = listener.local_addr().unwrap().port();
+    fn serve(
+        responses: Vec<(u16, String)>,
+    ) -> (tempfile::TempDir, std::thread::JoinHandle<Vec<String>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(dir.path().join("s.sock")).unwrap();
         let handle = std::thread::spawn(move || {
             let mut seen = Vec::new();
             for (status, body) in responses {
@@ -540,15 +673,20 @@ mod tests {
                 let mut req_body = vec![0u8; content_length];
                 reader.read_exact(&mut req_body).unwrap();
                 seen.push(format!("{head}\r\n{}", String::from_utf8_lossy(&req_body)));
+                let location = if status == 302 {
+                    "Location: http://localhost/redirected\r\n"
+                } else {
+                    ""
+                };
                 let resp = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\n{location}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 sock.write_all(resp.as_bytes()).unwrap();
             }
             seen
         });
-        (port, handle)
+        (dir, handle)
     }
 
     fn sleeper() -> Child {
@@ -588,10 +726,10 @@ mod tests {
         let published_pid = backend.kill.pid.load(Ordering::SeqCst);
         backend.running = Some(Running {
             child,
-            port: 0,
             api_key: String::new(),
             model_path: dir.path().join("m.gguf"),
-            client: loopback_client().unwrap(),
+            client: socket_client(&dir.path().join("s.sock")).unwrap(),
+            _socket: Arc::new(PrivateSocket::create(&backend.socket_root().unwrap()).unwrap()),
         });
         let switch = backend.kill_switch();
         switch.trigger();
@@ -656,6 +794,217 @@ mod tests {
     }
 
     #[test]
+    fn wbsec_socket_start_generate_kill_and_tcp_isolation() {
+        use std::process::Stdio;
+        let root = tempfile::tempdir().unwrap();
+        let mut attacker = Command::new("python3")
+            .args([
+                "-u",
+                "-c",
+                r#"
+import socket
+s = socket.socket()
+s.bind(('127.0.0.1', 0))
+s.listen(1)
+s.settimeout(3)
+print('ready', flush=True)
+try:
+    connection, _ = s.accept()
+except TimeoutError:
+    raise SystemExit(0)
+connection.close()
+raise SystemExit(1)
+"#,
+            ])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = String::new();
+        BufReader::new(attacker.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let binary = fake_binary(
+            root.path(),
+            r#"exec python3 - "$@" <<'PY'
+import json, os, socket, sys, time
+path = sys.argv[sys.argv.index('--host') + 1]
+s = socket.socket(socket.AF_UNIX)
+s.bind(path)
+s.listen(2)
+for expected in ('GET /health', 'POST /v1/chat/completions'):
+    connection, _ = s.accept()
+    request = connection.makefile('rb')
+    first = request.readline().decode()
+    assert first.startswith(expected)
+    headers = {}
+    for _ in range(100):
+        line = request.readline()
+        if line == b'\r\n': break
+        key, value = line.decode().split(':', 1)
+        headers[key.lower()] = value.strip()
+    else:
+        raise AssertionError('request header limit exceeded')
+    body = request.read(int(headers.get('content-length', '0')))
+    if expected.startswith('POST'):
+        assert headers['authorization'] == 'Bearer ' + os.environ['LLAMA_API_KEY']
+        assert json.loads(body)['messages'][0]['content'] == 'synthetic transcript'
+    reply = b'{"choices":[{"message":{"content":"synthetic result"}}]}'
+    connection.sendall(b'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: ' + str(len(reply)).encode() + b'\r\n\r\n' + reply)
+    request.close()
+    connection.close()
+time.sleep(30)
+PY"#,
+        );
+        let mut backend = LlamaServerBackend::with_binary(binary);
+        let options = opts(root.path().join("m.gguf"), Duration::from_secs(5));
+        let result = backend.ensure_loaded(registry::find("s1-mini-q4km").unwrap(), &options);
+        let generated = result.and_then(|()| {
+            backend.generate(&GenerateRequest {
+                messages: vec![ChatMessage {
+                    role: "user",
+                    content: "synthetic transcript".into(),
+                }],
+                max_tokens: 32,
+                timeout: Duration::from_secs(2),
+            })
+        });
+        let directory = backend
+            .running
+            .as_ref()
+            .map(|r| r._socket.path.parent().unwrap().to_path_buf());
+        backend.kill_switch().trigger();
+        let cleaned_before_unload = directory.as_ref().is_none_or(|path| !path.exists());
+        backend.unload();
+        let intercepted = attacker.wait().unwrap();
+        assert!(
+            cleaned_before_unload,
+            "kill switch must clean the socket even before unload"
+        );
+        assert_eq!(
+            generated,
+            Ok("synthetic result".into()),
+            "generation must use the private socket"
+        );
+        assert!(
+            intercepted.success(),
+            "pre-existing TCP listener must receive no request"
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path().join("llm-runtime"))
+                .unwrap()
+                .count(),
+            0,
+            "socket directories must be removed after cleanup"
+        );
+    }
+
+    #[test]
+    fn wbsec_health_response_cannot_make_an_exited_child_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut child = sleeper();
+        let pid = child.id() as i32;
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = [0; 1024];
+            assert!(stream.read(&mut head).unwrap() > 0);
+            // SAFETY: this is the live, unreaped child owned by this test.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let result = wait_healthy(
+            &socket_client(&socket).unwrap(),
+            &mut child,
+            Instant::now() + Duration::from_secs(2),
+            &AtomicBool::new(false),
+        );
+        stop_child(&mut child);
+        server.join().unwrap();
+        assert!(
+            matches!(result, Err(HealthError::Exited(_))),
+            "a health response must not hide child exit"
+        );
+    }
+
+    #[test]
+    fn wbsec_generate_rechecks_child_before_sending() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_binary(dir.path(), "exit 0");
+        let mut backend = LlamaServerBackend::with_binary(binary);
+        let mut child = sleeper();
+        stop_child(&mut child);
+        let socket = Arc::new(PrivateSocket::create(&backend.socket_root().unwrap()).unwrap());
+        backend.running = Some(Running {
+            child,
+            client: socket_client(&socket.path).unwrap(),
+            _socket: socket,
+            api_key: "fixture".into(),
+            model_path: dir.path().join("m.gguf"),
+        });
+        assert_eq!(
+            backend.generate(&GenerateRequest {
+                messages: vec![],
+                max_tokens: 1,
+                timeout: Duration::from_secs(1)
+            }),
+            Err(LocalLlmError::Transport(
+                "llama-server exited before request".into()
+            )),
+            "generation must refuse an exited child before sending"
+        );
+    }
+
+    #[test]
+    fn wbsec_redirects_are_refused_on_the_private_client() {
+        let (dir, server) = serve(vec![(302, "{}".into())]);
+        let result = post_chat(
+            &socket_client(&dir.path().join("s.sock")).unwrap(),
+            "fixture",
+            &GenerateRequest {
+                messages: vec![],
+                max_tokens: 1,
+                timeout: Duration::from_secs(1),
+            },
+        );
+        assert_eq!(result, Err(LocalLlmError::Http(302)));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn wbsec_private_socket_permissions_ownership_and_cleanup() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(PrivateSocket::create(root.path()).is_err());
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = PrivateSocket::create(root.path()).unwrap();
+        let directory = socket.path.parent().unwrap().to_path_buf();
+        let metadata = std::fs::metadata(&directory).unwrap();
+        assert_eq!(metadata.mode() & 0o777, 0o700);
+        assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+        assert!(validate_private_dir(&directory, metadata.uid() + 1).is_err());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_private_dir(&directory, metadata.uid()).is_err());
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&socket.path).unwrap();
+        drop(socket);
+        assert!(!directory.exists());
+        drop(listener);
+        let long = root.path().join("x".repeat(108));
+        std::fs::create_dir(&long).unwrap();
+        std::fs::set_permissions(&long, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(PrivateSocket::create(&long).is_err());
+        assert_eq!(std::fs::read_dir(&long).unwrap().count(), 0);
+    }
+
+    #[test]
     fn env_override_wins_and_missing_binary_is_an_error() {
         let dir = tempfile::tempdir().unwrap();
         let installed = dir.path().join("installed");
@@ -677,11 +1026,16 @@ mod tests {
 
     #[test]
     fn server_args_match_the_card_contract() {
-        let args = server_args(Path::new("/m/s1.gguf"), 4242, 4, 4096);
+        let args = server_args(
+            Path::new("/m/s1.gguf"),
+            Path::new("/private/llm.sock"),
+            4,
+            4096,
+        );
         let args: Vec<String> = args.into_iter().map(|a| a.into_string().unwrap()).collect();
         assert_eq!(
             args.join(" "),
-            "-m /m/s1.gguf --host 127.0.0.1 --port 4242 -t 4 -c 4096 -np 1 --temp 0 --jinja --chat-template-kwargs {\"enable_thinking\":false} --no-webui"
+            "-m /m/s1.gguf --host /private/llm.sock -t 4 -c 4096 -np 1 --temp 0 --jinja --chat-template-kwargs {\"enable_thinking\":false} --no-webui"
         );
     }
 
@@ -689,7 +1043,12 @@ mod tests {
     fn api_key_travels_in_the_environment_not_argv() {
         let options = opts(PathBuf::from("/m/s1.gguf"), Duration::from_secs(10));
         let key = "test-only-key";
-        let cmd = build_command(Path::new("/llm/llama-server"), &options, 4242, key);
+        let cmd = build_command(
+            Path::new("/llm/llama-server"),
+            &options,
+            Path::new("/private/llm.sock"),
+            key,
+        );
         assert!(!cmd.get_args().any(|arg| arg == "--api-key" || arg == key));
         assert!(cmd.get_envs().any(|(name, value)| {
             name == "LLAMA_API_KEY" && value == Some(std::ffi::OsStr::new(key))
@@ -698,7 +1057,12 @@ mod tests {
 
     #[test]
     fn server_args_clamp_zero_threads_to_one() {
-        let args = server_args(Path::new("/m/s1.gguf"), 4242, 0, 4096);
+        let args = server_args(
+            Path::new("/m/s1.gguf"),
+            Path::new("/private/llm.sock"),
+            0,
+            4096,
+        );
         let threads = args.iter().position(|arg| arg == "-t").unwrap();
         assert_eq!(args[threads + 1], OsString::from("1"));
     }
@@ -714,13 +1078,12 @@ mod tests {
 
     #[test]
     fn health_wait_succeeds_after_a_503() {
-        let (port, server) = serve(vec![(503, "{}".into()), (200, "{}".into())]);
+        let (dir, server) = serve(vec![(503, "{}".into()), (200, "{}".into())]);
         let mut child = sleeper();
         let cancel = AtomicBool::new(false);
-        let client = loopback_client().unwrap();
+        let client = socket_client(&dir.path().join("s.sock")).unwrap();
         let r = wait_healthy(
             &client,
-            port,
             &mut child,
             Instant::now() + Duration::from_secs(5),
             &cancel,
@@ -732,13 +1095,13 @@ mod tests {
 
     #[test]
     fn health_wait_reports_an_exited_child() {
+        let dir = tempfile::tempdir().unwrap();
         let mut child = Command::new("true").spawn().unwrap();
         std::thread::sleep(Duration::from_millis(100));
         let cancel = AtomicBool::new(false);
-        let client = loopback_client().unwrap();
+        let client = socket_client(&dir.path().join("s.sock")).unwrap();
         let r = wait_healthy(
             &client,
-            pick_port().unwrap(),
             &mut child,
             Instant::now() + Duration::from_secs(5),
             &cancel,
@@ -748,13 +1111,13 @@ mod tests {
 
     #[test]
     fn health_wait_times_out_and_honours_cancel() {
-        let client = loopback_client().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let client = socket_client(&dir.path().join("s.sock")).unwrap();
         let mut child = sleeper();
         let cancel = AtomicBool::new(false);
         let t0 = Instant::now();
         let r = wait_healthy(
             &client,
-            pick_port().unwrap(),
             &mut child,
             t0 + Duration::from_millis(300),
             &cancel,
@@ -764,7 +1127,6 @@ mod tests {
         cancel.store(true, Ordering::SeqCst);
         let r = wait_healthy(
             &client,
-            pick_port().unwrap(),
             &mut child,
             Instant::now() + Duration::from_secs(30),
             &cancel,
@@ -776,7 +1138,7 @@ mod tests {
     #[test]
     fn post_chat_sends_the_contract_and_reads_content() {
         let reply = r#"{"choices":[{"message":{"role":"assistant","content":"Hello there."}}]}"#;
-        let (port, server) = serve(vec![(200, reply.into())]);
+        let (dir, server) = serve(vec![(200, reply.into())]);
         let req = GenerateRequest {
             messages: vec![
                 ChatMessage {
@@ -791,7 +1153,12 @@ mod tests {
             max_tokens: 71,
             timeout: Duration::from_secs(5),
         };
-        let out = post_chat(&loopback_client().unwrap(), port, "k3y", &req).unwrap();
+        let out = post_chat(
+            &socket_client(&dir.path().join("s.sock")).unwrap(),
+            "k3y",
+            &req,
+        )
+        .unwrap();
         assert_eq!(out, "Hello there.");
         let seen = server.join().unwrap();
         let raw = &seen[0];
@@ -813,10 +1180,9 @@ mod tests {
     fn wbfix3_truncated_response_is_bad_output() {
         let reply =
             r#"{"choices":[{"finish_reason":"length","message":{"content":"Incomplete"}}]}"#;
-        let (port, server) = serve(vec![(200, reply.into())]);
+        let (dir, server) = serve(vec![(200, reply.into())]);
         let result = post_chat(
-            &loopback_client().unwrap(),
-            port,
+            &socket_client(&dir.path().join("s.sock")).unwrap(),
             "fixture-key",
             &GenerateRequest {
                 messages: vec![],
@@ -836,8 +1202,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let binary = fake_binary(dir.path(), "printf 'fixture-key /private/fixture/model\\n'; printf 'fixture-key /private/fixture/model\\n' >&2");
         let options = opts(dir.path().join("model"), Duration::from_secs(2));
-        let mut child =
-            spawn_from_supervisor(build_command(&binary, &options, 4242, "fixture-key")).unwrap();
+        let mut child = spawn_from_supervisor(build_command(
+            &binary,
+            &options,
+            Path::new("/private/llm.sock"),
+            "fixture-key",
+        ))
+        .unwrap();
         let pipes = (child.stdout.take(), child.stderr.take());
         assert!(child.wait().unwrap().success());
         assert!(
@@ -848,19 +1219,16 @@ mod tests {
 
     #[test]
     fn post_chat_maps_http_errors_and_missing_content() {
-        let (port, server) = serve(vec![(401, "{}".into()), (200, "{}".into())]);
+        let (dir, server) = serve(vec![(401, "{}".into()), (200, "{}".into())]);
         let req = GenerateRequest {
             messages: vec![],
             max_tokens: 8,
             timeout: Duration::from_secs(5),
         };
-        let client = loopback_client().unwrap();
-        assert_eq!(
-            post_chat(&client, port, "k", &req),
-            Err(LocalLlmError::Http(401))
-        );
+        let client = socket_client(&dir.path().join("s.sock")).unwrap();
+        assert_eq!(post_chat(&client, "k", &req), Err(LocalLlmError::Http(401)));
         assert!(matches!(
-            post_chat(&client, port, "k", &req),
+            post_chat(&client, "k", &req),
             Err(LocalLlmError::BadOutput(_))
         ));
         server.join().unwrap();
@@ -894,7 +1262,7 @@ mod tests {
     }
 
     #[test]
-    fn early_exit_is_retried_once_with_a_new_port() {
+    fn early_exit_is_retried_once_with_a_new_socket() {
         let dir = tempfile::tempdir().unwrap();
         let counter = dir.path().join("spawns");
         let bin = fake_binary(
@@ -911,6 +1279,13 @@ mod tests {
         let spawns = std::fs::read_to_string(&counter).unwrap();
         assert_eq!(spawns.lines().count(), 2);
         assert!(!backend.is_alive());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("llm-runtime"))
+                .unwrap()
+                .count(),
+            0,
+            "failed starts must remove socket directories"
+        );
     }
 
     #[test]
