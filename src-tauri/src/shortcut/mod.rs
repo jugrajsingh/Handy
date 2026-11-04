@@ -1095,7 +1095,7 @@ pub(crate) fn change_post_process_enabled_with(
             if enabled {
                 register_shortcut(app, binding.clone())?;
             } else {
-                unregister_shortcut(app, binding.clone())?;
+                let _ = unregister_shortcut(app, binding.clone());
             }
         }
         if raw_restored {

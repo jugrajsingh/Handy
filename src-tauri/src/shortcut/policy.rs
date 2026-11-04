@@ -638,25 +638,18 @@ pub(crate) mod command_path_tests {
     }
 
     #[test]
-    fn refused_toggle_never_refreshes_tray() {
-        for enabled in [false, true] {
-            let mut saved = enabled_settings(KeyboardImplementation::Tauri);
-            saved.post_process_enabled = !enabled;
-            let context = CommandTestContext::new(saved);
-            if enabled {
-                context.register_error.set(true);
-            } else {
-                context.seed_dictation();
-                context.unregister_error.set(true);
-            }
-            let refreshes = Cell::new(0);
-            assert!(change_post_process_enabled_with(&context, enabled, || {
-                refreshes.set(refreshes.get() + 1);
-            })
-            .is_err());
-            assert_eq!(refreshes.get(), 0);
-            assert_eq!(context.persisted().post_process_enabled, !enabled);
-        }
+    fn refused_enable_never_refreshes_tray() {
+        let mut saved = enabled_settings(KeyboardImplementation::Tauri);
+        saved.post_process_enabled = false;
+        let context = CommandTestContext::new(saved);
+        context.register_error.set(true);
+        let refreshes = Cell::new(0);
+        assert!(change_post_process_enabled_with(&context, true, || {
+            refreshes.set(refreshes.get() + 1);
+        })
+        .is_err());
+        assert_eq!(refreshes.get(), 0);
+        assert!(!context.persisted().post_process_enabled);
     }
 
     #[test]
@@ -710,6 +703,17 @@ pub(crate) mod command_path_tests {
                 .borrow()
                 .contains_key("transcribe_with_post_process"));
         }
+    }
+
+    #[test]
+    fn wbfix3_disable_tolerates_unregistered_cleanup_binding() {
+        let context = CommandTestContext::new(enabled_settings(KeyboardImplementation::Tauri));
+        context.unregister_error.set(true);
+        assert!(
+            change_post_process_enabled_with(&context, false, || {}).is_ok(),
+            "disabling must tolerate an absent native binding"
+        );
+        assert!(!context.persisted().post_process_enabled);
     }
 
     #[test]
