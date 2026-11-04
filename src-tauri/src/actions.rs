@@ -111,6 +111,15 @@ impl Drop for FinishGuard {
     }
 }
 
+/// Reports a refused paste before settling its processing generation.
+pub(crate) fn paste_admission_failed_with(notify: impl FnOnce(Notice), settle: impl FnOnce()) {
+    notify(Notice::new(
+        NoticeCode::PasteFailed,
+        NoticeSource::Dictation,
+    ));
+    settle();
+}
+
 // Shortcut Action Trait
 pub trait ShortcutAction: Send + Sync {
     fn start(&self, app: &AppHandle, binding_id: &str, shortcut_str: &str);
@@ -1111,15 +1120,35 @@ impl ShortcutAction for TranscribeAction {
                                     }),
                                     Arc::new(move |error| {
                                         error!("Failed to queue transcription paste: {error}");
-                                        utils::hide_recording_overlay(&failure_app);
-                                        set_tray_state(&failure_app, TrayIconState::Idle);
-                                        emit_transcription_complete(
-                                            &failure_app,
-                                            TranscriptionOutcome::Failed,
-                                            sample_count,
-                                            stop_time,
+                                        let owns_ui =
+                                            RECORDING_SESSION.load(Ordering::SeqCst) == session;
+                                        paste_admission_failed_with(
+                                            |notice| {
+                                                if owns_ui {
+                                                    notices::raise(&failure_app, notice);
+                                                } else {
+                                                    notices::raise_without_overlay(
+                                                        &failure_app,
+                                                        notice,
+                                                    );
+                                                }
+                                            },
+                                            || {
+                                                if owns_ui {
+                                                    set_tray_state(
+                                                        &failure_app,
+                                                        TrayIconState::Idle,
+                                                    );
+                                                }
+                                                emit_transcription_complete(
+                                                    &failure_app,
+                                                    TranscriptionOutcome::Failed,
+                                                    sample_count,
+                                                    stop_time,
+                                                );
+                                                failed_completion.settle_with(|| {});
+                                            },
                                         );
-                                        failed_completion.settle_with(|| {});
                                     }),
                                 );
                             }
