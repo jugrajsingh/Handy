@@ -14,7 +14,7 @@ type ReportedPosition = (u32, u32, f64, f64);
 type CursorFactory = for<'s> fn(&'s str, bool) -> Result<TextCursor<'s>, String>;
 
 fn text_cursor(source: &str, read_code: bool) -> Result<TextCursor<'_>, String> {
-    TextCursor::new(source, read_code).map_err(|_| "tts.errors.text".to_string())
+    TextCursor::streaming(source, read_code).map_err(|_| "tts.errors.text".to_string())
 }
 
 fn dsp_clock() -> Box<dyn Fn() -> f64 + Send> {
@@ -27,6 +27,12 @@ fn dsp_clock() -> Box<dyn Fn() -> f64 + Send> {
         let origin = std::time::Instant::now();
         Box::new(move || origin.elapsed().as_secs_f64())
     }
+}
+
+fn render(pcm: Pcm, stretch: f32, pitch: f32) -> Result<Pcm, dsp::DspError> {
+    let mut pcm = dsp::stretch(pcm, stretch, pitch)?;
+    pcm.samples = crate::edges::trim(pcm.samples, pcm.sample_rate).samples;
+    Ok(pcm)
 }
 
 /// Splits NPU input at word boundaries using the engine's token or frame capacity check.
@@ -101,6 +107,8 @@ pub trait Worker {
     /// Cancels requests no longer retained by the scheduler.
     fn retain_requests(&mut self, _tickets: &[Ticket]) {}
     fn poll(&mut self) -> Option<Completion>;
+    /// Observes rendered speech before queue splitting and punctuation pauses.
+    fn rendered(&mut self, _ticket: Ticket, _pcm: &Pcm) {}
     /// Supplies an optional request limit before each new request, including memory adapt-down.
     fn available_lanes(&mut self) -> Option<usize> {
         None
@@ -227,7 +235,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         output: O,
         handy_output: Option<&str>,
     ) -> Result<Self, String> {
-        let cursor = TextCursor::new(source, selection.read_code)
+        let cursor = TextCursor::streaming(source, selection.read_code)
             .map_err(|_| "tts.errors.text".to_string())?;
         let playback = Playback::idle(output);
         Ok(Self {
@@ -550,7 +558,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         };
         let began = (self.dsp_clock)();
         let native = crate::edges::trim(pcm.samples, pcm.sample_rate).samples;
-        let pcm = match dsp::stretch(
+        let pcm = match render(
             Pcm {
                 samples: native.clone(),
                 ..pcm
@@ -566,6 +574,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             }
         };
         let elapsed = completion.synthesis_seconds + ((self.dsp_clock)() - began).max(0.0);
+        self.worker.rendered(completion.ticket, &pcm);
         let seconds = pcm.samples.len() as f64 / f64::from(pcm.sample_rate);
         let pause_ms = self
             .metadata
@@ -792,7 +801,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 continue;
             }
             if let Some(stretch) = crate::speed::restretch(audio.plan.native, speed) {
-                audio.pcm = dsp::stretch(
+                audio.pcm = render(
                     Pcm {
                         samples: audio.native.clone(),
                         ..audio.pcm.clone()
@@ -831,7 +840,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                         .iter_mut()
                         .flat_map(|(_, native)| std::mem::take(native))
                         .collect();
-                    let pcm = dsp::stretch(
+                    let pcm = render(
                         Pcm {
                             id,
                             sample_rate: rate,
@@ -1090,6 +1099,49 @@ impl<W: Worker, O: Output> Drop for Session<'_, W, O> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rendered_edges_redetect_faded_crossings_and_capped_leading_quiet() {
+        let rate = 24000;
+        for leading in [3360, 31234] {
+            let mut raw = vec![0.0; leading + 12000 + 4800];
+            if leading == 3360 {
+                raw[2] = crate::edges::THRESHOLD;
+                let last = raw.len() - 3;
+                raw[last] = crate::edges::THRESHOLD;
+            }
+            raw[leading..leading + 12000].fill(0.25);
+            raw[leading + 4000..leading + 6000].fill(0.0);
+            let native = crate::edges::trim(raw, rate);
+            assert_eq!(native.lead_removed, if leading == 3360 { 0 } else { 24000 });
+            let rendered = render(
+                Pcm {
+                    id: 1,
+                    sample_rate: rate,
+                    samples: native.samples,
+                },
+                1.0,
+                0.0,
+            )
+            .unwrap();
+            let first = rendered
+                .samples
+                .iter()
+                .position(|s| s.abs() >= crate::edges::THRESHOLD)
+                .unwrap();
+            let last = rendered
+                .samples
+                .iter()
+                .rposition(|s| s.abs() >= crate::edges::THRESHOLD)
+                .unwrap();
+            assert_eq!(first, 240, "rendered leading quiet must equal the guard");
+            assert_eq!(rendered.samples.len() - last - 1, 240);
+            assert_eq!(rendered.samples.len(), 12480);
+            assert_eq!(&rendered.samples[240..4240], &[0.25; 4000]);
+            assert_eq!(&rendered.samples[4240..6240], &[0.0; 2000]);
+            assert_eq!(&rendered.samples[6240..12240], &[0.25; 6000]);
+        }
+    }
     use crate::playback::PlaybackError;
     use std::rc::Rc;
     #[derive(Default)]
@@ -1339,6 +1391,97 @@ mod tests {
         assert_eq!(session.queue.failed_index, None);
         assert!(session.queue.in_flight.contains_key(&0));
     }
+
+    #[test]
+    fn variable_length_requests_sustain_playback_within_the_read_ahead_budget() {
+        struct VariableWorker {
+            now: f64,
+            cost_per_character: f64,
+            pending: Vec<(f64, Completion)>,
+            texts: Vec<String>,
+        }
+        impl Worker for VariableWorker {
+            fn request(&mut self, ticket: Ticket, text: &str, _: &Selection) -> Result<(), String> {
+                let chars = text.chars().count();
+                let elapsed = chars as f64 * self.cost_per_character;
+                self.texts.push(text.into());
+                self.pending.push((
+                    self.now + elapsed,
+                    Completion {
+                        ticket,
+                        result: Ok(Pcm {
+                            id: ticket.index as u64,
+                            sample_rate: 8000,
+                            samples: vec![0.25; (chars * 8000).div_ceil(15)],
+                        }),
+                        synthesis_seconds: elapsed,
+                    },
+                ));
+                Ok(())
+            }
+            fn poll(&mut self) -> Option<Completion> {
+                let index = self.pending.iter().position(|(end, _)| *end <= self.now)?;
+                Some(self.pending.remove(index).1)
+            }
+            fn available_lanes(&mut self) -> Option<usize> {
+                Some(3)
+            }
+            fn cancel(&mut self, ticket: Ticket) {
+                self.pending.retain(|(_, c)| c.ticket != ticket);
+            }
+            fn selection_changed(&mut self) {}
+        }
+        let source = "ordinary words ".repeat(100);
+        for (speed, cost) in [(1.0, 0.055), (2.0, 0.02)] {
+            let worker = VariableWorker {
+                now: 0.0,
+                cost_per_character: cost,
+                pending: vec![],
+                texts: vec![],
+            };
+            let mut s = Session::new(
+                &source,
+                Selection {
+                    speed,
+                    ..selection()
+                },
+                worker,
+                FakeOutput::default(),
+                None,
+            )
+            .unwrap();
+            s.play().unwrap();
+            for step in 0..6000 {
+                let now = f64::from(step) * 0.05;
+                s.worker.now = now;
+                s.playback.output.now = now;
+                s.tick(now).unwrap();
+                assert!(s.queue.queued_seconds() <= 30.0);
+                assert!(s.queue.stored_seconds() <= 60.0);
+                if s.queue.state == PlaybackState::Finished {
+                    break;
+                }
+            }
+            assert_eq!(s.queue.state, PlaybackState::Finished);
+            assert_eq!(
+                s.queue.buffering_pauses, 0,
+                "variable-length synthesis must stay ahead"
+            );
+            let words: Vec<_> = s
+                .worker
+                .texts
+                .iter()
+                .flat_map(|t| t.split_whitespace())
+                .collect();
+            assert_eq!(words.len(), 200);
+            assert_eq!(
+                words[..199],
+                source.split_whitespace().take(199).collect::<Vec<_>>()
+            );
+            assert_eq!(words[199], "words.");
+            assert_eq!(s.playback.output.played.len(), s.worker.texts.len());
+        }
+    }
     mod streaming {
         use super::*;
         use crate::{
@@ -1496,7 +1639,7 @@ mod tests {
                 assert!(s.playback.current_index().is_none());
                 assert_eq!(s.playback.content_samples(), 0);
                 let native = crate::edges::trim(vec![0.25; 8000], 8000).samples;
-                let expected = dsp::stretch(
+                let expected = render(
                     Pcm {
                         id: 0,
                         sample_rate: 8000,
@@ -2061,7 +2204,7 @@ mod tests {
             "alpha beta gamma delta ".repeat(60)
         );
         let target = source.find("The destination").unwrap() as u32;
-        let mut cursor = TextCursor::new(&source, true).unwrap();
+        let mut cursor = TextCursor::streaming(&source, true).unwrap();
         let mut destination = None;
         while let Some(chunk) = cursor.next_chunk().unwrap() {
             if chunk.source_start == target {
@@ -2070,8 +2213,8 @@ mod tests {
             }
         }
         let destination = destination.unwrap();
-        assert_eq!(destination, 6);
-        let mut cursor = TextCursor::new(&source, false).unwrap();
+        assert_eq!(destination, 16);
+        let mut cursor = TextCursor::streaming(&source, false).unwrap();
         let mut expected = Vec::new();
         while let Some(chunk) = cursor.next_chunk().unwrap() {
             if chunk.source_start >= target {
@@ -2612,7 +2755,7 @@ mod tests {
                 }
             }
             assert_eq!(s.queue.state, PlaybackState::Finished);
-            assert!(s.worker.requests.iter().any(|text| text.len() > 200));
+            assert!(s.worker.requests.iter().any(|text| text.len() > 64));
             assert!(s.worker.calls.len() > s.worker.requests.len());
             let requested_words: Vec<_> = s
                 .worker

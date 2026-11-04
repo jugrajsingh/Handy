@@ -245,7 +245,17 @@ fn lane_loop(
     busy: &AtomicBool,
     tx: &mpsc::SyncSender<Event>,
 ) {
+    let trace = std::env::var_os("HANDY_TTS_TRACE_TIMINGS").is_some();
     for job in jobs {
+        let began = std::time::Instant::now();
+        if trace {
+            eprintln!(
+                "SYNTH_START lane={:?} id={} time={:?}",
+                std::thread::current().name(),
+                job.id,
+                std::time::SystemTime::now()
+            );
+        }
         let result = (|| {
             let samples = synthesize_bounded(engine.as_mut(), &job.text, job.speed, &job.cancel)?;
             ensure!(
@@ -260,6 +270,15 @@ fn lane_loop(
             );
             Ok((engine.sample_rate(), samples))
         })();
+        if trace {
+            eprintln!(
+                "SYNTH_END lane={:?} id={} time={:?} seconds={:.6}",
+                std::thread::current().name(),
+                job.id,
+                std::time::SystemTime::now(),
+                began.elapsed().as_secs_f64()
+            );
+        }
         let result = chunk_reply(writer, job.id, &job.cancel, result, || {
             let mut flags = flags
                 .lock()

@@ -8,7 +8,7 @@ pub struct Trimmed {
     pub tail_removed: usize,
 }
 
-/// Trims quiet edges with bounded guards and fades.
+/// Trims raw or rendered quiet edges with per-pass caps, a 10 ms guard and final fades.
 pub fn trim(mut samples: Vec<f32>, rate: u32) -> Trimmed {
     let Some(first) = samples.iter().position(|s| s.abs() >= THRESHOLD) else {
         return Trimmed {

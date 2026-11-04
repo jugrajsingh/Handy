@@ -32,9 +32,42 @@ fn resident_memory() -> Result<f64> {
     )
 }
 
+fn edge_diagnostics(samples: &[f32], rate: u32) -> serde_json::Value {
+    let first = samples
+        .iter()
+        .position(|s| s.abs() >= handy_tts_core::edges::THRESHOLD);
+    let last = samples
+        .iter()
+        .rposition(|s| s.abs() >= handy_tts_core::edges::THRESHOLD);
+    serde_json::json!({"samples": samples.len(), "sample_rate": rate,
+        "lead_samples": first, "tail_samples": last.map(|i| samples.len() - i - 1),
+        "all_quiet": first.is_none()})
+}
+
+fn join_diagnostics(
+    a: &serde_json::Value,
+    b: &serde_json::Value,
+    rate: u32,
+) -> Option<serde_json::Value> {
+    let millis = |samples: u64| samples as f64 * 1000.0 / f64::from(rate);
+    let pause = a["pause_samples"].as_u64()?;
+    let tail = a["scheduled"]
+        .as_u64()?
+        .checked_sub(pause)?
+        .checked_sub(a["last_loud"].as_u64()? + 1)?;
+    let lead = b["first_loud"].as_u64()?;
+    let dry = b["started_sample"]
+        .as_u64()?
+        .checked_sub(a["finished_sample"].as_u64()?)?;
+    Some(
+        serde_json::json!({"rendered_tail_ms": millis(tail), "rendered_lead_ms": millis(lead),
+        "pause_ms": millis(pause), "dry_ms": millis(dry), "gap_ms": millis(tail + lead + pause + dry)}),
+    )
+}
+
 fn measurement_chunks(corpus: &Path) -> Result<Vec<handy_tts_core::text::TextChunk>> {
     let source = std::fs::read_to_string(corpus).context("read explicit measurement corpus")?;
-    let mut cursor = TextCursor::new(&source, false)?;
+    let mut cursor = TextCursor::streaming(&source, false)?;
     let mut chunks = Vec::new();
     while chunks.len() < 7 {
         let Some(chunk) = cursor.next_chunk()? else {
@@ -230,7 +263,7 @@ fn first_audio_latency(
 ) -> Result<f64> {
     use handy_tts_core::scheduler::{AudioChunk, Queue};
     let began = clock();
-    let mut cursor = TextCursor::new(source, false)?;
+    let mut cursor = TextCursor::streaming(source, false)?;
     let mut queue = Queue::with_speed(1.0);
     queue.play();
     loop {
@@ -434,7 +467,7 @@ pub fn continuity(
 ) -> Result<()> {
     let model = catalog::entry(id)?;
     let source = std::fs::read_to_string(corpus).context("read explicit continuity corpus")?;
-    let mut cursor = TextCursor::new(&source, false)?;
+    let mut cursor = TextCursor::streaming(&source, false)?;
     let mut pauses = Vec::new();
     let long_document = source.split_whitespace().count() >= 2000;
     let mut coverage_words = Vec::new();
@@ -477,6 +510,7 @@ pub fn continuity(
     let parent_before = stable_parent_samples()?;
     let began = Instant::now();
     let worker = ProcessWorker::start(id, root, device, cache, lanes)?;
+    eprintln!("CONTINUITY_LOAD lanes={lanes} mem_available={before}");
     let load_seconds = began.elapsed().as_secs_f64();
     let selection = handy_tts_core::selection::Selection {
         model_id: id.into(),
@@ -539,14 +573,15 @@ pub fn continuity(
                 "trimmed_samples",
                 "lead_removed",
                 "tail_removed",
+                "rendered_samples",
+                "rendered_edges",
             ] {
                 chunk[key] = raw[key].clone();
             }
             chunk["dsp_seconds"] = (*dsp_times.1.get(index).context("DSP timing missing")?).into();
         }
     }
-    let plan = handy_tts_core::speed::plan(options.speed, model.native_speed)?;
-    let chunks = aggregate_chunks(&capture.chunks, &pauses, rate, options.speed, plan.stretch)?;
+    let chunks = aggregate_chunks(&capture.chunks, &pauses, rate, options.speed)?;
     let mut rtfs = chunks
         .iter()
         .map(|chunk| {
@@ -600,6 +635,7 @@ pub fn continuity(
             "wav": coverage_wav, "source_wav": options.wav, "expected_words": coverage_words},
         "unload_delta_mib": (before as f64 - after as f64) / 1048576.0,
         "median_rtf": median,
+        "requests": session.worker.records,
     });
     if let Some(directory) = options.gpu_inputs {
         ensure!(
@@ -707,7 +743,7 @@ fn gpu_repeat_timings(
     let mut first = Vec::new();
     let mut repeat = Vec::new();
     for (_, source) in first_audio_documents(directory)? {
-        let mut cursor = TextCursor::new(&source, false)?;
+        let mut cursor = TextCursor::streaming(&source, false)?;
         while let Some(chunk) = cursor.next_chunk()? {
             for times in [&mut first, &mut repeat] {
                 let start = Instant::now();
@@ -734,7 +770,6 @@ fn aggregate_chunks(
     pauses: &[u32],
     rate: u32,
     requested: f32,
-    stretch: f32,
 ) -> Result<Vec<serde_json::Value>> {
     let mut chunks = Vec::new();
     let mut position = 0;
@@ -755,11 +790,9 @@ fn aggregate_chunks(
         let last = &segments[position - 1];
         let mut row = first.clone();
         let pause = handy_tts_core::edges::pause_samples(pauses[index], requested, rate);
-        let speech = (first["trimmed_samples"]
+        let speech = first["rendered_samples"]
             .as_u64()
-            .context("native length missing")? as f64
-            / f64::from(stretch))
-        .round() as u64;
+            .context("rendered speech length missing")?;
         row["scheduled"] = (speech + pause as u64).into();
         row["pause_samples"] = pause.into();
         row["delivered"] = segments[begin..position]
@@ -771,6 +804,7 @@ fn aggregate_chunks(
             .into();
         row["finished_sample"] = last["finished_sample"].clone();
         row["gap_after_ms"] = last["gap_after_ms"].clone();
+        row["join"] = last["join"].clone();
         let start = first["started_sample"].as_u64();
         let loud_position = |segment: &serde_json::Value, key: &str| {
             segment[key]
@@ -841,6 +875,7 @@ impl ProcessWorker {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
+            .env("HANDY_TTS_TRACE_TIMINGS", "1")
             .spawn()
             .context("spawn continuity worker")?;
         let result = (|| -> Result<_> {
@@ -964,6 +999,12 @@ impl Drop for ProcessWorker {
     }
 }
 impl handy_tts_core::session::Worker for ProcessWorker {
+    fn rendered(&mut self, ticket: handy_tts_core::scheduler::Ticket, pcm: &Pcm) {
+        if let Some(record) = self.records.iter_mut().find(|r| r["index"] == ticket.index) {
+            record["rendered_samples"] = pcm.samples.len().into();
+            record["rendered_edges"] = edge_diagnostics(&pcm.samples, pcm.sample_rate);
+        }
+    }
     fn request(
         &mut self,
         ticket: handy_tts_core::scheduler::Ticket,
@@ -972,6 +1013,13 @@ impl handy_tts_core::session::Worker for ProcessWorker {
     ) -> Result<(), String> {
         let id = self.next_id;
         self.next_id += 1;
+        eprintln!(
+            "CONTINUITY_REQUEST id={id} index={} chars={} pending={} lanes={}",
+            ticket.index,
+            text.chars().count(),
+            self.pending.len(),
+            self.lanes
+        );
         handy_tts_core::protocol::write_request(
             &mut self.input,
             &handy_tts_core::protocol::Request::Synthesize {
@@ -992,9 +1040,12 @@ impl handy_tts_core::session::Worker for ProcessWorker {
         let (ticket, began) = self.pending.remove(&id)?;
         let synthesis_seconds = received.duration_since(began).as_secs_f64();
         if let Ok(pcm) = &result {
+            let raw = edge_diagnostics(&pcm.samples, pcm.sample_rate);
             let trim = handy_tts_core::edges::trim(pcm.samples.clone(), pcm.sample_rate);
+            let trimmed = edge_diagnostics(&trim.samples, pcm.sample_rate);
             self.records.push(serde_json::json!({"index": ticket.index, "synthesis_seconds": synthesis_seconds,
-                "trimmed_samples": trim.samples.len(), "lead_removed": trim.lead_removed, "tail_removed": trim.tail_removed}));
+                "trimmed_samples": trim.samples.len(), "lead_removed": trim.lead_removed, "tail_removed": trim.tail_removed,
+                "raw_edges": raw, "trimmed_edges": trimmed}));
         }
         Some(handy_tts_core::session::Completion {
             ticket,
@@ -1007,6 +1058,7 @@ impl handy_tts_core::session::Worker for ProcessWorker {
             .is_ok_and(|m| m < handy_tts_core::memory::LANE_RESERVE_BYTES)
             && self.lanes > 1
         {
+            eprintln!("CONTINUITY_LANES lower_to=1");
             self.lanes = 1;
             let _ = handy_tts_core::protocol::write_request(
                 &mut self.input,
@@ -1076,14 +1128,27 @@ impl CaptureState {
                 match event {
                     FeedEvent::Started(index) => {
                         self.first_started = true;
-                        let row = self
+                        let position = self
                             .chunks
-                            .iter_mut()
-                            .find(|r| r["index"] == index)
+                            .iter()
+                            .position(|r| r["index"] == index)
                             .context("unrecorded segment started")?;
+                        let row = &mut self.chunks[position];
                         row["started_sample"] = self.position.into();
                         row["started_seconds"] =
                             self.origin.map(|t| t.elapsed().as_secs_f64()).into();
+                        if position > 0 {
+                            let join = join_diagnostics(
+                                &self.chunks[position - 1],
+                                &self.chunks[position],
+                                self.feed.sample_rate(),
+                            );
+                            eprintln!(
+                                "CONTINUITY_JOIN before={} next={index} components={}",
+                                self.chunks[position - 1]["index"],
+                                serde_json::to_string(&join)?
+                            );
+                        }
                     }
                     FeedEvent::Finished { index, delivered } => {
                         let row = self
@@ -1128,6 +1193,12 @@ impl CaptureState {
                         / f64::from(self.feed.sample_rate())
                 });
             self.chunks[index]["gap_after_ms"] = gap.into();
+            self.chunks[index]["join"] = join_diagnostics(
+                &self.chunks[index],
+                &self.chunks[index + 1],
+                self.feed.sample_rate(),
+            )
+            .into();
         }
         if let Some(wav) = &mut self.wav {
             let bytes =
@@ -1301,6 +1372,7 @@ fn drive_session<W: CaptureWorker>(
         let result = (|| -> Result<()> {
             session.play().map_err(anyhow::Error::msg)?;
             let mut last_progress = 0.0;
+            let mut last_queue = None;
             for step in 0..1_800_000u64 {
                 let now = if real_time {
                     origin.elapsed().as_secs_f64()
@@ -1312,6 +1384,38 @@ fn drive_session<W: CaptureWorker>(
                 }
                 session.tick(now).map_err(anyhow::Error::msg)?;
                 let snapshot = session.snapshot();
+                let queue_key = (
+                    snapshot.state,
+                    session.queue.next_index,
+                    session.queue.observations,
+                    session.queue.in_flight.len(),
+                    session.queue.waiting.len(),
+                    session.queue.ready.len(),
+                );
+                if real_time && last_queue != Some(queue_key) {
+                    let chunks = session
+                        .queue
+                        .playing
+                        .iter()
+                        .chain(&session.queue.waiting)
+                        .chain(session.queue.ready.values());
+                    let (native, rendered) = chunks.fold((0usize, 0usize), |(n, r), a| {
+                        (n + a.native.len(), r + a.pcm.samples.len())
+                    });
+                    eprintln!(
+                        "CONTINUITY_QUEUE seconds={now:.6} state={:?} next={} lanes={} in_flight={} queued={} stored={} native_samples={native} rendered_samples={rendered} rtf={} head={} read_ahead={}",
+                        snapshot.state,
+                        session.queue.next_index,
+                        session.queue.lanes,
+                        session.queue.in_flight.len(),
+                        session.queue.queued_seconds(),
+                        session.queue.stored_seconds(),
+                        session.queue.rtf_played,
+                        session.queue.target_seconds(),
+                        session.queue.read_ahead_seconds()
+                    );
+                    last_queue = Some(queue_key);
+                }
                 ensure!(
                     snapshot.state != PlaybackState::Error,
                     "continuity session failed: {:?}",
@@ -1382,6 +1486,27 @@ fn drive_session<W: CaptureWorker>(
 #[cfg(test)]
 mod measurement_tests {
     use super::*;
+    #[test]
+    fn edge_diagnostics_separate_quiet_edges_from_speech_and_keep_quiet_chunks() {
+        let edges = edge_diagnostics(&[0.0, 0.0, 0.5, 0.0, 0.5, 0.0], 8000);
+        assert_eq!(edges["lead_samples"], 2);
+        assert_eq!(edges["tail_samples"], 1);
+        assert_eq!(edges["samples"], 6);
+        assert_eq!(edges["all_quiet"], false);
+        assert_eq!(edge_diagnostics(&[0.0; 4], 8000)["all_quiet"], true);
+    }
+    #[test]
+    fn join_diagnostics_account_for_rendered_edges_pause_and_dry_interval() {
+        let a = serde_json::json!({"started_sample": 0, "finished_sample": 1000, "scheduled": 1000, "pause_samples": 200, "last_loud": 719});
+        let b = serde_json::json!({"started_sample": 1080, "first_loud": 80});
+        let join = join_diagnostics(&a, &b, 8000).unwrap();
+        assert_eq!(join["rendered_tail_ms"], 10.0);
+        assert_eq!(join["rendered_lead_ms"], 10.0);
+        assert_eq!(join["pause_ms"], 25.0);
+        assert_eq!(join["dry_ms"], 10.0);
+        assert_eq!(join["gap_ms"], 55.0);
+        assert!(join_diagnostics(&a, &serde_json::json!({}), 8000).is_none());
+    }
     #[test]
     fn seven_observation_median_and_p95_use_observed_values_without_interpolation() {
         assert_eq!(
@@ -1601,12 +1726,12 @@ mod continuity_tests {
         drive_session(&mut session, false, false).unwrap();
         let capture = session.playback.output.state.lock().unwrap();
         let rows = &capture.chunks;
-        assert_eq!(rows.len(), 3);
+        assert_eq!(rows.len(), 4);
         assert_eq!(
             rows.iter()
                 .map(|r| r["index"].as_u64().unwrap())
                 .collect::<Vec<_>>(),
-            [0, 1, 2]
+            [0, 1, 2, 3]
         );
         for row in rows {
             assert_eq!(row["scheduled"], row["delivered"]);
@@ -1628,11 +1753,11 @@ mod continuity_parts_tests {
     #[test]
     fn split_segments_form_one_complete_sentence_and_missing_tail_is_detected() {
         let segments = vec![
-            serde_json::json!({"index":0,"scheduled":1000,"delivered":1000,"started_sample":0,"finished_sample":1000,"first_loud":0,"last_loud":999,"pause_samples":0,"trimmed_samples":1400,"synthesis_seconds":0.1,"dsp_seconds":0.0}),
+            serde_json::json!({"index":0,"scheduled":1000,"delivered":1000,"started_sample":0,"finished_sample":1000,"first_loud":0,"last_loud":999,"pause_samples":0,"trimmed_samples":1600,"rendered_samples":1400,"synthesis_seconds":0.1,"dsp_seconds":0.0}),
             serde_json::json!({"index":100,"scheduled":440,"delivered":440,"started_sample":1000,"finished_sample":1440,"first_loud":0,"last_loud":399,"pause_samples":40,"gap_after_ms":60.0}),
-            serde_json::json!({"index":1,"scheduled":1880,"delivered":1880,"started_sample":1440,"finished_sample":3320,"first_loud":20,"last_loud":1799,"pause_samples":80,"trimmed_samples":1800,"synthesis_seconds":0.1,"dsp_seconds":0.0}),
+            serde_json::json!({"index":1,"scheduled":1880,"delivered":1880,"started_sample":1440,"finished_sample":3320,"first_loud":20,"last_loud":1799,"pause_samples":80,"trimmed_samples":2000,"rendered_samples":1800,"synthesis_seconds":0.1,"dsp_seconds":0.0}),
         ];
-        let result = aggregate_chunks(&segments, &[40, 80], 1000, 1.0, 1.0).unwrap();
+        let result = aggregate_chunks(&segments, &[40, 80], 1000, 1.0).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0]["index"], 0);
         assert_eq!(result[0]["scheduled"], 1440);
@@ -1643,7 +1768,6 @@ mod continuity_parts_tests {
             &[segments[0].clone(), segments[2].clone()],
             &[40, 80],
             1000,
-            1.0,
             1.0,
         )
         .unwrap();

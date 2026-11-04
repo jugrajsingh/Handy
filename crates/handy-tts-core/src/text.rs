@@ -4,6 +4,9 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use thiserror::Error;
 
+/// Request size used by the streaming session to keep synthesis lanes supplied.
+pub const STREAMING_CHUNK_CHARS: usize = 100;
+
 /// A spoken chunk with its original UTF-16 source range and trailing pause.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TextChunk {
@@ -47,6 +50,7 @@ pub struct TextCursor<'a> {
     in_code: bool,
     skip_depth: usize,
     index: usize,
+    chunk_limit: usize,
     byte_cursor: usize,
     utf16_cursor: u32,
     emoji: Regex,
@@ -57,6 +61,12 @@ pub struct TextCursor<'a> {
     event_reads: std::rc::Rc<std::cell::Cell<usize>>,
 }
 impl<'a> TextCursor<'a> {
+    /// Creates a cursor with the streaming request budget.
+    pub fn streaming(source: &'a str, read_code: bool) -> Result<Self, TextError> {
+        let mut cursor = Self::new(source, read_code)?;
+        cursor.set_chunk_limit(STREAMING_CHUNK_CHARS);
+        Ok(cursor)
+    }
     /// Creates a cursor that reads or skips fenced code blocks.
     pub fn new(source: &'a str, read_code: bool) -> Result<Self, TextError> {
         let events = Parser::new_ext(
@@ -83,6 +93,7 @@ impl<'a> TextCursor<'a> {
             in_code: false,
             skip_depth: 0,
             index: 0,
+            chunk_limit: 300,
             byte_cursor: 0,
             utf16_cursor: 0,
             emoji: Regex::new(
@@ -94,6 +105,10 @@ impl<'a> TextCursor<'a> {
             #[cfg(test)]
             event_reads,
         })
+    }
+    /// Lowers the later-chunk ceiling without changing the first chunk or word boundaries.
+    pub fn set_chunk_limit(&mut self, limit: usize) {
+        self.chunk_limit = limit.clamp(70, 300);
     }
     fn normalize(&self, word: &str, code: &[Range<usize>]) -> String {
         let raw_word = word;
@@ -437,7 +452,11 @@ impl<'a> TextCursor<'a> {
     }
     /// Prepares the next spoken chunk, returning None at the end of the source.
     pub fn next_chunk(&mut self) -> Result<Option<TextChunk>, TextError> {
-        let limit = if self.index == 0 { 70 } else { 300 };
+        let limit = if self.index == 0 {
+            70
+        } else {
+            self.chunk_limit
+        };
         let mut words: Vec<Piece> = Vec::new();
         let mut size = 0;
         let mut pause = 0;
@@ -594,6 +613,37 @@ mod bakeoff_goldens {
 #[cfg(test)]
 mod fixes {
     use super::*;
+    #[test]
+    fn smaller_chunks_preserve_prepared_words_ranges_and_structural_pauses() {
+        let source = format!(
+            "# A heading\n\n{}\n\nA final paragraph.",
+            "These ordinary words stay in their original order. ".repeat(12)
+        );
+        let mut cursor = TextCursor::new(&source, false).unwrap();
+        cursor.set_chunk_limit(100);
+        let mut output = Vec::new();
+        while let Some(chunk) = cursor.next_chunk().unwrap() {
+            assert!(chunk.text.chars().count() <= 101);
+            assert!(chunk.source_start < chunk.source_end);
+            if let Some(previous) = output.last() {
+                let previous: &TextChunk = previous;
+                assert!(previous.source_end <= chunk.source_start);
+            }
+            output.push(chunk);
+        }
+        assert_eq!(output[0].pause_ms, 600);
+        assert_eq!(output.last().unwrap().pause_ms, 450);
+        assert_eq!(
+            output
+                .iter()
+                .flat_map(|c| c.text.split_whitespace())
+                .collect::<Vec<_>>(),
+            chunks(&source)
+                .iter()
+                .flat_map(|c| c.text.split_whitespace())
+                .collect::<Vec<_>>()
+        );
+    }
     fn chunks(s: &str) -> Vec<TextChunk> {
         let mut c = TextCursor::new(s, false).unwrap();
         std::iter::from_fn(|| c.next_chunk().unwrap()).collect()
