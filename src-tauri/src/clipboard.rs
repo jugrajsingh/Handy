@@ -1942,10 +1942,10 @@ fn paste_inner(
     if should_send_auto_submit(settings.auto_submit, paste_method) {
         std::thread::sleep(Duration::from_millis(50));
         let auto_submit_key = settings.auto_submit_key;
-        if let Err(_error) = with_enigo(&app_handle, move |enigo| {
+        if let Err(error) = with_enigo(&app_handle, move |enigo| {
             send_return_key(enigo, auto_submit_key)
         }) {
-            log::warn!("Paste succeeded, but auto-submit failed");
+            log::warn!("Paste succeeded, but auto-submit failed: {error}");
         }
     }
 
