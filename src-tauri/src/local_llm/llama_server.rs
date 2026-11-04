@@ -7,9 +7,11 @@ use super::LocalLlmError;
 #[cfg(target_os = "linux")]
 use crate::process_supervisor::set_parent_death_signal;
 pub use crate::process_supervisor::{spawn_from_supervisor, stop_child};
-use log::{debug, info, warn};
+use log::{info, warn};
 use std::ffi::OsString;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, Read};
+#[cfg(test)]
+use std::io::{BufRead, BufReader};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -76,8 +78,8 @@ fn build_command(binary: &Path, opts: &BackendOpts, port: u16, api_key: &str) ->
     let mut cmd = Command::new(binary);
     cmd.args(server_args(&opts.model_path, port, opts.threads, opts.ctx))
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
     cmd.env("LLAMA_API_KEY", api_key);
     #[cfg(target_os = "linux")]
     set_parent_death_signal(&mut cmd);
@@ -96,28 +98,6 @@ pub fn random_api_key() -> Result<String, LocalLlmError> {
         .and_then(|mut f| f.read_exact(&mut bytes))
         .map_err(|e| LocalLlmError::StartFailed(format!("cannot read /dev/urandom: {e}")))?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
-}
-
-/// Sends the child's output to Handy's log at debug level on reader threads.
-fn forward_output(child: &mut Child) {
-    fn pump<R: Read + Send + 'static>(stream: R, name: &str) {
-        let spawned = std::thread::Builder::new()
-            .name(format!("local-llm-{name}"))
-            .spawn(move || {
-                for line in BufReader::new(stream).lines().map_while(Result::ok) {
-                    debug!("llama-server: {line}");
-                }
-            });
-        if let Err(e) = spawned {
-            warn!("local-llm: cannot start the output reader: {e}");
-        }
-    }
-    if let Some(out) = child.stdout.take() {
-        pump(out, "stdout");
-    }
-    if let Some(err) = child.stderr.take() {
-        pump(err, "stderr");
-    }
 }
 
 /// Why a readiness wait ended without a healthy server.
@@ -214,6 +194,15 @@ pub fn post_chat(
             LocalLlmError::BadOutput(format!("invalid JSON: {e}"))
         }
     })?;
+    if value
+        .pointer("/choices/0/finish_reason")
+        .and_then(|reason| reason.as_str())
+        == Some("length")
+    {
+        return Err(LocalLlmError::BadOutput(
+            "response reached the token limit".into(),
+        ));
+    }
     value
         .pointer("/choices/0/message/content")
         .and_then(|c| c.as_str())
@@ -396,7 +385,6 @@ impl LlamaServerBackend {
                 )))
             }
         };
-        forward_output(&mut child);
         match wait_healthy_inner(
             &client,
             port,
@@ -816,6 +804,43 @@ mod tests {
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["content"], "ctl\nhello there");
+    }
+
+    #[test]
+    fn wbfix3_truncated_response_is_bad_output() {
+        let reply =
+            r#"{"choices":[{"finish_reason":"length","message":{"content":"Incomplete"}}]}"#;
+        let (port, server) = serve(vec![(200, reply.into())]);
+        let result = post_chat(
+            &loopback_client().unwrap(),
+            port,
+            "fixture-key",
+            &GenerateRequest {
+                messages: vec![],
+                max_tokens: 8,
+                timeout: Duration::from_secs(5),
+            },
+        );
+        server.join().unwrap();
+        assert!(
+            matches!(result, Err(LocalLlmError::BadOutput(_))),
+            "truncated cleanup must be rejected"
+        );
+    }
+
+    #[test]
+    fn wbfix3_server_output_cannot_reach_log_readers() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_binary(dir.path(), "printf 'fixture-key /private/fixture/model\\n'; printf 'fixture-key /private/fixture/model\\n' >&2");
+        let options = opts(dir.path().join("model"), Duration::from_secs(2));
+        let mut child =
+            spawn_from_supervisor(build_command(&binary, &options, 4242, "fixture-key")).unwrap();
+        let pipes = (child.stdout.take(), child.stderr.take());
+        assert!(child.wait().unwrap().success());
+        assert!(
+            pipes.0.is_none() && pipes.1.is_none(),
+            "server output must have no log reader pipes"
+        );
     }
 
     #[test]

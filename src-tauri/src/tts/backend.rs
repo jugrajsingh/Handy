@@ -31,6 +31,19 @@ pub trait Control: Clone + Send + Sync + 'static {
         None
     }
 }
+fn read_worker_diagnostics(
+    reader: impl std::io::BufRead,
+    preparation: &Arc<Mutex<Option<handy_tts_core::device::Preparation>>>,
+) {
+    for line in reader.lines().map_while(Result::ok) {
+        if let Some(json) = line.strip_prefix("HANDY_TTS_PROGRESS ") {
+            if let Ok(value) = serde_json::from_str(json) {
+                *preparation.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
+            }
+        }
+    }
+}
+
 pub trait Transport: Send + 'static {
     type Control: Control;
     fn control(&self) -> Self::Control;
@@ -173,17 +186,7 @@ impl WorkerBackend {
             std::thread::Builder::new()
                 .name("tts-stderr".into())
                 .spawn(move || {
-                    use std::io::BufRead;
-                    for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                        if let Some(json) = line.strip_prefix("HANDY_TTS_PROGRESS ") {
-                            if let Ok(value) = serde_json::from_str(json) {
-                                *preparation.lock().unwrap_or_else(|p| p.into_inner()) =
-                                    Some(value);
-                            }
-                        } else {
-                            log::debug!("handy-tts: {line}");
-                        }
-                    }
+                    read_worker_diagnostics(BufReader::new(stderr), &preparation);
                 })
                 .map_err(|_| TtsError::Start)?;
         }
@@ -432,6 +435,58 @@ impl Transport for WorkerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wbfix3_worker_diagnostics_do_not_log_private_output() {
+        if std::env::var_os("HANDY_TEST_DIAGNOSTIC_LOG").is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tts::backend::tests::wbfix3_worker_diagnostics_do_not_log_private_output",
+                    "--nocapture",
+                ])
+                .env("HANDY_TEST_DIAGNOSTIC_LOG", "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "worker diagnostics must not reach the log sink"
+            );
+            return;
+        }
+        struct Logs(Mutex<Vec<String>>);
+        impl log::Log for Logs {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, r: &log::Record<'_>) {
+                self.0.lock().unwrap().push(r.args().to_string());
+            }
+            fn flush(&self) {}
+        }
+        static LOGS: Logs = Logs(Mutex::new(Vec::new()));
+        log::set_logger(&LOGS).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+        let progress = Arc::default();
+        read_worker_diagnostics(
+            std::io::Cursor::new(b"fixture-key /private/fixture/model\n"),
+            &progress,
+        );
+        assert!(
+            LOGS.0.lock().unwrap().is_empty(),
+            "worker diagnostics must not reach the log sink"
+        );
+        read_worker_diagnostics(
+            std::io::Cursor::new(b"HANDY_TTS_PROGRESS {\"state\":\"ready\",\"device\":\"gpu\"}\n"),
+            &progress,
+        );
+        assert_eq!(
+            *progress.lock().unwrap(),
+            Some(handy_tts_core::device::Preparation::Ready {
+                device: handy_tts_core::device::Device::Gpu
+            })
+        );
+    }
+
     #[test]
     fn reader_routes_out_of_order_replies_by_id() {
         use handy_tts_core::device::Device;

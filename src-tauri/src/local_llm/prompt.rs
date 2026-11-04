@@ -239,8 +239,15 @@ pub fn clean_output(raw: &str) -> String {
 }
 
 /// Output guards: empty output only for inputs of at most 3 words; output
-/// with fewer than half the input's words is rejected.
+/// with fewer than half the words or characters (above 24 input characters) is rejected.
 pub fn check_output(input: &str, output: &str) -> Result<(), LocalLlmError> {
+    let in_chars = input.chars().filter(|c| !c.is_whitespace()).count();
+    let out_chars = output.chars().filter(|c| !c.is_whitespace()).count();
+    if in_chars > 24 && out_chars.saturating_mul(2) < in_chars {
+        return Err(LocalLlmError::BadOutput(
+            "output has under 50% of input characters".into(),
+        ));
+    }
     let in_words = input.split_whitespace().count();
     let out_words = output.split_whitespace().count();
     if out_words == 0 {
@@ -262,6 +269,22 @@ pub fn check_output(input: &str, output: &str) -> Result<(), LocalLlmError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wbfix3_unspaced_output_loss_is_rejected() {
+        let input = "語".repeat(1200);
+        for output in [String::new(), "語".repeat(599)] {
+            assert!(
+                matches!(
+                    check_output(&input, &output),
+                    Err(LocalLlmError::BadOutput(_))
+                ),
+                "unspaced transcript loss must be rejected"
+            );
+        }
+        assert!(check_output(&input, &"語".repeat(600)).is_ok());
+        assert!(check_output(&input, &input).is_ok());
+    }
 
     const ALL_STYLINGS: [LocalLlmStyling; 4] = [
         LocalLlmStyling::Casual,
@@ -476,7 +499,7 @@ mod tests {
     #[test]
     fn output_under_half_the_input_words_is_rejected() {
         let input = "one two three four five six seven eight nine ten";
-        assert!(check_output(input, "one two three four five").is_ok());
+        assert!(check_output(input, "six seven eight nine ten").is_ok());
         assert!(matches!(
             check_output(input, "one two three four"),
             Err(LocalLlmError::BadOutput(_))
