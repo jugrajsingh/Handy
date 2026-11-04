@@ -42,9 +42,15 @@ pub fn partial_path(final_path: &Path) -> PathBuf {
 
 /// Present with the registry size; UI queries do not hash the file.
 pub fn is_downloaded(models_root: &Path, entry: &ModelEntry) -> bool {
-    std::fs::metadata(registry::model_path(models_root, entry))
-        .map(|m| m.len() == entry.size_bytes)
-        .unwrap_or(false)
+    availability(models_root, entry).unwrap_or(false)
+}
+
+fn availability(models_root: &Path, entry: &ModelEntry) -> Result<bool, super::LocalLlmError> {
+    match std::fs::metadata(registry::model_path(models_root, entry)) {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() == entry.size_bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(super::LocalLlmError::ModelRead(entry.id.into())),
+    }
 }
 
 /// Hashes a model file against the compiled registry, without exposing its path.
@@ -70,7 +76,7 @@ pub async fn download(
 ) -> Result<PathBuf, String> {
     let _claim = InFlight::claim(entry.id)?;
     let final_path = registry::model_path(models_root, entry);
-    if is_downloaded(models_root, entry) {
+    if availability(models_root, entry).map_err(|error| error.to_string())? {
         let path = final_path.clone();
         let valid = tokio::task::spawn_blocking(move || {
             verify_model(&path, entry, &|| false).map_err(|error| error.to_string())
@@ -125,6 +131,21 @@ pub fn delete(models_root: &Path, entry: &ModelEntry) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fix2_download_metadata_error_is_local_read_failure() {
+        let root = tempfile::tempdir().unwrap();
+        static ENTRY: ModelEntry = ModelEntry {
+            id: "fix2-read-error",
+            ..registry::MODELS[0]
+        };
+        std::fs::write(root.path().join(ENTRY.id), b"not a directory").unwrap();
+        assert_eq!(
+            download(root.path(), &ENTRY, &|_| {}).await,
+            Err(super::super::LocalLlmError::ModelRead(ENTRY.id.into()).to_string()),
+            "LLM download metadata errors must return local read failure before transport"
+        );
+    }
 
     #[tokio::test]
     async fn followup_download_errors_identify_model_not_directory() {

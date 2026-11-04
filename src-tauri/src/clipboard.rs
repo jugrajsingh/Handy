@@ -2428,12 +2428,14 @@ with socket.socket(socket.AF_UNIX) as stream:
         let pid_file = scratch.path().join("probe.pid");
         std::fs::write(
             &binary,
-            r#"#!/usr/bin/python3
-import os, pathlib, sys, time
+            r#"#!/bin/sh
+printf '%s' "$$" > "$3"
+exec /usr/bin/python3 - "$@" <<'PY'
+import sys, time
 assert sys.argv[1:3] == ['key', '--help']
-pathlib.Path(sys.argv[3]).write_text(str(os.getpid()))
 time.sleep(2)
 print('Each key sequence: modifiers separated by plus (+)', file=sys.stderr)
+PY
 "#,
         )
         .unwrap();
@@ -2474,12 +2476,17 @@ print('Each key sequence: modifiers separated by plus (+)', file=sys.stderr)
         wait.recv_timeout(Duration::from_secs(5)).unwrap();
         let elapsed = began.elapsed();
         let outcome = receive.recv().unwrap();
-        let pid: i32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
-        let mut status = 0;
-        // SAFETY: pid was written by the child started by this test.
-        let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
-        let reaped =
-            waited == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+        let reaped = match std::fs::read_to_string(pid_file) {
+            Ok(pid) => {
+                let pid: i32 = pid.parse().unwrap();
+                let mut status = 0;
+                // SAFETY: pid was written by the child started by this test.
+                let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+                waited == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => panic!("cannot read probe pid: {error}"),
+        };
         let reserved = fence.reserve_capture();
         if reserved {
             fence.release_capture();

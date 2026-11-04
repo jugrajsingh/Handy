@@ -286,12 +286,45 @@ fn fingerprint(entry: &ModelEntry) -> String {
 }
 /// Checks the manifest fingerprint and file sizes without rehashing the model.
 pub fn is_downloaded(root: &Path, entry: &ModelEntry) -> bool {
+    availability(root, entry).unwrap_or(false)
+}
+
+/// Checks availability without treating unreadable local files as missing models.
+pub fn availability(root: &Path, entry: &ModelEntry) -> Result<bool, DownloadError> {
+    availability_with(
+        root,
+        entry,
+        |path| fs::read(path),
+        |path| fs::metadata(path),
+    )
+}
+
+fn availability_with(
+    root: &Path,
+    entry: &ModelEntry,
+    read: impl Fn(&Path) -> std::io::Result<Vec<u8>>,
+    metadata: impl Fn(&Path) -> std::io::Result<fs::Metadata>,
+) -> Result<bool, DownloadError> {
     let directory = root.join(entry.id);
-    fs::read_to_string(directory.join(".verified")).is_ok_and(|marker| marker == fingerprint(entry))
-        && entry.files.iter().all(|file| {
-            fs::metadata(directory.join(&file.path))
-                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == file.bytes)
-        })
+    let marker = match read(&directory.join(".verified")) {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(DownloadError::LocalIo),
+    };
+    if marker != fingerprint(entry).as_bytes() {
+        return Ok(false);
+    }
+    for file in &entry.files {
+        let metadata = match metadata(&directory.join(&file.path)) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(_) => return Err(DownloadError::LocalIo),
+        };
+        if !metadata.is_file() || metadata.len() != file.bytes {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 fn remove_file_if_present(path: &Path) -> Result<(), DownloadError> {
     match fs::remove_file(path) {
@@ -380,7 +413,7 @@ impl Downloader {
         let token = self.credentials.token();
         fs::create_dir_all(&directory).map_err(|_| DownloadError::LocalIo)?;
         let marker = directory.join(".verified");
-        if !is_downloaded(root, entry) {
+        if !availability(root, entry)? {
             remove_file_if_present(&marker)?;
         }
         let mut completed = 0u64;
@@ -403,10 +436,7 @@ impl Downloader {
                     continue;
                 }
                 Ok(false) => remove_file_if_present(&marker)?,
-                Err(error) => {
-                    remove_file_if_present(&marker)?;
-                    return Err(error);
-                }
+                Err(error) => return Err(error),
             }
             let partial = final_path.with_file_name(format!(
                 "{}.partial",
@@ -543,6 +573,149 @@ mod tests {
         .collect();
         entry.bytes = entry.files.iter().map(|file| file.bytes).sum();
         entry
+    }
+    struct NoTransport;
+    impl Transport for NoTransport {
+        fn get(&self, _: &ModelFile, _: u64, _: Option<&str>) -> Result<Response, DownloadError> {
+            panic!("read errors must never start a network request")
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix2_availability_reports_marker_and_metadata_io_errors() {
+        let root = root("fix2-availability-io");
+        let entry = fixture();
+        for errno in [5, 13] {
+            for marker_error in [true, false] {
+                let result = availability_with(
+                    &root,
+                    &entry,
+                    |_| {
+                        if marker_error {
+                            Err(std::io::Error::from_raw_os_error(errno))
+                        } else {
+                            Ok(fingerprint(&entry).into_bytes())
+                        }
+                    },
+                    |_| Err(std::io::Error::from_raw_os_error(errno)),
+                );
+                assert_eq!(
+                    result,
+                    Err(DownloadError::LocalIo),
+                    "availability IO errors must not become missing models"
+                );
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_download_read_error_preserves_marker(failure: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        {
+            let root = root(&format!("fix2-read-{failure}"));
+            let entry = fixture();
+            let directory = root.join(entry.id);
+            fs::create_dir_all(directory.join("voices")).unwrap();
+            fs::write(directory.join("public.bin"), b"public").unwrap();
+            fs::write(directory.join("voices/alba.bin"), b"voice").unwrap();
+            let marker = fingerprint(&entry);
+            fs::write(directory.join(".verified"), &marker).unwrap();
+            assert!(is_downloaded(&root, &entry));
+            let blocked = directory.join(match failure {
+                "marker" => ".verified",
+                "metadata" => "voices",
+                _ => "public.bin",
+            });
+            let permissions = fs::metadata(&blocked).unwrap().permissions();
+            fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
+            let result = Downloader {
+                credentials: Credentials::memory_only(),
+            }
+            .download(&root, &entry, &NoTransport, &AtomicBool::new(false), |_| {});
+            fs::set_permissions(&blocked, permissions).unwrap();
+            assert_eq!(
+                result,
+                Err(DownloadError::LocalIo),
+                "download {failure} error must stay LocalIo"
+            );
+            assert_eq!(
+                fs::read(directory.join(".verified")).ok(),
+                Some(marker.into_bytes()),
+                "download {failure} read error must preserve marker bytes"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix2_download_availability_errors_preserve_marker() {
+        for failure in ["marker", "metadata"] {
+            assert_download_read_error_preserves_marker(failure);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix2_download_artifact_read_error_preserves_marker() {
+        assert_download_read_error_preserves_marker("artifact");
+    }
+
+    #[test]
+    fn fix2_download_mismatches_invalidate_marker() {
+        struct RefuseTransport;
+        impl Transport for RefuseTransport {
+            fn get(
+                &self,
+                _: &ModelFile,
+                _: u64,
+                _: Option<&str>,
+            ) -> Result<Response, DownloadError> {
+                Err(DownloadError::Transport)
+            }
+        }
+        for failure in ["manifest", "size", "digest"] {
+            let root = root(&format!("fix2-mismatch-{failure}"));
+            let entry = fixture();
+            let directory = root.join(entry.id);
+            fs::create_dir_all(directory.join("voices")).unwrap();
+            fs::write(directory.join("voices/alba.bin"), b"voice").unwrap();
+            fs::write(
+                directory.join("public.bin"),
+                if failure == "size" {
+                    b"bad".as_slice()
+                } else {
+                    b"WRONG!"
+                },
+            )
+            .unwrap();
+            fs::write(
+                directory.join(".verified"),
+                if failure == "manifest" {
+                    "old manifest".into()
+                } else {
+                    fingerprint(&entry)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                Downloader {
+                    credentials: Credentials::memory_only()
+                }
+                .download(
+                    &root,
+                    &entry,
+                    &RefuseTransport,
+                    &AtomicBool::new(false),
+                    |_| {},
+                ),
+                Err(DownloadError::Transport)
+            );
+            assert!(
+                !directory.join(".verified").exists(),
+                "confirmed {failure} mismatch must invalidate marker"
+            );
+        }
     }
     #[test]
     fn fix1_public_hash_layers_observe_cancellation_after_reading_and_preserve_marker() {

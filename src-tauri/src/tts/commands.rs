@@ -174,7 +174,7 @@ pub fn set_selection(
     let reader = app.clone();
     let result = select_with_store(
         chosen,
-        download::is_downloaded(&ready.root, entry),
+        download::availability(&ready.root, entry).map_err(|e| e.to_string())?,
         &ready.session,
         move || crate::settings::get_settings(&reader),
         move |settings| crate::settings::write_settings_checked(&app, settings),
@@ -270,7 +270,10 @@ pub async fn set_tts_run_on(
         if settings.tts_model_id == model_id {
             ready.session.select_and_wait(
                 selection(&settings),
-                ready.manager.downloaded(&model_id),
+                ready
+                    .manager
+                    .availability(&model_id)
+                    .map_err(|e| e.to_string())?,
                 Box::new(|_| Ok(())),
             )?;
         }
@@ -410,7 +413,7 @@ pub async fn preview_tts_voice(
         if !entry.voices.contains(&chosen.voice) {
             return Err("tts.errors.invalidVoice".into());
         }
-        if !download::is_downloaded(&ready.root, entry) {
+        if !download::availability(&ready.root, entry).map_err(|e| e.to_string())? {
             return Err("tts.errors.notDownloaded".into());
         }
         service.preview(chosen, text)

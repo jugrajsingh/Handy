@@ -25,7 +25,11 @@ impl Compilation for Job {
 }
 pub fn prepare(ready: &Ready, model: &str, choice: RunOn) -> Result<(), String> {
     let entry = catalog::entry(model).map_err(|e| e.to_string())?;
-    if !ready.manager.downloaded(model) {
+    if !ready
+        .manager
+        .availability(model)
+        .map_err(|e| e.to_string())?
+    {
         return Ok(());
     }
     let manager = ready.manager.fork().map_err(|e| e.to_string())?;

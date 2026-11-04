@@ -856,7 +856,7 @@ pub(super) mod tests {
             },
             super::super::manager::Checks {
                 memory: || Ok(8 * 1024 * 1024 * 1024),
-                downloaded: |_, _| true,
+                downloaded: |_, _| Ok(true),
                 verify: |_, _, _| Ok(true),
             },
         )

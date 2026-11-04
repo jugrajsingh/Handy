@@ -204,6 +204,23 @@ pub fn warm_up_for_recording(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fix2_recording_warmup_wires_the_recorder_generation() {
+        let source = include_str!("mod.rs");
+        let body = source
+            .split("pub fn warm_up_for_recording(app: &AppHandle) {")
+            .nth(1)
+            .unwrap()
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("let generation = recorder.cancel_generation();")
+                && body.contains("Arc::new(move || recorder.was_cancelled_since(generation))"),
+            "production warmup must wire the recorder cancellation generation"
+        );
+    }
+
+    #[test]
     fn m1_missing_binary_message_uses_a_label_not_a_location() {
         assert_eq!(
             super::LocalLlmError::BinaryMissing("llama-server".into()).to_string(),

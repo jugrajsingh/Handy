@@ -207,6 +207,22 @@ pub fn change_local_llm_context_setting(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fix2_successful_download_wires_error_clear() {
+        let source = include_str!("commands.rs");
+        let body = source
+            .split("pub async fn download_local_llm_model(")
+            .nth(1)
+            .unwrap()
+            .split("async fn download_local_llm_model_with_refresh(")
+            .next()
+            .unwrap();
+        assert!(
+            body.contains("manager.clear_download_error(entry.id);"),
+            "production download completion must clear the recovered model error"
+        );
+    }
+
     use super::*;
     use crate::local_llm::manager::tests::harness;
     use std::sync::atomic::Ordering;

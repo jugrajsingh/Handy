@@ -91,8 +91,10 @@ type RecordingCancellation = Arc<dyn Fn() -> bool + Send + Sync>;
 #[derive(Clone, PartialEq, Eq)]
 struct FileIdentity {
     path: PathBuf,
+    device: u64,
     inode: u64,
     modified: std::time::SystemTime,
+    changed: (i64, i64),
     size: u64,
 }
 impl FileIdentity {
@@ -102,18 +104,24 @@ impl FileIdentity {
             _ => LocalLlmError::ModelRead(entry.id.into()),
         })?;
         #[cfg(unix)]
-        let inode = {
+        let (device, inode, changed) = {
             use std::os::unix::fs::MetadataExt;
-            metadata.ino()
+            (
+                metadata.dev(),
+                metadata.ino(),
+                (metadata.ctime(), metadata.ctime_nsec()),
+            )
         };
         #[cfg(not(unix))]
-        let inode = 0;
+        let (device, inode, changed) = (0, 0, (0, 0));
         Ok(Self {
             path: path.to_path_buf(),
+            device,
             inode,
             modified: metadata
                 .modified()
                 .map_err(|_| LocalLlmError::ModelRead(entry.id.into()))?,
+            changed,
             size: metadata.len(),
         })
     }
@@ -209,8 +217,10 @@ impl Verification {
             }
             if let Some((cached, valid)) = state.cache.get(entry.id) {
                 if cached.path == identity.path
+                    && cached.device == identity.device
                     && cached.inode == identity.inode
                     && cached.modified == identity.modified
+                    && cached.changed == identity.changed
                     && cached.size == identity.size
                 {
                     return Ok(VerifiedFile {
@@ -747,8 +757,13 @@ impl LocalLlmManager {
             Err(e) => {
                 inner.backend.unload();
                 inner.loaded = None;
-                inner.failed_starts += 1;
-                inner.last_start_failure = Some((Instant::now(), e.clone()));
+                let verification_used_budget = start_timeout < self.config.start_timeout;
+                if e == LocalLlmError::StartTimeout && verification_used_budget {
+                    inner.last_start_failure = None;
+                } else {
+                    inner.failed_starts += 1;
+                    inner.last_start_failure = Some((Instant::now(), e.clone()));
+                }
                 let next = if inner.failed_starts >= MAX_FAILED_STARTS {
                     LocalLlmState::Failed {
                         reason: e.to_string(),
@@ -1224,98 +1239,48 @@ pub(crate) mod tests {
     #[test]
     fn fix1_cache_rehashes_changed_identity_and_remembers_corruption() {
         use std::sync::atomic::AtomicUsize;
-        let mut h = harness();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let count = calls.clone();
-        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(move |_, _, _| {
-            count.fetch_add(1, Ordering::SeqCst);
-            Ok(false)
-        });
-        for _ in 0..2 {
+        for field in ["path", "device", "inode", "modified", "changed", "size"] {
+            let mut h = harness();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(move |_, _, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            });
+            for _ in 0..2 {
+                assert!(matches!(
+                    h.manager.ensure_started(&h.settings),
+                    Err(LocalLlmError::ModelCorrupt(_))
+                ));
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "an unchanged corrupt GGUF must not be hashed twice"
+            );
+            {
+                let mut state = lock(&h.manager.verification.state);
+                let (cached, _) = state.cache.get_mut("s1-mini-q4km").unwrap();
+                match field {
+                    "path" => cached.path = cached.path.with_extension("alias"),
+                    "device" => cached.device ^= 1,
+                    "inode" => cached.inode ^= 1,
+                    "modified" => cached.modified += Duration::from_secs(1),
+                    "changed" => cached.changed.0 += 1,
+                    "size" => cached.size += 1,
+                    _ => unreachable!(),
+                }
+            }
             assert!(matches!(
                 h.manager.ensure_started(&h.settings),
                 Err(LocalLlmError::ModelCorrupt(_))
             ));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                2,
+                "changed {field} alone must invalidate verification"
+            );
         }
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            1,
-            "an unchanged corrupt GGUF must not be hashed twice"
-        );
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&h.model_file)
-            .unwrap();
-        let before = file.metadata().unwrap().modified().unwrap();
-        file.set_modified(before + Duration::from_secs(1)).unwrap();
-        assert!(h.manager.ensure_started(&h.settings).is_err());
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2,
-            "changed mtime must invalidate verification"
-        );
-        let replacement = h.model_file.with_extension("replacement");
-        let next = std::fs::File::create(&replacement).unwrap();
-        next.set_len(file.metadata().unwrap().len()).unwrap();
-        next.set_modified(before + Duration::from_secs(1)).unwrap();
-        std::fs::rename(replacement, &h.model_file).unwrap();
-        assert!(h.manager.ensure_started(&h.settings).is_err());
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            3,
-            "changed inode must invalidate verification even at the same size and mtime"
-        );
-        let entry = registry::find("s1-mini-q4km").unwrap();
-        let alias = h.model_file.with_extension("alias");
-        std::fs::hard_link(&h.model_file, &alias).unwrap();
-        let epoch = h.manager.verification.epoch.load(Ordering::SeqCst);
-        h.manager
-            .verification
-            .verify(
-                &alias,
-                entry,
-                h.manager.verify.clone(),
-                VerificationWait {
-                    deadline: Instant::now() + Duration::from_secs(2),
-                    epoch,
-                    cancelled: &|| false,
-                    shutdown: h.manager.cancel.clone(),
-                    recording: None,
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            4,
-            "changed path must invalidate verification even for a hard link"
-        );
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(&alias)
-            .unwrap();
-        let modified = file.metadata().unwrap().modified().unwrap();
-        file.set_len(entry.size_bytes + 1).unwrap();
-        file.set_modified(modified).unwrap();
-        h.manager
-            .verification
-            .verify(
-                &alias,
-                entry,
-                h.manager.verify.clone(),
-                VerificationWait {
-                    deadline: Instant::now() + Duration::from_secs(2),
-                    epoch,
-                    cancelled: &|| false,
-                    shutdown: h.manager.cancel.clone(),
-                    recording: None,
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            5,
-            "changed size must invalidate verification at the same inode and mtime"
-        );
     }
 
     #[test]
@@ -1367,6 +1332,218 @@ pub(crate) mod tests {
             calls.load(Ordering::SeqCst) == 2,
             "completed verification errors must not restart hashing or load changed files"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix2_restored_mtime_tampering_rehashes_before_loading() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::MetadataExt;
+        let mut h = harness();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(move |path, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let mut byte = [0];
+            std::fs::File::open(path)
+                .unwrap()
+                .read_exact(&mut byte)
+                .unwrap();
+            Ok(byte == [0])
+        });
+        h.manager.ensure_started(&h.settings).unwrap();
+        h.manager.unload();
+        let before = std::fs::metadata(&h.model_file).unwrap();
+        let identity =
+            FileIdentity::read(&h.model_file, registry::find("s1-mini-q4km").unwrap()).unwrap();
+        assert_eq!(
+            identity.device,
+            before.dev(),
+            "file identity must capture the filesystem device"
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&h.model_file)
+            .unwrap();
+        file.write_all(&[255]).unwrap();
+        file.set_modified(before.modified().unwrap()).unwrap();
+        let after = file.metadata().unwrap();
+        assert_eq!(before.ino(), after.ino());
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+        assert_ne!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec())
+        );
+        assert!(
+            matches!(
+                h.manager.ensure_started(&h.settings),
+                Err(LocalLlmError::ModelCorrupt(_))
+            ),
+            "restored mtime must not let changed bytes reach the loader"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "changed ctime must force rehash"
+        );
+        assert_eq!(lock(&h.fake).loads, 1, "tampered bytes must not load again");
+    }
+
+    #[test]
+    fn fix2_worker_identity_check_rejects_changed_file_without_caching() {
+        let mut h = harness();
+        let (release, _, entered) = fix1_hash_probe(&mut h, true);
+        Arc::get_mut(&mut h.manager).unwrap().config.start_timeout = Duration::from_secs(5);
+        let _release = Fix1Release(release.clone());
+        let (manager, settings) = (h.manager.clone(), h.settings.clone());
+        let request = std::thread::spawn(move || manager.ensure_started(&settings));
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let job = lock(&h.manager.verification.state)
+            .active
+            .as_ref()
+            .unwrap()
+            .job
+            .clone();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&h.model_file)
+            .unwrap();
+        file.set_modified(file.metadata().unwrap().modified().unwrap() + Duration::from_secs(1))
+            .unwrap();
+        release.store(true, Ordering::SeqCst);
+        fix1_finish_hash(&h.manager);
+        let result = lock(&job.result).clone();
+        let outcome = request.join().unwrap();
+        assert!(
+            matches!(result, Some(Err(LocalLlmError::ModelRead(_)))),
+            "worker identity check must return a read error before any loader check"
+        );
+        assert!(matches!(outcome, Err(LocalLlmError::ModelRead(_))));
+        assert!(
+            lock(&h.manager.verification.state).cache.is_empty(),
+            "changed identity must not enter verification cache"
+        );
+        assert_eq!(lock(&h.fake).loads, 0);
+    }
+
+    #[test]
+    fn fix2_loader_identity_check_rejects_change_after_successful_hash() {
+        let mut h = harness();
+        let (release, _, entered) = fix1_hash_probe(&mut h, true);
+        Arc::get_mut(&mut h.manager).unwrap().config.start_timeout = Duration::from_secs(5);
+        let _release = Fix1Release(release.clone());
+        let (manager, settings) = (h.manager.clone(), h.settings.clone());
+        let request = std::thread::spawn(move || manager.ensure_started(&settings));
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let held = lock(&h.manager.inner);
+        let job = lock(&h.manager.verification.state)
+            .active
+            .as_ref()
+            .unwrap()
+            .job
+            .clone();
+        release.store(true, Ordering::SeqCst);
+        fix1_finish_hash(&h.manager);
+        assert_eq!(
+            *lock(&job.result),
+            Some(Ok(true)),
+            "worker must finish against unchanged bytes"
+        );
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&h.model_file)
+            .unwrap();
+        file.set_modified(file.metadata().unwrap().modified().unwrap() + Duration::from_secs(1))
+            .unwrap();
+        drop(held);
+        assert!(
+            matches!(request.join().unwrap(), Err(LocalLlmError::ModelRead(_))),
+            "loader identity check must reject changes after successful verification"
+        );
+        assert_eq!(lock(&h.fake).loads, 0);
+    }
+
+    #[test]
+    fn fix2_reduced_start_budget_timeout_is_not_sticky_or_inherited() {
+        let mut h = harness();
+        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(|_, _, _| {
+            std::thread::sleep(Duration::from_millis(20));
+            Ok(true)
+        });
+        lock(&h.fake)
+            .start_results
+            .push_back(Err(LocalLlmError::StartTimeout));
+        let concurrent_call_started = Instant::now();
+        assert_eq!(
+            h.manager.ensure_started(&h.settings),
+            Err(LocalLlmError::StartTimeout)
+        );
+        assert_eq!(
+            lock(&h.manager.inner).failed_starts,
+            0,
+            "verification-reduced start timeout must not cost a failed-start strike"
+        );
+        assert!(
+            h.manager
+                .ready(
+                    &h.settings,
+                    concurrent_call_started,
+                    &AtomicBool::new(false),
+                    None
+                )
+                .is_ok(),
+            "concurrent dictation must not inherit a verification-reduced start timeout"
+        );
+        assert_eq!(lock(&h.fake).loads, 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix2_swap_during_hash_cannot_cache_another_files_result() {
+        use std::io::{Read, Write};
+        let mut h = harness();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&h.model_file)
+            .unwrap()
+            .write_all(&[255])
+            .unwrap();
+        let replacement = h.model_file.with_extension("replacement");
+        let saved = h.model_file.with_extension("saved");
+        std::fs::File::create(&replacement)
+            .unwrap()
+            .set_len(std::fs::metadata(&h.model_file).unwrap().len())
+            .unwrap();
+        let swap = replacement.clone();
+        let original = saved.clone();
+        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(move |path, _, _| {
+            let before = std::fs::metadata(path).unwrap().modified().unwrap();
+            std::fs::rename(path, &original).unwrap();
+            std::fs::rename(&swap, path).unwrap();
+            let mut reader = std::fs::File::open(path).unwrap();
+            let mut byte = [255];
+            reader.read_exact(&mut byte).unwrap();
+            std::fs::rename(path, &swap).unwrap();
+            std::fs::rename(&original, path).unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(before)
+                .unwrap();
+            assert!(reader.metadata().unwrap().is_file());
+            Ok(byte == [0])
+        });
+        assert!(
+            matches!(
+                h.manager.ensure_started(&h.settings),
+                Err(LocalLlmError::ModelRead(_))
+            ),
+            "rename swap must not associate another file's hash with the original identity"
+        );
+        assert!(lock(&h.manager.verification.state).cache.is_empty());
+        assert_eq!(lock(&h.fake).loads, 0);
     }
 
     #[test]
@@ -1645,15 +1822,16 @@ pub(crate) mod tests {
     #[test]
     fn a_call_waiting_on_a_failing_start_gets_its_error_without_a_second_start() {
         let h = harness();
+        let failure = LocalLlmError::StartFailed("fixture start failure".into());
         {
             let mut s = lock(&h.fake);
             s.start_delay = Duration::from_millis(300);
-            s.start_results.push_back(Err(LocalLlmError::StartTimeout));
+            s.start_results.push_back(Err(failure.clone()));
         }
         h.manager.warm_up(&h.settings);
         std::thread::sleep(Duration::from_millis(50));
         let r = h.manager.process("hello there friend", &h.settings);
-        assert_eq!(r, Err(LocalLlmError::StartTimeout));
+        assert_eq!(r, Err(failure));
         assert_eq!(lock(&h.fake).loads, 1);
     }
 

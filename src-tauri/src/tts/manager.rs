@@ -49,14 +49,14 @@ type ModelVerification =
 #[derive(Clone)]
 pub(super) struct Checks {
     pub(super) memory: fn() -> Result<u64, TtsError>,
-    pub(super) downloaded: fn(&Path, &catalog::ModelEntry) -> bool,
+    pub(super) downloaded: fn(&Path, &catalog::ModelEntry) -> Result<bool, download::DownloadError>,
     pub(super) verify: ModelVerification,
 }
 impl Checks {
     fn production() -> Self {
         Self {
             memory: super::memory_available,
-            downloaded: download::is_downloaded,
+            downloaded: download::availability,
             verify: verify_model,
         }
     }
@@ -246,9 +246,10 @@ impl<B: Transport> TtsManager<B> {
     pub fn wake_idle(&self) {
         let _ = self.idle_wake.try_send(());
     }
-    pub fn downloaded(&self, id: &str) -> bool {
+    pub fn availability(&self, id: &str) -> Result<bool, TtsError> {
         let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        catalog::entry(id).is_ok_and(|entry| (self.checks.downloaded)(&inner.config.root, entry))
+        let entry = catalog::entry(id).map_err(|_| TtsError::Model)?;
+        (self.checks.downloaded)(&inner.config.root, entry).map_err(|_| TtsError::Read)
     }
     pub fn has_model(&self, model: &str) -> bool {
         self.inner
@@ -364,7 +365,7 @@ impl<B: Transport> TtsManager<B> {
             }
         }
         let entry = catalog::entry(&selection.model_id).map_err(|_| TtsError::Model)?;
-        if !(self.checks.downloaded)(&inner.config.root, entry) {
+        if !(self.checks.downloaded)(&inner.config.root, entry).map_err(|_| TtsError::Read)? {
             log::warn!(
                 "TTS worker start refused: {}: {}",
                 entry.id,
@@ -996,7 +997,7 @@ mod tests {
             },
             Checks {
                 memory,
-                downloaded: |_, _| true,
+                downloaded: |_, _| Ok(true),
                 verify: |_, _, _| Ok(true),
             },
         )
@@ -1004,6 +1005,100 @@ mod tests {
     }
     fn enough() -> Result<u64, TtsError> {
         Ok(handy_tts_core::memory::MIN_AVAILABLE_BYTES)
+    }
+    #[cfg(unix)]
+    #[test]
+    fn fix2_availability_read_errors_do_not_load_or_change_marker() {
+        use sha2::{Digest, Sha256};
+        use std::os::unix::fs::PermissionsExt;
+        let entry = catalog::entry("supertonic-3").unwrap();
+        let mut files: Vec<_> = entry.files.iter().collect();
+        files.sort_by_key(|file| (&file.revision, &file.path, file.bytes, &file.sha256));
+        let mut digest = Sha256::new();
+        digest.update(b"handy-tts-manifest-v1");
+        for file in files {
+            for value in [&file.revision, &file.path, &file.sha256] {
+                digest.update((value.len() as u64).to_le_bytes());
+                digest.update(value.as_bytes());
+            }
+            digest.update(file.bytes.to_le_bytes());
+        }
+        let marker = format!("handy-tts-manifest-v1\n{:x}\n", digest.finalize());
+        for failure in ["marker", "metadata", "missing"] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join(entry.id);
+            for file in &entry.files {
+                let path = directory.join(&file.path);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::File::create(path)
+                    .unwrap()
+                    .set_len(file.bytes)
+                    .unwrap();
+            }
+            let marker_path = directory.join(".verified");
+            std::fs::write(&marker_path, &marker).unwrap();
+            assert!(download::is_downloaded(root.path(), entry));
+            let blocked = if failure == "marker" {
+                marker_path.clone()
+            } else {
+                directory
+                    .join(&entry.files[0].path)
+                    .parent()
+                    .unwrap()
+                    .to_path_buf()
+            };
+            let permissions = std::fs::metadata(&blocked).unwrap().permissions();
+            if failure == "missing" {
+                std::fs::remove_file(directory.join(&entry.files[0].path)).unwrap();
+            } else {
+                std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            }
+            let mut settings = config(RunOn::Cpu);
+            settings.root = root.path().to_path_buf();
+            let trace = Arc::new(Mutex::new(Trace::default()));
+            let manager = TtsManager::with_backend(
+                settings,
+                Fake {
+                    control: FakeControl::default(),
+                    trace: trace.clone(),
+                },
+                Checks {
+                    memory: enough,
+                    ..Checks::production()
+                },
+            )
+            .unwrap();
+            let availability = manager.availability(entry.id);
+            let result = manager.ensure(&selection());
+            std::fs::set_permissions(&blocked, permissions).unwrap();
+            assert_eq!(
+                availability,
+                if failure == "missing" {
+                    Ok(false)
+                } else {
+                    Err(TtsError::Read)
+                },
+                "availability callers must receive {failure} read errors"
+            );
+            assert_eq!(
+                result,
+                Err(if failure == "missing" {
+                    TtsError::NotDownloaded
+                } else {
+                    TtsError::Read
+                }),
+                "production availability must distinguish {failure} from missing bytes"
+            );
+            assert!(
+                trace.lock().unwrap().starts.is_empty(),
+                "availability failure must not load a backend"
+            );
+            assert_eq!(
+                std::fs::read(&marker_path).unwrap(),
+                marker.as_bytes(),
+                "availability failure must preserve marker"
+            );
+        }
     }
     #[cfg(unix)]
     #[test]
@@ -1036,7 +1131,7 @@ mod tests {
                 },
                 Checks {
                     memory: enough,
-                    downloaded: |_, _| true,
+                    downloaded: |_, _| Ok(true),
                     ..Checks::production()
                 },
             )
@@ -1192,7 +1287,7 @@ mod tests {
             },
             Checks {
                 memory: || Ok(8 * 1024 * 1024 * 1024),
-                downloaded: |_, _| true,
+                downloaded: |_, _| Ok(true),
                 verify: |_, _, _| Ok(true),
             },
         )
@@ -1258,7 +1353,7 @@ mod tests {
             },
             Checks {
                 memory: enough,
-                downloaded: |_, _| false,
+                downloaded: |_, _| Ok(false),
                 verify: |_, _, _| Ok(true),
             },
         )
@@ -1372,7 +1467,7 @@ for line in sys.stdin:
                 WorkerBackend::default(),
                 Checks {
                     memory: enough,
-                    downloaded: |_, _| true,
+                    downloaded: |_, _| Ok(true),
                     verify: |_, _, _| Ok(true),
                 },
             )
@@ -1448,7 +1543,7 @@ for line in sys.stdin:
             WorkerBackend::with_synthesis_timeout(Duration::from_millis(100)),
             Checks {
                 memory: enough,
-                downloaded: |_, _| true,
+                downloaded: |_, _| Ok(true),
                 verify: |_, _, _| Ok(true),
             },
         )
@@ -2140,7 +2235,7 @@ for line in sys.stdin:
             WorkerBackend::default(),
             Checks {
                 memory: enough,
-                downloaded: |_, _| true,
+                downloaded: |_, _| Ok(true),
                 verify: |_, _, _| Ok(true),
             },
         )
