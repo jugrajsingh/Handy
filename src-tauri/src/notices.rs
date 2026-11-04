@@ -47,6 +47,7 @@ pub enum NoticeCode {
     RecordingFailed,
     ModelLoadFailed,
     ReadAloudUnavailable,
+    ReadAloudBusyPasting,
     PostProcessFailed,
     FileTranscriptionFailed,
     FilePostProcessFailed,
@@ -61,6 +62,7 @@ impl NoticeCode {
             | Self::MicPermissionDenied
             | Self::RecordingFailed
             | Self::ReadAloudUnavailable
+            | Self::ReadAloudBusyPasting
             | Self::ModelLoadFailed
             | Self::FileTranscriptionFailed => NoticeLevel::Error,
             Self::PostProcessFailed | Self::FilePostProcessFailed => NoticeLevel::Warning,
@@ -77,6 +79,7 @@ impl NoticeCode {
             Self::RecordingFailed => &strings.recording_failed_title,
             Self::ModelLoadFailed => &strings.model_load_failed_title,
             Self::ReadAloudUnavailable => &strings.read_aloud_unavailable_title,
+            Self::ReadAloudBusyPasting => &strings.read_aloud_busy_pasting_title,
             Self::PostProcessFailed => &strings.post_process_failed_title,
             Self::FileTranscriptionFailed => &strings.file_transcription_failed_title,
             Self::FilePostProcessFailed => &strings.file_post_process_failed_title,

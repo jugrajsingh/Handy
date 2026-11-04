@@ -930,6 +930,8 @@
     "noOptionsFound": "옵션을 찾을 수 없습니다"
   },
   "errors": {
+    "readAloudBusyPastingTitle": "Read Aloud Is Busy Pasting",
+    "readAloudBusyPasting": "Handy is still pasting. Try Read aloud again after the paste finishes.",
     "readAloudUnavailableTitle": "Read Aloud Unavailable",
     "loadDirectory": "디렉토리 로딩 오류: {{error}}",
     "micPermissionDeniedTitle": "마이크 접근이 거부되었습니다",

@@ -930,6 +930,8 @@
     "noOptionsFound": "Ingen muligheder fundet"
   },
   "errors": {
+    "readAloudBusyPastingTitle": "Read Aloud Is Busy Pasting",
+    "readAloudBusyPasting": "Handy is still pasting. Try Read aloud again after the paste finishes.",
     "readAloudUnavailableTitle": "Read Aloud Unavailable",
     "loadDirectory": "Fejl ved indlæsning af mappe: {{error}}",
     "micPermissionDeniedTitle": "Mikrofonadgang nægtet",

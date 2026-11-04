@@ -930,6 +930,8 @@
     "noOptionsFound": "Geen opties gevonden"
   },
   "errors": {
+    "readAloudBusyPastingTitle": "Read Aloud Is Busy Pasting",
+    "readAloudBusyPasting": "Handy is still pasting. Try Read aloud again after the paste finishes.",
     "readAloudUnavailableTitle": "Read Aloud Unavailable",
     "loadDirectory": "Fout bij laden van map: {{error}}",
     "micPermissionDeniedTitle": "Microfoontoegang geweigerd",

@@ -18,6 +18,7 @@ pub enum Event {
     DictationProcessing,
     ReadShortcut,
     Clipboard { ticket: u64, text: String },
+    CaptureRefused { ticket: u64 },
     DictationFinished,
     Cancel,
     Close,
@@ -26,6 +27,7 @@ pub enum Event {
 /// Ordered actions for the native adapter to perform.
 pub enum Effect {
     Capture { ticket: u64 },
+    CaptureRefused,
     StopReading,
     ClosePopup,
     StartDictation,
@@ -108,6 +110,10 @@ impl Referee {
                     ticket: self.ticket,
                 });
             }
+            Event::CaptureRefused { ticket } if ticket == self.ticket && self.capture_pending => {
+                self.invalidate();
+                effects.push(Effect::CaptureRefused);
+            }
             Event::Clipboard { ticket, text } if ticket == self.ticket && self.capture_pending => {
                 self.capture_pending = false;
                 self.captured = Some(text);
@@ -138,7 +144,7 @@ impl Referee {
                 }
                 self.popup_open = false;
             }
-            Event::Clipboard { .. } => {}
+            Event::Clipboard { .. } | Event::CaptureRefused { .. } => {}
         }
         effects
     }

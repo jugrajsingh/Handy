@@ -115,6 +115,22 @@ fn unavailable_with(error: &str, log: impl FnOnce(&str), notify: impl FnOnce()) 
     log(error);
     notify();
 }
+struct CaptureReservation<'a>(&'a PasteFence);
+impl Drop for CaptureReservation<'_> {
+    fn drop(&mut self) {
+        self.0.release_capture();
+    }
+}
+
+fn capture_with(fence: &PasteFence, revision: u64, capture: impl FnOnce(), refused: impl FnOnce()) {
+    if !fence.reserve_capture_since(revision) {
+        refused();
+        return;
+    }
+    let _reservation = CaptureReservation(fence);
+    capture();
+}
+
 fn capture_off_thread(job: impl FnOnce() + Send + 'static) -> std::thread::JoinHandle<()> {
     std::thread::spawn(job)
 }
@@ -553,6 +569,13 @@ impl TtsService {
                         coordinator.stop_recording(&binding, "read_aloud");
                     }
                 }
+                Effect::CaptureRefused => crate::notices::raise(
+                    &self.app,
+                    crate::notices::Notice::new(
+                        crate::notices::NoticeCode::ReadAloudBusyPasting,
+                        crate::notices::NoticeSource::ReadAloud,
+                    ),
+                ),
                 Effect::StartDictation | Effect::Capture { .. } => {}
             }
         }
@@ -605,42 +628,41 @@ impl TtsService {
         });
     }
     fn capture_shortcut(self: &Arc<Self>, ticket: u64, revision: u64) {
-        if !self.fence.reserve_capture_since(revision) {
-            self.apply(Event::Clipboard {
-                ticket,
-                text: String::new(),
-            });
-            return;
-        }
-        #[cfg(target_os = "linux")]
-        let text = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-            super::clipboard::capture_wayland()
-        } else {
-            let mut command = std::process::Command::new("xclip");
-            command.args(["-selection", "clipboard", "-o", "-t", "UTF8_STRING"]);
-            super::clipboard::capture_command_with_timeout(
-                command,
-                std::time::Duration::from_secs(30),
-            )
-        };
-        #[cfg(not(target_os = "linux"))]
-        let text = {
-            use tauri_plugin_clipboard_manager::ClipboardExt;
-            self.app
-                .clipboard()
-                .read_text()
-                .map_err(|_| super::TtsError::Clipboard)
-        };
-        if let Err(error) = self.cancel_preview() {
-            let _ = self.app.emit("tts-preview-error", error);
-            self.apply(Event::Close);
-        } else {
-            self.apply(Event::Clipboard {
-                ticket,
-                text: text.unwrap_or_default(),
-            });
-        }
-        self.fence.release_capture();
+        capture_with(
+            &self.fence,
+            revision,
+            || {
+                #[cfg(target_os = "linux")]
+                let text = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                    super::clipboard::capture_wayland()
+                } else {
+                    let mut command = std::process::Command::new("xclip");
+                    command.args(["-selection", "clipboard", "-o", "-t", "UTF8_STRING"]);
+                    super::clipboard::capture_command_with_timeout(
+                        command,
+                        std::time::Duration::from_secs(30),
+                    )
+                };
+                #[cfg(not(target_os = "linux"))]
+                let text = {
+                    use tauri_plugin_clipboard_manager::ClipboardExt;
+                    self.app
+                        .clipboard()
+                        .read_text()
+                        .map_err(|_| super::TtsError::Clipboard)
+                };
+                if let Err(error) = self.cancel_preview() {
+                    let _ = self.app.emit("tts-preview-error", error);
+                    self.apply(Event::Close);
+                } else {
+                    self.apply(Event::Clipboard {
+                        ticket,
+                        text: text.unwrap_or_default(),
+                    });
+                }
+            },
+            || self.apply(Event::CaptureRefused { ticket }),
+        );
     }
     pub fn dictation_start(&self, binding: &str) -> Result<(), super::TtsError> {
         dictation_start_with(
@@ -725,6 +747,73 @@ impl handy_tts_core::preview::ReadingControl for ReadAloudSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wbfix3_capture_reservation_releases_on_unwind() {
+        let fence = PasteFence::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            capture_with(
+                &fence,
+                fence.revision(),
+                || panic!("fixture unwind"),
+                || panic!("unexpected refusal"),
+            );
+        }));
+        assert!(result.is_err());
+        assert!(fence.reserve_capture(), "capture must release on unwind");
+        fence.release_capture();
+    }
+
+    #[test]
+    fn wbfix3_busy_capture_settles_without_changing_dictation() {
+        let fence = PasteFence::default();
+        let mut referee = Referee::default();
+        referee.apply(Event::DictationStart);
+        referee.apply(Event::DictationProcessing);
+        referee.apply(Event::ReadShortcut);
+        let ticket = referee.ticket;
+        assert!(
+            referee
+                .apply(Event::CaptureRefused {
+                    ticket: ticket.wrapping_sub(1)
+                })
+                .is_empty(),
+            "stale capture refusal must be ignored"
+        );
+        assert!(referee.capture_pending);
+        assert!(fence.reserve_capture());
+        let mut effects = Vec::new();
+        capture_with(
+            &fence,
+            fence.revision(),
+            || panic!("busy capture must not read"),
+            || {
+                effects = referee.apply(Event::CaptureRefused { ticket });
+            },
+        );
+        assert_eq!(
+            effects,
+            [Effect::CaptureRefused],
+            "busy capture must emit a visible refusal"
+        );
+        assert_eq!(referee.activity, Activity::Dictating);
+        assert!(!referee.popup_open && !referee.capture_pending && referee.captured.is_none());
+        assert!(
+            referee.apply(Event::DictationFinished).is_empty(),
+            "refused capture must never open a popup"
+        );
+        fence.release_capture();
+        referee.apply(Event::ReadShortcut);
+        assert_eq!(
+            referee.apply(Event::Clipboard {
+                ticket: referee.ticket,
+                text: String::new()
+            }),
+            [Effect::OpenPopup {
+                text: String::new()
+            }]
+        );
+    }
+
     #[test]
     fn wbfix_shortcut_returns_before_capture_work_finishes() {
         let (release, wait) = mpsc::channel();
