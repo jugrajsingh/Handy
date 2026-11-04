@@ -1,11 +1,19 @@
 import { useEffect, useState, useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { listen } from "@tauri-apps/api/event";
+import { listen, emit } from "@tauri-apps/api/event";
 import { commands, type Selection, type TtsModelInfo } from "@/bindings";
 import { useSettings } from "@/hooks/useSettings";
 import { unwrapTts } from "./ModelsPage";
 import { selectionEntries } from "./actions";
 import { ModelSelect } from "./ModelSelect";
+import { Alert } from "@/components/ui/Alert";
+import { Button } from "@/components/ui/Button";
+import { Dropdown } from "@/components/ui/Dropdown";
+import { SettingContainer } from "@/components/ui/SettingContainer";
+import { SettingsGroup } from "@/components/ui/SettingsGroup";
+import { Slider } from "@/components/ui/Slider";
+import { ToggleSwitch } from "@/components/ui/ToggleSwitch";
+
 export function SettingsPage() {
   const { t } = useTranslation();
   const {
@@ -72,94 +80,145 @@ export function SettingsPage() {
   }, [choose, persisted]);
   if (!persisted) return null;
   const selected = draft ?? persisted;
-  const id = selected.model_id;
-  const model = models.find((row) => row.id === id);
   const change = (patch: Partial<Selection>) =>
     void choose.edit(patch, selected);
   return (
-    <section className="w-full max-w-3xl flex flex-col gap-4">
-      <h2>{t("tts.settingsTitle")}</h2>
-      {error && <p role="alert">{t(error)}</p>}
-      <ModelSelect
-        models={models}
-        value={id}
-        change={(next) =>
-          change({
-            model_id: next.id,
-            voice: settings?.tts_voice?.[next.id] ?? next.default_voice,
-          })
-        }
-      />
-      <label>
-        {t("tts.voice")}
-        <select
-          value={selected.voice}
-          onChange={(event) => change({ voice: event.target.value })}
+    <SettingsControls
+      selected={selected}
+      models={models}
+      outputDevices={outputDevices}
+      error={error}
+      change={change}
+      openModels={() => void emit("open-tts-models")}
+      preview={() =>
+        void commands
+          .previewTtsVoice(selected.voice, t("tts.previewSentence"))
+          .then(unwrapTts)
+          .catch(() => setError("tts.errors.generic"))
+      }
+      rememberedVoices={settings?.tts_voice}
+    />
+  );
+}
+
+export function SettingsControls({
+  selected,
+  models,
+  outputDevices,
+  error,
+  change,
+  preview,
+  openModels,
+  rememberedVoices,
+}: {
+  selected: Selection;
+  models: readonly TtsModelInfo[];
+  outputDevices: readonly { name: string; index: string | number }[];
+  error: string | null;
+  change: (patch: Partial<Selection>) => void;
+  preview: () => void;
+  openModels: () => void;
+  rememberedVoices?: Partial<Record<string, string>>;
+}) {
+  const { t } = useTranslation();
+  const model = models.find((row) => row.id === selected.model_id);
+  return (
+    <section className="max-w-3xl w-full mx-auto space-y-6">
+      {error && (
+        <div role="alert">
+          <Alert>{t(error)}</Alert>
+        </div>
+      )}
+      <SettingsGroup title={t("tts.settingsTitle")}>
+        <SettingContainer
+          title={t("tts.model")}
+          description={t("tts.help.model")}
+          grouped
         >
-          {model?.voices.map((voice) => (
-            <option key={voice} value={voice}>
-              {voice}
-            </option>
-          ))}
-        </select>
-      </label>
-      <button
-        disabled={!model?.downloaded}
-        onClick={() =>
-          void commands
-            .previewTtsVoice(selected.voice, t("tts.previewSentence"))
-            .then(unwrapTts)
-            .catch(() => setError("tts.errors.generic"))
-        }
-      >
-        {t("tts.preview")}
-      </button>
-      <label>
-        {t("tts.speed", { value: selected.speed })}
-        <input
-          type="range"
+          <ModelSelect
+            models={models}
+            value={selected.model_id}
+            change={(next) =>
+              change({
+                model_id: next.id,
+                voice: rememberedVoices?.[next.id] ?? next.default_voice,
+              })
+            }
+            openModels={openModels}
+          />
+        </SettingContainer>
+        <SettingContainer
+          title={t("tts.voice")}
+          description={t("tts.help.voice")}
+          grouped
+        >
+          <div className="flex items-center gap-2">
+            <Dropdown
+              options={(model?.voices ?? []).map((voice) => ({
+                value: voice,
+                label: voice,
+              }))}
+              selectedValue={selected.voice}
+              placeholder={selected.voice}
+              onSelect={(voice) => change({ voice })}
+              disabled={!model?.voices.length}
+            />
+            <Button
+              variant="secondary"
+              onClick={preview}
+              disabled={!model?.downloaded}
+            >
+              {t("tts.preview")}
+            </Button>
+          </div>
+        </SettingContainer>
+        <Slider
+          label={t("tts.speedLabel")}
+          description={t("tts.help.speed")}
+          grouped
           min={0.5}
           max={2}
           step={0.1}
           value={selected.speed}
-          onChange={(event) => change({ speed: Number(event.target.value) })}
+          formatValue={(value) => `${value.toFixed(1)}x`}
+          onChange={(speed) => change({ speed })}
         />
-      </label>
-      <label>
-        {t("tts.pitch", { value: selected.pitch })}
-        <input
-          type="range"
+        <Slider
+          label={t("tts.pitchLabel")}
+          description={t("tts.help.pitch")}
+          grouped
           min={-6}
           max={6}
           step={1}
           value={selected.pitch}
-          onChange={(event) => change({ pitch: Number(event.target.value) })}
+          formatValue={(value) => value.toFixed(0)}
+          onChange={(pitch) => change({ pitch })}
         />
-      </label>
-      <label>
-        {t("tts.output")}
-        <select
-          value={selected.output_device ?? ""}
-          onChange={(event) =>
-            change({ output_device: event.target.value || null })
-          }
+        <SettingContainer
+          title={t("tts.output")}
+          description={t("tts.help.output")}
+          grouped
         >
-          <option value="">{t("tts.sameAsHandy")}</option>
-          {outputDevices.map((device) => (
-            <option key={device.index} value={device.name}>
-              {device.name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label>
-        <input
-          type="checkbox"
+          <Dropdown
+            options={[
+              { value: "", label: t("tts.sameAsHandy") },
+              ...outputDevices.map((device) => ({
+                value: device.name,
+                label: device.name,
+              })),
+            ]}
+            selectedValue={selected.output_device ?? ""}
+            onSelect={(value) => change({ output_device: value || null })}
+          />
+        </SettingContainer>
+        <ToggleSwitch
+          label={t("tts.readCode")}
+          description={t("tts.help.readCode")}
+          grouped
           checked={selected.read_code}
-          onChange={(event) => change({ read_code: event.target.checked })}
+          onChange={(read_code) => change({ read_code })}
         />
-        {t("tts.readCode")}
-      </label>
+      </SettingsGroup>
     </section>
   );
 }

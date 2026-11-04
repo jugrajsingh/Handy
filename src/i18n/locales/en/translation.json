@@ -1207,6 +1207,16 @@
     },
     "voiceCount": "{{count}} voices",
     "downloadProgress": "Model download progress",
-    "settingsTitle": "Text-to-speech"
+    "settingsTitle": "Text-to-speech",
+    "speedLabel": "Speed",
+    "pitchLabel": "Pitch",
+    "help": {
+      "model": "Choose a downloaded text-to-speech model.",
+      "voice": "Choose a voice for this model and preview it.",
+      "speed": "Adjust how fast the text is read.",
+      "pitch": "Adjust the voice pitch in semitones.",
+      "output": "Choose where read-aloud audio plays.",
+      "readCode": "Include fenced code blocks when reading."
+    }
   }
 }
