@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub const MAX_HEADER_BYTES: usize = 1024;
+pub const MAX_CONTROL_BYTES: usize = 16_384;
 pub const MAX_SAMPLES: usize = 5_760_000;
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -84,7 +85,11 @@ pub enum ProtocolError {
 }
 
 pub fn write_request(writer: &mut impl Write, request: &Request) -> Result<(), ProtocolError> {
-    serde_json::to_writer(&mut *writer, request)?;
+    let bytes = serde_json::to_vec(request)?;
+    if bytes.len() >= MAX_CONTROL_BYTES {
+        return Err(ProtocolError::Invalid("control length"));
+    }
+    writer.write_all(&bytes)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
@@ -166,6 +171,22 @@ pub fn write_reply(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wbfix_oversized_request_writes_nothing_and_next_request_remains_valid() {
+        let mut bytes = Vec::new();
+        let request = Request::Synthesize {
+            id: 1,
+            text: "x".repeat(MAX_CONTROL_BYTES),
+            speed: None,
+        };
+        assert!(write_request(&mut bytes, &request).is_err());
+        assert!(bytes.is_empty());
+        write_request(&mut bytes, &Request::Shutdown).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Request>(&bytes).unwrap(),
+            Request::Shutdown
+        );
+    }
     use super::*;
     use std::io::Cursor;
     #[test]

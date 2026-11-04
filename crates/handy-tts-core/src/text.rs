@@ -462,12 +462,43 @@ impl<'a> TextCursor<'a> {
         let mut pause = 0;
         let mut synthetic_period = false;
         let mut boundary = None;
-        while let Some(p) = self.piece() {
+        while let Some(mut p) = self.piece() {
             if p.text.is_empty() {
                 if words.is_empty() {
                     continue;
                 }
                 (pause, synthetic_period) = self.structural_pause(p.pause);
+                break;
+            }
+            if words.is_empty() && p.text.chars().count() > limit {
+                let cut = p
+                    .text
+                    .char_indices()
+                    .nth(limit - 1)
+                    .map(|(i, _)| i)
+                    .ok_or(TextError::Range)?;
+                let source = &self.source[p.range.clone()];
+                let source_count = source.chars().count();
+                let spoken_count = p.text.chars().count();
+                let source_cut = if source == p.text {
+                    cut
+                } else {
+                    let count = ((limit - 1) * source_count / spoken_count).max(1);
+                    source
+                        .char_indices()
+                        .nth(count)
+                        .map_or(source.len(), |(i, _)| i)
+                };
+                let remainder = Piece {
+                    text: p.text[cut..].to_owned(),
+                    range: p.range.start + source_cut..p.range.end,
+                    pause: p.pause,
+                };
+                p.text.truncate(cut);
+                p.range.end = remainder.range.start;
+                p.pause = 0;
+                self.pending.push_front(remainder);
+                words.push(p);
                 break;
             }
             let added = p.text.chars().count() + usize::from(!words.is_empty());
@@ -548,6 +579,40 @@ mod tests {
         all.join(" ")
     }
     #[test]
+    fn wbfix_unbroken_words_are_bounded_with_exact_source_ranges_and_following_text() {
+        for count in [400, 20_000] {
+            for letter in ["x", "é"] {
+                let word = letter.repeat(count);
+                let source = format!("{word}\n\nFollowing text must be reached.");
+                let mut cursor = TextCursor::streaming(&source, false).unwrap();
+                let mut joined = String::new();
+                let mut end = 0;
+                while let Some(chunk) = cursor.next_chunk().unwrap() {
+                    assert!(
+                        chunk.text.chars().count() <= 100,
+                        "synthesis text budget exceeded"
+                    );
+                    if chunk.source_start < word.encode_utf16().count() as u32 {
+                        assert_eq!(chunk.source_start, end);
+                        let original: String = source
+                            .encode_utf16()
+                            .skip(chunk.source_start as usize)
+                            .take((chunk.source_end - chunk.source_start) as usize)
+                            .map(|unit| char::from_u32(u32::from(unit)).unwrap())
+                            .collect();
+                        assert_eq!(chunk.text.trim_end_matches('.'), original);
+                        joined.push_str(&original);
+                    } else {
+                        assert_eq!(chunk.text, "Following text must be reached.");
+                    }
+                    end = chunk.source_end;
+                }
+                assert_eq!(joined, word);
+                assert_eq!(end as usize, source.encode_utf16().count());
+            }
+        }
+    }
+    #[test]
     fn section_four_markdown_rules_have_golden_outputs() {
         let source = "# Heading\n\n- **first** item\n- second [label](https://example.com/path)\n\n`foo_bar.rs` and v0.9.7 at /a/b/file.rs.\n\nhttps://example.org/path ![Picture](img.png) <b>hello</b> 😀 note[^1]\n\n```rust\nsecret();\n```\n\n| Name | Value |\n| --- | --- |\n| A | 42 |\n\n[^1]: omit footnote\n";
         let result = prepared(source, false);
@@ -565,7 +630,7 @@ mod tests {
         assert!(prepared("```\nfoo_bar.rs\n```", true).contains("foo bar rs"));
     }
     #[test]
-    fn never_splits_a_word_and_returns_utf16_ranges_for_highlighting() {
+    fn bounded_words_and_long_word_parts_keep_utf16_ranges_for_highlighting() {
         let source = "Reading clearly, one phrase at a time. This second sentence contains naïve names and remains bounded.";
         let mut cursor = TextCursor::new(source, false).unwrap();
         let mut last = 0;
@@ -582,7 +647,7 @@ mod tests {
         assert_eq!(chunk.source_end, unicode.encode_utf16().count() as u32);
         assert_eq!(chunk.text, "naïve readers enjoy clear sentences.");
         let word = "x".repeat(400);
-        assert_eq!(prepared(&word, false), format!("{word}."));
+        assert_eq!(prepared(&word, false).replace(' ', ""), format!("{word}."));
     }
 }
 

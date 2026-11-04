@@ -56,6 +56,42 @@ fn style(component: Component) -> Result<Array3<f32>> {
         component.data.into_iter().flatten().flatten().collect(),
     )?)
 }
+pub(crate) fn prepare_text(text: &str) -> String {
+    // Model-specific character normalization from the pinned inference path.
+    let mut text: String = text.nfkd().collect();
+    for (from, to) in [
+        ("\u{2013}", "-"),
+        ("\u{2011}", "-"),
+        ("\u{2014}", "-"),
+        ("_", " "),
+        ("\u{201c}", "\""),
+        ("\u{201d}", "\""),
+        ("\u{2018}", "'"),
+        ("\u{2019}", "'"),
+        ("´", "'"),
+        ("`", "'"),
+        ("[", " "),
+        ("]", " "),
+        ("|", " "),
+        ("/", " "),
+        ("#", " "),
+        ("→", " "),
+        ("←", " "),
+        ("@", " at "),
+        ("e.g.,", "for example, "),
+        ("i.e.,", "that is, "),
+    ] {
+        text = text.replace(from, to);
+    }
+    for symbol in ["♥", "☆", "♡", "©", "\\"] {
+        text = text.replace(symbol, "");
+    }
+    text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !text.ends_with(['.', '!', '?', ':', ';', ',', '\"', '\'']) {
+        text.push('.');
+    }
+    format!("<en>{text}</en>")
+}
 impl Supertonic {
     pub fn load(
         root: &Path,
@@ -112,40 +148,7 @@ impl Supertonic {
         self.cfg.ae.sample_rate
     }
     pub fn synth(&mut self, text: &str, speed: f32) -> Result<Vec<f32>> {
-        // Model-specific character normalization from the pinned inference path.
-        let mut text: String = text.nfkd().collect();
-        for (from, to) in [
-            ("\u{2013}", "-"),
-            ("\u{2011}", "-"),
-            ("\u{2014}", "-"),
-            ("_", " "),
-            ("\u{201c}", "\""),
-            ("\u{201d}", "\""),
-            ("\u{2018}", "'"),
-            ("\u{2019}", "'"),
-            ("´", "'"),
-            ("`", "'"),
-            ("[", " "),
-            ("]", " "),
-            ("|", " "),
-            ("/", " "),
-            ("#", " "),
-            ("→", " "),
-            ("←", " "),
-            ("@", " at "),
-            ("e.g.,", "for example, "),
-            ("i.e.,", "that is, "),
-        ] {
-            text = text.replace(from, to);
-        }
-        for symbol in ["♥", "☆", "♡", "©", "\\"] {
-            text = text.replace(symbol, "");
-        }
-        text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        if !text.ends_with(['.', '!', '?', ':', ';', ',', '\"', '\'']) {
-            text.push('.');
-        }
-        let tagged = format!("<en>{text}</en>");
+        let tagged = prepare_text(text);
         let ids: Vec<i64> = tagged
             .chars()
             .map(|c| self.indexer.get(c as usize).copied().unwrap_or(-1))

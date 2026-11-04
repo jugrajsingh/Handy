@@ -58,6 +58,10 @@ pub trait SynthEngine: Send {
         speed: Option<f32>,
         cancelled: &AtomicBool,
     ) -> Result<Vec<f32>>;
+    /// Checks text length against the selected graph's smallest text-input cap.
+    fn fits_text(&self, _text: &str) -> bool {
+        true
+    }
     fn sample_rate(&self) -> u32;
     fn device(&self) -> handy_tts_core::device::Device {
         handy_tts_core::device::Device::Cpu
@@ -101,7 +105,12 @@ pub fn synthesize_bounded(
     let mut samples = Vec::new();
     while let Some(part) = pending.pop() {
         ensure!(!cancelled.load(Ordering::SeqCst), "cancelled");
-        match engine.synthesize(part, speed, cancelled) {
+        let result = if engine.fits_text(part) {
+            engine.synthesize(part, speed, cancelled)
+        } else {
+            Err(crate::padding::StaticCapacity.into())
+        };
+        match result {
             Ok(pcm) => {
                 ensure!(
                     pcm.len() <= handy_tts_core::protocol::MAX_SAMPLES - samples.len(),
@@ -119,7 +128,13 @@ pub fn synthesize_bounded(
                     .filter(|(i, ch)| *i > 0 && ch.is_whitespace() && !part[*i..].trim().is_empty())
                     .min_by_key(|(i, _)| i.abs_diff(part.len() / 2))
                     .map(|(i, _)| i)
-                    .context("static input cannot split at a word boundary")?;
+                    .or_else(|| {
+                        part.char_indices()
+                            .nth(part.chars().count() / 2)
+                            .map(|(i, _)| i)
+                            .filter(|i| *i > 0)
+                    })
+                    .context("static input cannot split further")?;
                 pending.push(part[split..].trim_start());
                 pending.push(part[..split].trim_end());
             }
@@ -344,7 +359,7 @@ pub fn run_lanes(
                     let mut bytes = Vec::new();
                     let count = reader
                         .by_ref()
-                        .take(16385)
+                        .take((handy_tts_core::protocol::MAX_CONTROL_BYTES + 1) as u64)
                         .read_until(b'\n', &mut bytes)
                         .context("read control")?;
                     if count == 0 {
@@ -353,7 +368,8 @@ pub fn run_lanes(
                         break;
                     }
                     ensure!(
-                        count <= 16384 && bytes.last() == Some(&b'\n'),
+                        count <= handy_tts_core::protocol::MAX_CONTROL_BYTES
+                            && bytes.last() == Some(&b'\n'),
                         "control line too long"
                     );
                     let request: Request =
@@ -616,11 +632,20 @@ pub fn run_lanes(
 }
 
 pub struct EngineAdapter {
+    text_capacity: Option<usize>,
     engine: crate::Engine,
     device: handy_tts_core::device::Device,
     placement: std::collections::BTreeMap<String, handy_tts_core::device::Device>,
 }
 impl SynthEngine for EngineAdapter {
+    fn fits_text(&self, text: &str) -> bool {
+        match (&self.engine, self.text_capacity) {
+            (crate::Engine::Supertonic(_), Some(capacity)) => {
+                crate::supertonic::prepare_text(text).chars().count() <= capacity
+            }
+            _ => true,
+        }
+    }
     fn cancellation(&self) -> Option<crate::cancellation::Cancellation> {
         Some(self.engine.cancellation().clone())
     }
@@ -672,6 +697,24 @@ pub fn load_adapters(
     ensure!((1..=3).contains(&lanes), "invalid lanes");
     ensure!((1..=8).contains(&threads), "invalid threads");
     let config = crate::backend_config::config(model, root, device, cache)?;
+    let text_capacity = config
+        .classes
+        .iter()
+        .map(|class| class.text as usize)
+        .max()
+        .or_else(|| {
+            config
+                .shapes
+                .values()
+                .filter_map(|inputs| {
+                    inputs
+                        .get("text_ids")
+                        .and_then(|shape| shape.last())
+                        .copied()
+                })
+                .filter_map(|value| usize::try_from(value).ok())
+                .min()
+        });
     let placement = config.placement.clone();
     let engines = crate::graph::with_config(config, || {
         crate::Engine::load_lanes(model, root, (threads / lanes).max(1), voice, lanes)
@@ -680,6 +723,7 @@ pub fn load_adapters(
         .into_iter()
         .map(|engine| {
             Box::new(EngineAdapter {
+                text_capacity,
                 engine,
                 device,
                 placement: placement.clone(),
@@ -1803,6 +1847,54 @@ mod tests {
                     .collect();
                 self.words.extend(words);
                 Ok(samples)
+            }
+        }
+        #[test]
+        fn wbfix_supertonic_cap_splits_unbroken_text_before_inference() {
+            struct TextCap {
+                delivered: String,
+            }
+            impl SynthEngine for TextCap {
+                fn sample_rate(&self) -> u32 {
+                    24000
+                }
+                fn fits_text(&self, text: &str) -> bool {
+                    crate::supertonic::prepare_text(text).chars().count() <= 304
+                }
+                fn synthesize(
+                    &mut self,
+                    text: &str,
+                    _: Option<f32>,
+                    _: &AtomicBool,
+                ) -> Result<Vec<f32>> {
+                    assert!(
+                        self.fits_text(text),
+                        "text length must fit before inference"
+                    );
+                    self.delivered.push_str(text);
+                    Ok(text
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .map(|c| c as u32 as f32)
+                        .collect())
+                }
+            }
+            for count in [400, 20_000] {
+                let text = format!("{} Following text.", "@".repeat(count));
+                let mut engine = TextCap {
+                    delivered: String::new(),
+                };
+                let samples =
+                    synthesize_bounded(&mut engine, &text, Some(1.0), &AtomicBool::new(false))
+                        .unwrap();
+                assert_eq!(
+                    samples,
+                    text.chars()
+                        .filter(|c| !c.is_whitespace())
+                        .map(|c| c as u32 as f32)
+                        .collect::<Vec<_>>()
+                );
+                assert!(engine.delivered.ends_with("Following text."));
             }
         }
         #[test]
