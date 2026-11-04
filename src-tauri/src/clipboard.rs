@@ -597,7 +597,13 @@ pub fn get_available_typing_tools() -> Vec<String> {
 fn tool_available_with(command: &mut Command, timeout: Duration) -> Result<bool, String> {
     paste_probe_with_timeout(command, timeout)
         .map(|output| output.status.success())
-        .map_err(|error| format!("Typing tool availability probe failed: {error}"))
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                Err(format!("Typing tool availability probe failed: {error}"))
+            } else {
+                Ok(false)
+            }
+        })
 }
 
 /// Check if wtype is available (Wayland text input tool)
@@ -688,6 +694,10 @@ fn detect_ydotool_key_syntax_with(
                 );
                 Ok(YDOTOOL_UNKNOWN_HELP_FALLBACK)
             }
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::TimedOut => {
+            log::warn!("Could not query ydotool key syntax: {error}; using raw-keycode syntax");
+            Ok(YDOTOOL_UNKNOWN_HELP_FALLBACK)
         }
         Err(error) => Err(format!("Could not query ydotool key syntax: {error}")),
     }
@@ -1047,17 +1057,28 @@ fn paste_direct(
     #[cfg(target_os = "linux")] typing_tool: TypingTool,
 ) -> Result<(), String> {
     #[cfg(target_os = "linux")]
-    {
-        if try_direct_typing_linux(text, typing_tool)? {
-            return Ok(());
-        }
-        info!("Falling back to enigo for direct text input");
-    }
+    let handled = try_direct_typing_linux(text, typing_tool);
+    #[cfg(not(target_os = "linux"))]
+    let handled = Ok(false);
 
-    let text = text.to_string();
-    with_enigo(app_handle, move |enigo| {
-        input::paste_text_direct(enigo, &text)
+    paste_with_fallback(handled, || {
+        info!("Falling back to enigo for direct text input");
+        let text = text.to_string();
+        with_enigo(app_handle, move |enigo| {
+            input::paste_text_direct(enigo, &text)
+        })
     })
+}
+
+fn paste_with_fallback(
+    handled: Result<bool, String>,
+    native: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    if handled? {
+        Ok(())
+    } else {
+        native()
+    }
 }
 
 pub(crate) fn send_return_key(enigo: &mut Enigo, key_type: AutoSubmitKey) -> Result<(), String> {
@@ -1241,6 +1262,208 @@ fn paste_inner(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wbfix2_unspawnable_probe_keeps_native_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-probe");
+        for (path, kind) in [
+            (missing.as_path(), std::io::ErrorKind::NotFound),
+            (dir.path(), std::io::ErrorKind::PermissionDenied),
+        ] {
+            assert!(path.is_absolute());
+            assert_eq!(Command::new(path).output().unwrap_err().kind(), kind);
+            let available = tool_available_with(&mut Command::new(path), Duration::from_secs(1));
+            assert_eq!(
+                available,
+                Ok(false),
+                "unspawnable probe must be unavailable"
+            );
+            let called = Cell::new(false);
+            let result = paste_with_fallback(available, || {
+                called.set(true);
+                Ok(())
+            });
+            assert!(result.is_ok());
+            assert!(called.get(), "missing probe must reach native paste");
+        }
+        let called = Cell::new(false);
+        let result = paste_with_fallback(
+            tool_available_with(
+                Command::new("sh").args(["-c", "sleep 2"]),
+                Duration::from_millis(60),
+            ),
+            || {
+                called.set(true);
+                Ok(())
+            },
+        );
+        assert!(result.is_err(), "probe timeout must abort native fallback");
+        assert!(!called.get());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wbfix2_failed_help_probe_uses_uncached_fallback_and_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-help-probe");
+        for path in [missing.as_path(), dir.path()] {
+            let cache = OnceLock::new();
+            assert_eq!(
+                detect_ydotool_key_syntax_with(
+                    &mut Command::new(path),
+                    &cache,
+                    Duration::from_secs(1)
+                ),
+                Ok(YDOTOOL_UNKNOWN_HELP_FALLBACK),
+                "failed help probe must retain raw-keycode fallback"
+            );
+            assert!(
+                cache.get().is_none(),
+                "failed help must not poison syntax cache"
+            );
+            assert_eq!(
+                detect_ydotool_key_syntax_with(
+                    Command::new("sh").args(["-c", "printf 'separated by plus (+)'"]),
+                    &cache,
+                    Duration::from_secs(1)
+                ),
+                Ok(YdotoolKeySyntax::Symbolic),
+                "later help probe must recover"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wbfix2_unreadable_probe_output_keeps_fallbacks() {
+        let script = "import sys; sys.stdout.write('x'*70000)";
+        let available = tool_available_with(
+            Command::new("python3").args(["-c", script]),
+            Duration::from_secs(2),
+        );
+        assert_eq!(
+            available,
+            Ok(false),
+            "unreadable availability output must allow fallback"
+        );
+        let cache = OnceLock::new();
+        assert_eq!(
+            detect_ydotool_key_syntax_with(
+                Command::new("python3").args(["-c", script]),
+                &cache,
+                Duration::from_secs(2)
+            ),
+            Ok(YDOTOOL_UNKNOWN_HELP_FALLBACK),
+            "unreadable help output must allow fallback"
+        );
+        assert!(cache.get().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wbfix2_tool_receives_complete_large_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let received = dir.path().join("stdin");
+        let capacity = dir.path().join("capacity");
+        let payload = b"type complete payload\n".repeat(16384);
+        let output = paste_tool_with_timeout(
+            Command::new("python3")
+                .args([
+                    "-c",
+                    r#"import fcntl, pathlib, sys
+capacity = fcntl.fcntl(sys.stdin.fileno(), fcntl.F_GETPIPE_SZ)
+pathlib.Path(sys.argv[2]).write_text(str(capacity))
+pathlib.Path(sys.argv[1]).write_bytes(sys.stdin.buffer.read())
+"#,
+                ])
+                .arg(&received)
+                .arg(&capacity),
+            Some(payload.clone()),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        let capacity: usize = std::fs::read_to_string(capacity).unwrap().parse().unwrap();
+        assert!(
+            payload.len() > capacity,
+            "fixture must exceed pipe capacity"
+        );
+        assert!(
+            std::fs::read(received).unwrap() == payload,
+            "tool must receive every stdin byte"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wbfix2_external_script_descendant_serves_after_return() {
+        use std::io::{Read, Write};
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("clipboard.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let script = dir.path().join("clipboard-helper");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/python3
+import os, socket, sys
+ready_read, ready_write = os.pipe()
+if os.fork():
+    os.close(ready_write)
+    os.read(ready_read, 1)
+    os.close(ready_read)
+    sys.exit(0)
+os.close(ready_read)
+with socket.socket(socket.AF_UNIX) as stream:
+    stream.settimeout(5)
+    stream.connect(sys.argv[1])
+    os.write(ready_write, b'1')
+    os.close(ready_write)
+    request = stream.recv(64)
+    stream.sendall(request)
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let began = std::time::Instant::now();
+        let result = paste_via_external_script(socket.to_str().unwrap(), script.to_str().unwrap());
+        assert!(result.is_ok(), "clipboard helper must return successfully");
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "helper must not wait for its serving descendant"
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "serving descendant must connect"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Err(error) => panic!("accept clipboard descendant: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = b"clipboard requested after parent returned";
+        let sent = stream.write_all(request);
+        let mut response = Vec::new();
+        let read = stream.read_to_end(&mut response);
+        assert!(
+            sent.is_ok() && read.is_ok() && response == request,
+            "serving descendant must survive successful tool return"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn wbfix_fix1_ydotool_help_keeps_both_streams_and_legacy_exit_status() {
