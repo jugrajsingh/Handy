@@ -930,6 +930,7 @@
     "noOptionsFound": "No se encontraron opciones"
   },
   "errors": {
+    "readAloudUnavailableTitle": "Read Aloud Unavailable",
     "loadDirectory": "Error al cargar el directorio: {{error}}",
     "micPermissionDeniedTitle": "Acceso al micrófono denegado",
     "micPermissionDenied": {

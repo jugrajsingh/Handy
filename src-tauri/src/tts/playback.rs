@@ -484,6 +484,9 @@ impl Output for RodioOutput {
             sink.play();
         }
     }
+    fn close(&mut self) {
+        *self = Self::default();
+    }
     fn stop(&mut self) {
         if let (Some(conversion), Some(feed), Some(rate)) =
             (&self.conversion, &self.feed, self.rate)
@@ -1174,6 +1177,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn wbfix_close_releases_sink_and_feed_while_stop_keeps_them() {
+        let (mixer, _) = rodio::mixer::mixer(
+            rodio::ChannelCount::MIN,
+            rodio::SampleRate::new(8000).unwrap(),
+        );
+        let mut output = RodioOutput::with_mixer(&mixer, 8000);
+        Output::stop(&mut output);
+        assert!(output.sink.is_some() && output.feed.is_some());
+        Output::close(&mut output);
+        assert!(output.sink.is_none() && output.feed.is_none() && output.stream.is_none());
+    }
     #[test]
     fn stop_clears_feed_without_replacing_sink() {
         let (mixer, mut mixed) = rodio::mixer::mixer(

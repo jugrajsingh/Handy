@@ -1016,13 +1016,16 @@ impl ShortcutAction for TranscribeAction {
                                 }
                                 let failure_app = ah.clone();
                                 let completion =
-                                    handy_tts_core::handoff::PasteCompletion::new(move || {
-                                        if let (Some(service), Some(generation)) =
-                                            (service, generation)
-                                        {
-                                            service.paste_completed(generation);
-                                        }
-                                    });
+                                    handy_tts_core::handoff::PasteCompletion::with_timeout(
+                                        crate::clipboard::paste_timeout(&get_settings(&ah)),
+                                        move || {
+                                            if let (Some(service), Some(generation)) =
+                                                (service, generation)
+                                            {
+                                                service.paste_completed(generation);
+                                            }
+                                        },
+                                    );
                                 let failed_completion = completion.clone();
                                 let session = RECORDING_SESSION.load(Ordering::SeqCst);
                                 fence.queue_native(

@@ -190,6 +190,28 @@ struct Parts {
     plan: crate::speed::SpeedPlan,
     elapsed_per_second: f64,
 }
+type ControlResult = Result<Pcm, String>;
+type ControlRenderer = std::sync::Arc<dyn Fn(Pcm, f32, f32) -> ControlResult + Send + Sync>;
+struct ControlRender {
+    chosen: Selection,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    result: std::sync::mpsc::Receiver<VecDeque<ControlResult>>,
+    join: std::thread::JoinHandle<()>,
+}
+fn control_pcm(
+    pcm: Pcm,
+    stretch: f32,
+    pitch: f32,
+    results: &mut Option<VecDeque<ControlResult>>,
+) -> ControlResult {
+    if let Some(results) = results {
+        results
+            .pop_front()
+            .unwrap_or_else(|| Err("tts.errors.audio".into()))
+    } else {
+        render(pcm, stretch, pitch).map_err(|_| "tts.errors.audio".to_string())
+    }
+}
 struct Appended {
     sentence: usize,
     segment: usize,
@@ -198,6 +220,11 @@ struct Appended {
 /// Owns incremental text, bounded audio scheduling and output playback.
 pub struct Session<'a, W: Worker, O: Output> {
     source: &'a str,
+    async_controls: bool,
+    control_renderer: ControlRenderer,
+    control_render: Option<ControlRender>,
+    pending_controls: Option<Selection>,
+    control_results: Option<VecDeque<ControlResult>>,
     source_utf16: usize,
     handy_output: Option<String>,
     cursor: TextCursor<'a>,
@@ -245,6 +272,13 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         let playback = Playback::idle(output);
         Ok(Self {
             source,
+            async_controls: !cfg!(test),
+            control_renderer: std::sync::Arc::new(|pcm, stretch, pitch| {
+                render(pcm, stretch, pitch).map_err(|_| "tts.errors.audio".into())
+            }),
+            control_render: None,
+            pending_controls: None,
+            control_results: None,
             source_utf16: source.encode_utf16().count(),
             handy_output: handy_output.map(str::to_owned),
             cursor,
@@ -362,6 +396,25 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         }
         Ok(())
     }
+    /// Updates the inherited output choice before Play.
+    pub fn set_handy_output(&mut self, handy: Option<String>) -> Result<(), String> {
+        if self.handy_output != handy {
+            if self.selection.output_device.is_none() {
+                let prepared = self
+                    .playback
+                    .prepare(None, handy.as_deref())
+                    .map_err(|_| "tts.errors.audio".to_string())?;
+                self.playback.commit(prepared);
+            }
+            self.handy_output = handy;
+        }
+        Ok(())
+    }
+    /// Stops reading and releases the output stream.
+    pub fn close(&mut self) {
+        self.stop();
+        self.playback.close();
+    }
     /// Pauses output and generation requests while preserving queued audio.
     pub fn pause(&mut self) {
         if !matches!(
@@ -375,6 +428,14 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
     }
     /// Drops audio and invalidates pending requests.
     pub fn stop(&mut self) {
+        self.pending_controls = None;
+        self.control_results = None;
+        if let Some(render) = &self.control_render {
+            render
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            let _ = render.result.try_recv();
+        }
         for ticket in self.queue.in_flight.values().copied() {
             self.worker.cancel(ticket);
         }
@@ -401,6 +462,13 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
     }
     /// Stops at the active sentence and rejects stale audio until retry.
     pub fn fail(&mut self, error: String) {
+        self.pending_controls = None;
+        if let Some(render) = &self.control_render {
+            render
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+
         for ticket in self.queue.in_flight.values().copied() {
             self.worker.cancel(ticket);
         }
@@ -437,6 +505,12 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             self.set_speed_pitch(selection.speed, selection.pitch)
                 .map_err(|_| SelectionError::Controls)?;
             return Ok(changed);
+        }
+        self.pending_controls = None;
+        if let Some(render) = &self.control_render {
+            render
+                .cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
         }
         let index = self.queue.next_unspoken();
         let position = (self.selection.read_code != selection.read_code)
@@ -759,17 +833,21 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         chosen.pitch = pitch;
         crate::selection::clamp_selection(chosen.clone())
             .map_err(|_| "tts.errors.audio".to_string())?;
-        self.playback.pause();
-        let result = self.restretch_unstarted(chosen);
-        if self.queue.state != PlaybackState::Paused {
-            self.playback.resume();
+        if self.async_controls {
+            self.selection = chosen.clone();
+            self.pending_controls = Some(chosen);
+            if let Some(render) = &self.control_render {
+                render
+                    .cancelled
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            self.poll_controls()?;
+            return Ok(());
         }
-        result?;
+        self.restretch_unstarted(chosen)?;
         self.append_ahead()
     }
-    fn restretch_unstarted(&mut self, chosen: Selection) -> Result<(), String> {
-        let speed = chosen.speed;
-        let pitch = chosen.pitch;
+    fn retract_controls(&mut self) -> Result<(), String> {
         self.output_events()?;
         let retracted = self.playback.retract_unstarted();
         self.output_events()?;
@@ -784,6 +862,113 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                     .push_back((audio.sentence, audio.segment));
             }
         }
+        Ok(())
+    }
+    fn poll_controls(&mut self) -> Result<bool, String> {
+        if let Some(work) = &self.control_render {
+            match work.result.try_recv() {
+                Ok(results) => {
+                    let work = self.control_render.take().ok_or("tts.errors.audio")?;
+                    let _ = work.join.join();
+                    if !work.cancelled.load(std::sync::atomic::Ordering::Acquire) {
+                        self.control_results = Some(results);
+                        let result = self.restretch_unstarted(work.chosen);
+                        self.control_results = None;
+                        result?;
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => return Ok(true),
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let cancelled = work.cancelled.load(std::sync::atomic::Ordering::Acquire);
+                    self.control_render = None;
+                    if !cancelled {
+                        return Err("tts.errors.audio".into());
+                    }
+                }
+            }
+        }
+        let Some(chosen) = self.pending_controls.take() else {
+            return Ok(false);
+        };
+        self.retract_controls()?;
+        let audible_index = self.started_sentence.filter(|index| {
+            self.queue
+                .playing
+                .as_ref()
+                .is_some_and(|a| a.ticket.index == *index)
+        });
+        let mut jobs = Vec::new();
+        for audio in self
+            .queue
+            .playing
+            .iter()
+            .chain(self.queue.waiting.iter())
+            .chain(self.queue.ready.values())
+        {
+            if Some(audio.ticket.index) != audible_index
+                && let Some(stretch) = crate::speed::restretch(audio.plan.native, chosen.speed)
+            {
+                jobs.push((
+                    Pcm {
+                        samples: audio.native.clone(),
+                        ..audio.pcm.clone()
+                    },
+                    stretch,
+                ));
+            }
+        }
+        for (index, parts) in &self.parts {
+            if Some(*index) == audible_index {
+                continue;
+            }
+            if let Some(stretch) = crate::speed::restretch(parts.plan.native, chosen.speed)
+                && let Some((first, _)) = parts.samples.front()
+            {
+                jobs.push((
+                    Pcm {
+                        id: first.id,
+                        sample_rate: first.sample_rate,
+                        samples: parts
+                            .samples
+                            .iter()
+                            .flat_map(|(_, native)| native.iter().copied())
+                            .collect(),
+                    },
+                    stretch,
+                ));
+            }
+        }
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let renderer = self.control_renderer.clone();
+        let (send, result) = std::sync::mpsc::sync_channel(1);
+        let pitch = chosen.pitch;
+        let join = std::thread::spawn(move || {
+            let mut rendered = VecDeque::new();
+            for (pcm, stretch) in jobs {
+                if flag.load(std::sync::atomic::Ordering::Acquire) {
+                    break;
+                }
+                rendered.push_back(renderer(pcm, stretch, pitch));
+            }
+            if flag.load(std::sync::atomic::Ordering::Acquire) {
+                rendered.clear();
+            }
+            let _ = send.send(rendered);
+        });
+        self.control_render = Some(ControlRender {
+            chosen,
+            cancelled,
+            result,
+            join,
+        });
+        Ok(true)
+    }
+    fn restretch_unstarted(&mut self, chosen: Selection) -> Result<(), String> {
+        let speed = chosen.speed;
+        let pitch = chosen.pitch;
+        self.retract_controls()?;
+        let mut results = self.control_results.take();
         self.selection = chosen;
         self.queue.speed = speed;
         let audible_index = self.started_sentence.filter(|index| {
@@ -806,13 +991,14 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 continue;
             }
             if let Some(stretch) = crate::speed::restretch(audio.plan.native, speed) {
-                audio.pcm = render(
+                audio.pcm = control_pcm(
                     Pcm {
                         samples: audio.native.clone(),
                         ..audio.pcm.clone()
                     },
                     stretch,
                     pitch,
+                    &mut results,
                 )
                 .map_err(|_| "tts.errors.audio".to_string())?;
                 audio.plan.requested = speed;
@@ -845,7 +1031,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                         .iter_mut()
                         .flat_map(|(_, native)| std::mem::take(native))
                         .collect();
-                    let pcm = render(
+                    let pcm = control_pcm(
                         Pcm {
                             id,
                             sample_rate: rate,
@@ -853,6 +1039,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                         },
                         stretch,
                         pitch,
+                        &mut results,
                     )
                     .map_err(|_| "tts.errors.audio".to_string())?;
                     let new_samples = pcm.samples.len();
@@ -931,6 +1118,9 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         }
         self.now = now;
         self.output_events()?;
+        if self.poll_controls()? {
+            return Ok(());
+        }
         self.advance();
         while let Some(completion) = self.worker.poll() {
             self.received(completion);
@@ -1497,6 +1687,7 @@ mod tests {
         struct Audio {
             feed: Feed,
             paused: bool,
+            pause_calls: usize,
             trace: Vec<OutputEvent>,
             appended: Vec<(usize, usize)>,
             expected_speech: Option<Vec<f32>>,
@@ -1506,6 +1697,7 @@ mod tests {
                 Self {
                     feed: Feed::new(8000),
                     paused: false,
+                    pause_calls: 0,
                     trace: vec![],
                     appended: vec![],
                     expected_speech: None,
@@ -1553,6 +1745,7 @@ mod tests {
                 self.feed.content_samples()
             }
             fn pause(&mut self) {
+                self.pause_calls += 1;
                 self.paused = true;
             }
             fn resume(&mut self) {
@@ -1626,6 +1819,165 @@ mod tests {
             if s.queue.state == PlaybackState::Playing && !s.playback.output.paused {
                 s.playback.output.feed.pull(&mut vec![0.0; pull]);
             }
+        }
+        #[test]
+        fn wbfix_pause_after_two_finished_segments_never_reappends_waiting_audio() {
+            let source =
+                "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(8);
+            let mut s = create(&source, 2.0);
+            s.tick(0.0).unwrap();
+            s.tick(0.01).unwrap();
+            assert_eq!(s.appended.len(), 2);
+            s.playback.output.feed.pull(&mut [0.0]);
+            s.tick(0.02).unwrap();
+            assert_eq!(s.appended.len(), 3);
+            let samples: usize = s.appended.iter().take(2).map(|a| a.samples).sum();
+            s.playback.output.feed.pull(&mut vec![0.0; samples - 1]);
+            s.pause();
+            s.tick(0.03).unwrap();
+            s.play().unwrap();
+            for step in 4..2000 {
+                pump(&mut s, f64::from(step) * 0.02, 160);
+                if s.queue.state == PlaybackState::Finished {
+                    break;
+                }
+            }
+            assert_eq!(s.queue.state, PlaybackState::Finished);
+            let started: Vec<_> = s
+                .playback
+                .output
+                .trace
+                .iter()
+                .filter_map(|e| {
+                    if let OutputEvent::Started(i) = e {
+                        Some(*i)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(
+                started,
+                (0..8).collect::<Vec<_>>(),
+                "every segment must play exactly once"
+            );
+        }
+        #[test]
+        fn wbfix_stop_and_current_audio_remain_live_during_a_blocked_render() {
+            let source =
+                "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(8);
+            let mut s = create(&source, 1.0);
+            s.tick(0.0).unwrap();
+            s.tick(0.01).unwrap();
+            s.playback.output.feed.pull(&mut [0.0]);
+            s.tick(0.02).unwrap();
+            let epoch = s.queue.epoch;
+            s.async_controls = true;
+            let (entered, wait) = std::sync::mpsc::channel();
+            let (release, blocked) = std::sync::mpsc::channel();
+            let blocked = std::sync::Mutex::new(blocked);
+            s.control_renderer = std::sync::Arc::new(move |pcm, stretch, pitch| {
+                entered.send(()).unwrap();
+                blocked.lock().unwrap().recv().unwrap();
+                render(pcm, stretch, pitch).map_err(|_| "tts.errors.audio".into())
+            });
+            let began = std::time::Instant::now();
+            s.set_speed_pitch(2.0, 0.0).unwrap();
+            let control_time = began.elapsed();
+            wait.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap();
+            let before = s.playback.output.feed.content_samples();
+            s.playback.output.feed.pull(&mut [0.0; 1024]);
+            assert_eq!(s.playback.output.feed.content_samples(), before + 1024);
+            assert_eq!(s.queue.epoch, epoch);
+            assert_eq!(s.queue.playing.as_ref().unwrap().plan.requested, 1.0);
+            let began = std::time::Instant::now();
+            s.stop();
+            let stop_time = began.elapsed();
+            assert!(
+                control_time < std::time::Duration::from_millis(50),
+                "control render must leave actor free"
+            );
+            assert!(
+                stop_time < std::time::Duration::from_millis(50),
+                "Stop must not wait for rendering"
+            );
+            release.send(()).unwrap();
+            let work = s.control_render.take().unwrap();
+            work.join.join().unwrap();
+            assert!(
+                work.result.recv().unwrap().is_empty(),
+                "Stop must discard rendered audio"
+            );
+            println!(
+                "blocked-render control={control_time:?} stop={stop_time:?} continued_samples=1024"
+            );
+            assert_eq!(s.queue.state, PlaybackState::Waiting);
+            assert!(s.appended.is_empty());
+        }
+        #[test]
+        fn wbfix_background_speed_change_delivers_every_segment_at_the_next_boundary() {
+            let source =
+                "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(8);
+            let mut s = create(&source, 1.0);
+            s.tick(0.0).unwrap();
+            s.tick(0.01).unwrap();
+            s.playback.output.feed.pull(&mut [0.0]);
+            s.tick(0.02).unwrap();
+            let epoch = s.queue.epoch;
+            s.async_controls = true;
+            s.set_speed_pitch(2.0, 0.0).unwrap();
+            for _ in 0..2000 {
+                s.tick(0.02).unwrap();
+                if s.control_render.is_none() && s.pending_controls.is_none() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                s.control_render.is_none(),
+                "background rendering must finish"
+            );
+            for step in 2..2000 {
+                pump(&mut s, f64::from(step) * 0.02, 160);
+                if s.queue.state == PlaybackState::Finished {
+                    break;
+                }
+            }
+            assert_eq!(s.queue.epoch, epoch);
+            assert_eq!(s.queue.state, PlaybackState::Finished);
+            let finished: Vec<_> = s
+                .playback
+                .output
+                .trace
+                .iter()
+                .filter_map(|e| {
+                    if let OutputEvent::Finished { index, delivered } = e {
+                        assert_eq!(*delivered, if *index == 0 { 11_600 } else { 5800 });
+                        Some(*index)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            assert_eq!(finished, (0..8).collect::<Vec<_>>());
+            assert_eq!(s.playback.output.pause_calls, 0);
+        }
+        #[test]
+        fn wbfix_speed_change_never_pauses_the_audible_segment() {
+            let source =
+                "Every sentence has enough characters to form its own speech chunk.\n\n".repeat(8);
+            let mut s = create(&source, 1.0);
+            s.tick(0.0).unwrap();
+            s.tick(0.01).unwrap();
+            s.playback.output.feed.pull(&mut [0.0]);
+            s.tick(0.02).unwrap();
+            let pauses = s.playback.output.pause_calls;
+            s.set_speed_pitch(2.0, 0.0).unwrap();
+            assert_eq!(
+                s.playback.output.pause_calls, pauses,
+                "current speech must never be paused for rendering"
+            );
         }
         #[test]
         fn resume_from_buffering_keeps_native_audio_until_started() {

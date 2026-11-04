@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::sync::{Arc, Condvar, Mutex};
 
 #[derive(Default)]
 /// Tracks actual paste completion for the current dictation generation.
@@ -47,18 +47,28 @@ enum DeferredJob {
 #[derive(Default)]
 struct FenceState {
     capture: bool,
+    pastes: usize,
     deferred: Vec<DeferredJob>,
 }
 #[derive(Default)]
 /// Reserves clipboard capture ahead of native paste.
 pub struct PasteFence {
     state: Mutex<FenceState>,
+    revision: std::sync::atomic::AtomicU64,
 }
 impl PasteFence {
-    /// Reserves capture unless another capture already owns the fence.
+    /// Reads a nonblocking paste stamp at shortcut dispatch.
+    pub fn revision(&self) -> u64 {
+        self.revision.load(std::sync::atomic::Ordering::Acquire)
+    }
+    /// Reserves capture unless another capture or paste already owns the fence.
     pub fn reserve_capture(&self) -> bool {
+        self.reserve_capture_since(self.revision())
+    }
+    /// Rejects capture if native paste started after the shortcut press.
+    pub fn reserve_capture_since(&self, revision: u64) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.capture {
+        if state.capture || state.pastes > 0 || self.revision() != revision {
             return false;
         }
         state.capture = true;
@@ -79,12 +89,18 @@ impl PasteFence {
         }
     }
     fn dispatch(&self, job: Job) {
-        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.capture {
-            state.deferred.push(DeferredJob::Paste(job));
-        } else {
-            job();
+        {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.capture {
+                state.deferred.push(DeferredJob::Paste(job));
+                return;
+            }
+            state.pastes += 1;
+            self.revision
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         }
+        let _active = ActivePaste(self);
+        job();
     }
     /// Defers queueing during capture; queue callbacks may enter the paste fence.
     pub fn before_queue(&self, job: Job) {
@@ -109,40 +125,150 @@ impl PasteFence {
             let replay_queue = queue.clone();
             let replay_failed = failed.clone();
             let guarded = Box::new(move || {
-                let mut state = fence.state.lock().unwrap_or_else(|p| p.into_inner());
-                if state.capture {
-                    let replay = fence.clone();
-                    state.deferred.push(DeferredJob::Queue(Box::new(move || {
-                        replay.queue_native(replay_queue, job, replay_failed);
-                    })));
-                } else {
-                    job();
+                {
+                    let mut state = fence.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if state.capture {
+                        let replay = fence.clone();
+                        state.deferred.push(DeferredJob::Queue(Box::new(move || {
+                            replay.queue_native(replay_queue, job, replay_failed);
+                        })));
+                        return;
+                    }
+                    if state.pastes > 0 {
+                        drop(state);
+                        replay_failed("native paste still active".into());
+                        return;
+                    }
+                    state.pastes += 1;
+                    fence
+                        .revision
+                        .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 }
+                let _active = ActivePaste(&fence);
+                job();
             });
             if let Err(error) = queue(guarded) {
                 failed(error);
             }
         }));
     }
-    /// Serializes actual paste with capture reservation; callbacks must not re-enter.
+    /// Prevents capture during native paste without holding the state lock.
     pub fn before_paste(&self, job: Job) {
         self.dispatch(job);
     }
 }
 
-#[derive(Clone)]
-/// Completes a paste only after its native settlement has finished.
-pub struct PasteCompletion(std::sync::Arc<Mutex<Option<Job>>>);
-impl PasteCompletion {
-    pub fn new(done: impl FnOnce() + Send + 'static) -> Self {
-        Self(std::sync::Arc::new(Mutex::new(Some(Box::new(done)))))
+struct ActivePaste<'a>(&'a PasteFence);
+impl Drop for ActivePaste<'_> {
+    fn drop(&mut self) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pastes -= 1;
     }
-    pub fn settle_with(&self, native: impl FnOnce()) {
-        let done = self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+}
+
+#[derive(Default)]
+struct Settlement {
+    done: Option<Job>,
+    settling: bool,
+}
+struct CompletionState {
+    settlement: Mutex<Settlement>,
+    wake: Condvar,
+    holders: std::sync::atomic::AtomicUsize,
+}
+impl CompletionState {
+    fn finish(&self) {
+        let done = self
+            .settlement
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .done
+            .take();
+        self.wake.notify_all();
         if let Some(done) = done {
-            native();
             done();
         }
+    }
+}
+impl Drop for CompletionState {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+struct SettleOnDrop<'a>(&'a CompletionState);
+impl Drop for SettleOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.finish();
+    }
+}
+/// Completes a paste after native settlement, unwind, abandonment or timeout.
+pub struct PasteCompletion(Arc<CompletionState>);
+impl Clone for PasteCompletion {
+    fn clone(&self) -> Self {
+        self.0
+            .holders
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(self.0.clone())
+    }
+}
+impl Drop for PasteCompletion {
+    fn drop(&mut self) {
+        if self
+            .0
+            .holders
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            self.0.finish();
+        }
+    }
+}
+impl PasteCompletion {
+    pub fn new(done: impl FnOnce() + Send + 'static) -> Self {
+        Self(Arc::new(CompletionState {
+            settlement: Mutex::new(Settlement {
+                done: Some(Box::new(done)),
+                settling: false,
+            }),
+            wake: Condvar::new(),
+            holders: std::sync::atomic::AtomicUsize::new(1),
+        }))
+    }
+    /// Releases processing after the paste budget even if a native callback stalls.
+    pub fn with_timeout(
+        timeout: std::time::Duration,
+        done: impl FnOnce() + Send + 'static,
+    ) -> Self {
+        let completion = Self::new(done);
+        let state = completion.0.clone();
+        std::thread::spawn(move || {
+            let pending = state.settlement.lock().unwrap_or_else(|p| p.into_inner());
+            let (pending, _) = state
+                .wake
+                .wait_timeout_while(pending, timeout, |s| s.done.is_some())
+                .unwrap_or_else(|p| p.into_inner());
+            let expired = pending.done.is_some();
+            drop(pending);
+            if expired {
+                log::warn!("Native paste timed out; releasing dictation processing");
+                state.finish();
+            }
+        });
+        completion
+    }
+    pub fn settle_with(&self, native: impl FnOnce()) {
+        {
+            let mut pending = self.0.settlement.lock().unwrap_or_else(|p| p.into_inner());
+            if pending.done.is_none() || pending.settling {
+                return;
+            }
+            pending.settling = true;
+        }
+        let _settle = SettleOnDrop(&self.0);
+        native();
     }
 }
 
@@ -151,6 +277,95 @@ mod tests {
     use super::*;
     use crate::referee::{Effect, Event, Referee};
     use std::sync::Arc;
+    #[test]
+    fn wbfix_delayed_capture_never_reads_a_paste_completed_after_the_press() {
+        let fence = PasteFence::default();
+        let pressed = fence.revision();
+        fence.before_paste(Box::new(|| {}));
+        assert!(
+            !fence.reserve_capture_since(pressed),
+            "late capture must reject intervening paste"
+        );
+        assert!(fence.reserve_capture());
+        fence.release_capture();
+    }
+    #[test]
+    fn wbfix_hung_native_settlement_releases_processing_within_its_budget() {
+        let pipeline = Arc::new(Mutex::new(PipelineFence::default()));
+        let generation = pipeline.lock().unwrap().begin();
+        pipeline.lock().unwrap().queued(generation);
+        let (done, wait) = std::sync::mpsc::channel();
+        let state = pipeline.clone();
+        let completion =
+            PasteCompletion::with_timeout(std::time::Duration::from_millis(50), move || {
+                let mut state = state.lock().unwrap();
+                state.pasted(generation);
+                done.send(state.finish(generation)).unwrap();
+            });
+        let (release, blocked) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            completion.settle_with(|| {
+                blocked.recv().unwrap();
+            })
+        });
+        assert!(
+            wait.recv_timeout(std::time::Duration::from_secs(2))
+                .unwrap(),
+            "hung paste must release processing"
+        );
+        let mut state = pipeline.lock().unwrap();
+        let new = state.begin();
+        assert!(state.finish(new), "new dictation must remain usable");
+        drop(state);
+        release.send(()).unwrap();
+        worker.join().unwrap();
+    }
+    #[test]
+    fn wbfix_paste_completion_settles_on_drop_and_native_panic() {
+        for panic in [false, true] {
+            let settled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = settled.clone();
+            let completion =
+                PasteCompletion::with_timeout(std::time::Duration::from_secs(5), move || {
+                    observed.store(true, std::sync::atomic::Ordering::Release);
+                });
+            if panic {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    completion.settle_with(|| panic!("injected native panic"));
+                }));
+            }
+            drop(completion);
+            assert!(
+                settled.load(std::sync::atomic::Ordering::Acquire),
+                "paste must always settle"
+            );
+        }
+    }
+    #[test]
+    fn wbfix_capture_does_not_hold_or_capture_an_active_paste() {
+        let fence = Arc::new(PasteFence::default());
+        let (entered, wait) = std::sync::mpsc::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let paste = fence.clone();
+        let job = std::thread::spawn(move || {
+            paste.before_paste(Box::new(move || {
+                entered.send(()).unwrap();
+                blocked.recv().unwrap();
+            }))
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let (reserved, result) = std::sync::mpsc::channel();
+        let capture = fence.clone();
+        let reader = std::thread::spawn(move || reserved.send(capture.reserve_capture()).unwrap());
+        let early = result.recv_timeout(std::time::Duration::from_millis(150));
+        release.send(()).unwrap();
+        job.join().unwrap();
+        reader.join().unwrap();
+        assert!(!early.unwrap(), "active paste must refuse capture promptly");
+        assert!(fence.reserve_capture());
+        fence.release_capture();
+    }
     #[test]
     fn deferred_native_paste_waits_for_capture_reserved_during_release() {
         let fence = Arc::new(PasteFence::default());

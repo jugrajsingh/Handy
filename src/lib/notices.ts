@@ -31,6 +31,9 @@ const NOTICE_DISPLAY: Record<NoticeCode, NoticeDisplay> = {
   RecordingFailed: {
     title: "errors.recordingFailedTitle",
   },
+  ReadAloudUnavailable: {
+    title: "errors.readAloudUnavailableTitle",
+  },
   ModelLoadFailed: {
     title: "errors.modelLoadFailedTitle",
     explanation: (t) => t("errors.modelLoadFailed"),

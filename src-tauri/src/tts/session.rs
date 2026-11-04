@@ -291,8 +291,95 @@ fn reading_active(state: PlaybackState) -> bool {
             | PlaybackState::Starting
     )
 }
+#[derive(Default)]
+struct InboxState {
+    commands: std::collections::VecDeque<SessionCommand>,
+    close: bool,
+    stop: bool,
+    shutdown: bool,
+}
+#[derive(Default)]
+struct SessionInbox {
+    state: Mutex<InboxState>,
+    wake: std::sync::Condvar,
+}
+impl SessionInbox {
+    fn send(&self, command: SessionCommand) -> Result<(), TtsError> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(
+            command,
+            SessionCommand::Stop
+                | SessionCommand::Close
+                | SessionCommand::Shutdown
+                | SessionCommand::Interrupt(_)
+        ) {
+            let close = matches!(command, SessionCommand::Close | SessionCommand::Shutdown);
+            state.commands.retain_mut(|queued| match queued {
+                SessionCommand::Replace { autoplay, .. } => {
+                    *autoplay = false;
+                    !close
+                }
+                SessionCommand::Play | SessionCommand::Pause | SessionCommand::WorkerReady => false,
+                _ => true,
+            });
+        }
+        match command {
+            SessionCommand::Close => state.close = true,
+            SessionCommand::Stop => state.stop = true,
+            SessionCommand::Shutdown => state.shutdown = true,
+            command => {
+                if matches!(command, SessionCommand::Interrupt(_)) {
+                    state.stop = true;
+                }
+                if matches!(command, SessionCommand::WorkerReady)
+                    && state
+                        .commands
+                        .iter()
+                        .any(|c| matches!(c, SessionCommand::WorkerReady))
+                {
+                    return Ok(());
+                }
+                if state.commands.len() >= 16 {
+                    self.wake.notify_one();
+                    return Err(TtsError::Generic);
+                }
+                state.commands.push_back(command);
+            }
+        }
+        self.wake.notify_one();
+        Ok(())
+    }
+    fn recv(&self, timeout: Option<Duration>) -> Result<SessionCommand, mpsc::RecvTimeoutError> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        let empty =
+            |s: &mut InboxState| !s.close && !s.stop && !s.shutdown && s.commands.is_empty();
+        state = if let Some(timeout) = timeout {
+            self.wake
+                .wait_timeout_while(state, timeout, empty)
+                .unwrap_or_else(|p| p.into_inner())
+                .0
+        } else {
+            self.wake
+                .wait_while(state, empty)
+                .unwrap_or_else(|p| p.into_inner())
+        };
+        if std::mem::take(&mut state.shutdown) {
+            return Ok(SessionCommand::Shutdown);
+        }
+        if std::mem::take(&mut state.close) {
+            return Ok(SessionCommand::Close);
+        }
+        if std::mem::take(&mut state.stop) {
+            return Ok(SessionCommand::Stop);
+        }
+        state
+            .commands
+            .pop_front()
+            .ok_or(mpsc::RecvTimeoutError::Timeout)
+    }
+}
 pub struct ReadAloudSession {
-    tx: mpsc::SyncSender<SessionCommand>,
+    tx: Arc<SessionInbox>,
     view: Arc<Mutex<SessionView>>,
     pub busy: Arc<AtomicBool>,
     manager: Arc<TtsManager>,
@@ -302,11 +389,11 @@ impl ReadAloudSession {
     pub fn spawn(
         manager: Arc<TtsManager>,
         selection: Selection,
-        handy_output: Option<String>,
+        handy_output: Arc<dyn Fn() -> Option<String> + Send + Sync>,
         emit: Arc<dyn Fn(SessionEvent) + Send + Sync>,
     ) -> Arc<Self> {
         let worker = ManagerWorker::new(manager.clone());
-        Self::spawn_with(
+        Self::spawn_with_output_settings(
             manager,
             worker,
             super::playback::RodioOutput::default,
@@ -315,9 +402,10 @@ impl ReadAloudSession {
             emit,
         )
     }
+    #[cfg(test)]
     fn spawn_with<W, O>(
         manager: Arc<TtsManager>,
-        mut worker: W,
+        worker: W,
         output: impl Fn() -> O + Send + 'static,
         selection: Selection,
         handy_output: Option<String>,
@@ -327,10 +415,32 @@ impl ReadAloudSession {
         W: Worker + Clone + Send + 'static,
         O: handy_tts_core::playback::segment::Output + Send + 'static,
     {
-        let (tx, rx) = mpsc::sync_channel(16);
+        Self::spawn_with_output_settings(
+            manager,
+            worker,
+            output,
+            selection,
+            Arc::new(move || handy_output.clone()),
+            emit,
+        )
+    }
+    fn spawn_with_output_settings<W, O>(
+        manager: Arc<TtsManager>,
+        mut worker: W,
+        output: impl Fn() -> O + Send + 'static,
+        selection: Selection,
+        handy_output: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+        emit: Arc<dyn Fn(SessionEvent) + Send + Sync>,
+    ) -> Arc<Self>
+    where
+        W: Worker + Clone + Send + 'static,
+        O: handy_tts_core::playback::segment::Output + Send + 'static,
+    {
+        let tx = Arc::new(SessionInbox::default());
+        let rx = tx.clone();
         let notify = tx.clone();
         worker.set_completion_waker(Arc::new(move || {
-            let _ = notify.try_send(SessionCommand::WorkerReady);
+            let _ = notify.send(SessionCommand::WorkerReady);
         }));
         let empty = SessionSnapshot {
             epoch: 0,
@@ -373,7 +483,7 @@ impl ReadAloudSession {
                     selected.clone(),
                     worker.clone(),
                     output(),
-                    handy_output.as_deref(),
+                    handy_output().as_deref(),
                 ) {
                     Ok(session) => session,
                     Err(error) => {
@@ -390,16 +500,19 @@ impl ReadAloudSession {
                 };
                 session.queue.epoch = epoch;
                 if autoplay {
-                    if let Err(error) = session.play() {
+                    if let Err(error) = session
+                        .set_handy_output(handy_output())
+                        .and_then(|()| session.play())
+                    {
                         session.fail(error);
                     }
                 }
                 let mut text_sent = false;
                 loop {
                     let message = if !visible && !reading_active(session.queue.state) {
-                        rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+                        rx.recv(None)
                     } else {
-                        rx.recv_timeout(Duration::from_millis(20))
+                        rx.recv(Some(Duration::from_millis(20)))
                     };
                     let commanded =
                         message.is_ok() && !matches!(message, Ok(SessionCommand::WorkerReady));
@@ -432,14 +545,17 @@ impl ReadAloudSession {
                             continue 'document;
                         }
                         Ok(SessionCommand::Play) => {
-                            if let Err(error) = session.play() {
+                            if let Err(error) = session
+                                .set_handy_output(handy_output())
+                                .and_then(|()| session.play())
+                            {
                                 session.fail(error);
                             }
                         }
                         Ok(SessionCommand::Pause) => session.pause(),
                         Ok(SessionCommand::Stop) => session.stop(),
                         Ok(SessionCommand::Close) => {
-                            session.stop();
+                            session.close();
                             visible = false;
                         }
                         Ok(SessionCommand::Select {
@@ -511,7 +627,7 @@ impl ReadAloudSession {
         })
     }
     pub fn send(&self, message: SessionCommand) -> Result<(), TtsError> {
-        self.tx.try_send(message).map_err(|_| TtsError::Generic)
+        self.tx.send(message)
     }
     pub fn select_and_wait(
         &self,
@@ -1059,6 +1175,7 @@ pub(super) mod tests {
         prepares: usize,
         commits: usize,
         stops: usize,
+        last_device: Option<String>,
     }
     struct RecoveringAudio(Arc<Mutex<SharedAudio>>);
     impl Output for RecoveringAudio {
@@ -1069,8 +1186,9 @@ pub(super) mod tests {
         fn open(&mut self, _: Option<&str>) -> Result<(), PlaybackError> {
             self.prepare(None)
         }
-        fn prepare(&mut self, _: Option<&str>) -> Result<(), PlaybackError> {
+        fn prepare(&mut self, name: Option<&str>) -> Result<(), PlaybackError> {
             let mut state = self.0.lock().unwrap();
+            state.last_device = name.map(str::to_owned);
             state.prepares += 1;
             if state.unavailable {
                 Err(PlaybackError::Unavailable)
@@ -1208,6 +1326,62 @@ pub(super) mod tests {
             assert!(reading.shutdown());
             std::fs::remove_file(path).unwrap();
         }
+    }
+    #[test]
+    fn wbfix_full_inbox_keeps_close_and_discards_queued_autoplay() {
+        let inbox = SessionInbox::default();
+        for _ in 0..16 {
+            inbox
+                .send(SessionCommand::Replace {
+                    text: "stale".into(),
+                    autoplay: true,
+                    client_revision: None,
+                })
+                .unwrap();
+        }
+        inbox.send(SessionCommand::Close).unwrap();
+        assert!(matches!(
+            inbox.recv(Some(Duration::ZERO)),
+            Ok(SessionCommand::Close)
+        ));
+        assert!(inbox.recv(Some(Duration::ZERO)).is_err());
+        inbox.send(SessionCommand::Stop).unwrap();
+        assert!(matches!(
+            inbox.recv(Some(Duration::ZERO)),
+            Ok(SessionCommand::Stop)
+        ));
+    }
+    #[test]
+    fn wbfix_play_reads_current_handy_output_without_restarting_the_service() {
+        let audio = Arc::new(Mutex::new(SharedAudio::default()));
+        let capture = audio.clone();
+        let device = Arc::new(Mutex::new(None));
+        let setting = device.clone();
+        let reading = ReadAloudSession::spawn_with_output_settings(
+            manager(),
+            Engine,
+            move || RecoveringAudio(capture.clone()),
+            selection(),
+            Arc::new(move || setting.lock().unwrap().clone()),
+            Arc::new(|_| {}),
+        );
+        reading
+            .send(SessionCommand::Replace {
+                text: "A complete sentence for output settings.".into(),
+                autoplay: false,
+                client_revision: None,
+            })
+            .unwrap();
+        reading.pause_and_wait().unwrap();
+        *device.lock().unwrap() = Some("new".into());
+        reading.send(SessionCommand::Play).unwrap();
+        wait_for_state(&reading, PlaybackState::Buffering);
+        assert_eq!(
+            audio.lock().unwrap().last_device.as_deref(),
+            Some("new"),
+            "Play must use live Handy settings"
+        );
+        assert!(reading.shutdown());
     }
     #[test]
     fn blocked_stop_acknowledgement_still_starts_recording() {
@@ -1456,6 +1630,7 @@ pub(super) mod tests {
                 autoplay: true,
             })
             .unwrap();
+        reading.pause_and_wait().unwrap();
         reading.stop_and_wait().unwrap();
         assert!(audio.lock().unwrap().prepares > 0);
         audio.lock().unwrap().unavailable = false;

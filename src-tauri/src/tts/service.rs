@@ -31,6 +31,7 @@ pub struct TtsService {
     app: tauri::AppHandle,
     ready: Mutex<Result<Ready, String>>,
     refused_shortcut: AtomicBool,
+    reading: AtomicBool,
     tray_refresh: mpsc::SyncSender<()>,
     referee: Mutex<Referee>,
     binding: Mutex<String>,
@@ -86,13 +87,13 @@ pub(crate) fn dictation_start_with(
     stop_reading: impl FnOnce() -> Result<(), super::TtsError>,
     begin: impl FnOnce(),
 ) -> Result<(), super::TtsError> {
+    begin();
     if let Err(error) = cancel_preview() {
         log::warn!("Read-aloud preview stop failed during dictation: {error}");
     }
     if let Err(error) = stop_reading() {
         log::warn!("Read-aloud stop acknowledgment failed during dictation: {error}");
     }
-    begin();
     Ok(())
 }
 fn read_shortcut_with(
@@ -110,6 +111,47 @@ fn read_shortcut_with(
     refused.store(false, Ordering::Release);
     referee.apply(Event::ReadShortcut)
 }
+fn unavailable_with(error: &str, log: impl FnOnce(&str), notify: impl FnOnce()) {
+    log(error);
+    notify();
+}
+fn capture_off_thread(job: impl FnOnce() + Send + 'static) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(job)
+}
+fn apply_ordered(
+    referee: &Mutex<Referee>,
+    event: Event,
+    dispatch: impl FnOnce(&Referee, Vec<Effect>),
+) {
+    let mut referee = referee.lock().unwrap_or_else(|p| p.into_inner());
+    let effects = referee.apply(event);
+    dispatch(&referee, effects);
+}
+fn driver_or_cpu<T, E: std::fmt::Display>(result: Result<Option<T>, E>) -> Option<T> {
+    result.unwrap_or_else(|error| {
+        log::warn!("NPU driver discovery failed; using no driver: {error}");
+        None
+    })
+}
+fn available_or_cpu(output: Option<&str>) -> Vec<Device> {
+    let devices = output
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .and_then(|value| value.get("available").and_then(|v| v.as_array()).cloned());
+    let mut result = vec![Device::Cpu];
+    if let Some(devices) = devices {
+        for value in devices {
+            let device = match value.as_str() {
+                Some("GPU") => Device::Gpu,
+                Some("NPU") => Device::Npu,
+                _ => continue,
+            };
+            if !result.contains(&device) {
+                result.push(device);
+            }
+        }
+    }
+    result
+}
 fn run_tray_refreshes(events: mpsc::Receiver<()>, mut refresh: impl FnMut() -> bool) {
     while events.recv().is_ok() {
         if !refresh() {
@@ -123,6 +165,7 @@ impl TtsService {
         let service = Arc::new(Self {
             app: app.clone(),
             refused_shortcut: AtomicBool::new(false),
+            reading: AtomicBool::new(false),
             tray_refresh,
             ready: Mutex::new(Err("tts.errors.starting".into())),
             referee: Mutex::new(Referee::default()),
@@ -195,9 +238,10 @@ impl TtsService {
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
-        let driver =
-            handy_tts_core::worker_env::discover_driver(&home.join(".local/share/intel-npu"))
-                .map_err(|e| e.to_string())?;
+        let driver_result =
+            handy_tts_core::worker_env::discover_driver(&home.join(".local/share/intel-npu"));
+        let driver_failed = driver_result.is_err();
+        let driver = driver_or_cpu(driver_result);
         let parent = binary
             .parent()
             .unwrap_or(std::path::Path::new("."))
@@ -217,27 +261,16 @@ impl TtsService {
         }
         #[cfg(target_os = "linux")]
         crate::process_supervisor::set_parent_death_signal(&mut command);
-        let available = match super::clipboard::capture_command_with_timeout(
+        let output = super::clipboard::capture_command_with_timeout(
             command,
             std::time::Duration::from_secs(30),
-        ) {
-            Ok(output) => {
-                let value: serde_json::Value =
-                    serde_json::from_str(&output).map_err(|_| "tts.errors.protocol".to_string())?;
-                value["available"]
-                    .as_array()
-                    .ok_or("tts.errors.protocol")?
-                    .iter()
-                    .filter_map(|name| match name.as_str() {
-                        Some("CPU") => Some(Device::Cpu),
-                        Some("GPU") => Some(Device::Gpu),
-                        Some("NPU") => Some(Device::Npu),
-                        _ => None,
-                    })
-                    .collect()
-            }
-            _ => vec![Device::Cpu],
-        };
+        )
+        .ok();
+        let available = available_or_cpu(if driver_failed {
+            None
+        } else {
+            output.as_deref()
+        });
         let config = ManagerConfig {
             root: root.clone(),
             binary,
@@ -252,7 +285,10 @@ impl TtsService {
         let session = ReadAloudSession::spawn(
             manager.clone(),
             selection(&settings),
-            settings.selected_output_device.clone(),
+            {
+                let app = self.app.clone();
+                Arc::new(move || crate::settings::get_settings(&app).selected_output_device)
+            },
             Arc::new(move |state| {
                 let _ = app.emit("read-aloud-state", state);
             }),
@@ -295,7 +331,24 @@ impl TtsService {
         self.preview.cancel()
     }
     pub fn reading_command(&self, command: SessionCommand) -> Result<(), String> {
+        if matches!(command, SessionCommand::Stop | SessionCommand::Close) {
+            return self.preview.stopping_command(|| {
+                self.ready()?
+                    .session
+                    .send(command)
+                    .map_err(|e| e.to_string())
+            });
+        }
         self.preview.reading_command(|| {
+            let referee = self.referee.lock().unwrap_or_else(|p| p.into_inner());
+            if referee.activity == Activity::Dictating
+                && matches!(
+                    command,
+                    SessionCommand::Play | SessionCommand::Replace { autoplay: true, .. }
+                )
+            {
+                return Err("tts.errors.busy".into());
+            }
             self.ready()?
                 .session
                 .send(command)
@@ -362,6 +415,9 @@ impl TtsService {
                         .output
                         .set_sample_rate(pcm.sample_rate)
                         .map_err(|e| e.to_string())?;
+                    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(());
+                    }
                     output
                         .append(Segment {
                             epoch: 0,
@@ -438,20 +494,22 @@ impl TtsService {
         self.ready.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
     pub fn is_reading(&self) -> bool {
-        let referee = self.referee.lock().unwrap_or_else(|p| p.into_inner());
-        referee.popup_open || referee.activity == Activity::Reading
+        self.reading.load(Ordering::Acquire)
     }
     pub fn close(&self) {
-        let _ = self.cancel_preview();
         self.apply(Event::Close);
+        let _ = self.cancel_preview();
     }
     pub fn apply(&self, event: Event) {
-        let effects = self
-            .referee
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .apply(event);
-        self.dispatch_effects(effects);
+        apply_ordered(&self.referee, event, |referee, effects| {
+            self.preview
+                .set_dictating(referee.activity == Activity::Dictating);
+            self.reading.store(
+                referee.popup_open || referee.activity == Activity::Reading,
+                Ordering::Release,
+            );
+            self.dispatch_effects(effects);
+        });
     }
     fn dispatch_effects(&self, effects: Vec<Effect>) {
         for effect in effects {
@@ -500,67 +558,89 @@ impl TtsService {
         }
     }
     pub fn read_shortcut(self: &Arc<Self>) {
-        let effects = read_shortcut_with(
-            &mut self.referee.lock().unwrap_or_else(|p| p.into_inner()),
-            self.ready().map(|_| ()),
-            &self.refused_shortcut,
-            |error| log::warn!("Read-aloud shortcut refused before readiness: {error}"),
-        );
-        if effects.is_empty() {
+        let revision = self.fence.revision();
+        let ticket = {
+            let mut referee = self.referee.lock().unwrap_or_else(|p| p.into_inner());
+            if self.ready().is_ok() {
+                crate::notices::clear(&self.app, crate::notices::NoticeSource::ReadAloud);
+            }
+            let effects = read_shortcut_with(
+                &mut referee,
+                self.ready().map(|_| ()),
+                &self.refused_shortcut,
+                |error| {
+                    unavailable_with(
+                        error,
+                        |error| log::warn!("Read-aloud shortcut refused before readiness: {error}"),
+                        || {
+                            crate::notices::raise(
+                                &self.app,
+                                crate::notices::Notice::new(
+                                    crate::notices::NoticeCode::ReadAloudUnavailable,
+                                    crate::notices::NoticeSource::ReadAloud,
+                                ),
+                            )
+                        },
+                    )
+                },
+            );
+            self.reading.store(
+                referee.popup_open || referee.activity == Activity::Reading,
+                Ordering::Release,
+            );
+            if let Some(Effect::Capture { ticket }) = effects.first() {
+                Some(*ticket)
+            } else {
+                self.dispatch_effects(effects);
+                None
+            }
+        };
+        let service = self.clone();
+        capture_off_thread(move || {
+            if let Some(ticket) = ticket {
+                service.capture_shortcut(ticket, revision);
+            } else {
+                let _ = service.cancel_preview();
+            }
+        });
+    }
+    fn capture_shortcut(self: &Arc<Self>, ticket: u64, revision: u64) {
+        if !self.fence.reserve_capture_since(revision) {
+            self.apply(Event::Clipboard {
+                ticket,
+                text: String::new(),
+            });
             return;
         }
-        if let Some(Effect::Capture { ticket }) = effects.first() {
-            let ticket = *ticket;
-            if !self.fence.reserve_capture() {
-                self.apply(Event::Clipboard {
-                    ticket,
-                    text: String::new(),
-                });
-                return;
-            }
-            let service = self.clone();
-            std::thread::spawn(move || {
-                #[cfg(target_os = "linux")]
-                let text = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
-                    super::clipboard::capture_wayland()
-                } else {
-                    let mut command = std::process::Command::new("xclip");
-                    command.args(["-selection", "clipboard", "-o", "-t", "UTF8_STRING"]);
-                    super::clipboard::capture_command_with_timeout(
-                        command,
-                        std::time::Duration::from_secs(30),
-                    )
-                };
-                #[cfg(not(target_os = "linux"))]
-                let text = {
-                    use tauri_plugin_clipboard_manager::ClipboardExt;
-                    service
-                        .app
-                        .clipboard()
-                        .read_text()
-                        .map_err(|_| super::TtsError::Clipboard)
-                };
-                if let Err(error) = service.cancel_preview() {
-                    let _ = service.app.emit("tts-preview-error", error);
-                    service.apply(Event::Close);
-                } else {
-                    service.apply(Event::Clipboard {
-                        ticket,
-                        text: text.unwrap_or_default(),
-                    });
-                }
-                service.fence.release_capture();
-            });
+        #[cfg(target_os = "linux")]
+        let text = if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            super::clipboard::capture_wayland()
         } else {
-            let service = self.clone();
-            std::thread::spawn(move || {
-                if let Err(error) = service.cancel_preview() {
-                    let _ = service.app.emit("tts-preview-error", error);
-                    return;
-                }
-                service.dispatch_effects(effects);
+            let mut command = std::process::Command::new("xclip");
+            command.args(["-selection", "clipboard", "-o", "-t", "UTF8_STRING"]);
+            super::clipboard::capture_command_with_timeout(
+                command,
+                std::time::Duration::from_secs(30),
+            )
+        };
+        #[cfg(not(target_os = "linux"))]
+        let text = {
+            use tauri_plugin_clipboard_manager::ClipboardExt;
+            self.app
+                .clipboard()
+                .read_text()
+                .map_err(|_| super::TtsError::Clipboard)
+        };
+        if let Err(error) = self.cancel_preview() {
+            let _ = self.app.emit("tts-preview-error", error);
+            self.apply(Event::Close);
+        } else {
+            self.apply(Event::Clipboard {
+                ticket,
+                text: text.unwrap_or_default(),
             });
         }
+        self.fence.release_capture();
     }
     pub fn dictation_start(&self, binding: &str) -> Result<(), super::TtsError> {
         dictation_start_with(
@@ -645,6 +725,129 @@ impl handy_tts_core::preview::ReadingControl for ReadAloudSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn wbfix_shortcut_returns_before_capture_work_finishes() {
+        let (release, wait) = mpsc::channel();
+        let caller = std::thread::current().id();
+        let began = std::time::Instant::now();
+        let worker = capture_off_thread(move || {
+            assert_ne!(std::thread::current().id(), caller);
+            wait.recv().unwrap();
+        });
+        assert!(began.elapsed() < std::time::Duration::from_millis(50));
+        release.send(()).unwrap();
+        worker.join().unwrap();
+    }
+    #[test]
+    fn wbfix_referee_effects_cannot_overtake_an_earlier_transition() {
+        let referee = Arc::new(Mutex::new(Referee::default()));
+        let trace = Arc::new(Mutex::new(Vec::new()));
+        let ticket = match referee.lock().unwrap().apply(Event::ReadShortcut)[0] {
+            Effect::Capture { ticket } => ticket,
+            _ => panic!(),
+        };
+        let (entered, wait) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let state = referee.clone();
+        let observed = trace.clone();
+        let capture = std::thread::spawn(move || {
+            apply_ordered(
+                &state,
+                Event::Clipboard {
+                    ticket,
+                    text: "original".into(),
+                },
+                |_, effects| {
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                    observed.lock().unwrap().extend(effects);
+                },
+            )
+        });
+        wait.recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let state = referee.clone();
+        let observed = trace.clone();
+        let (applied, applied_wait) = mpsc::channel();
+        let dictation = std::thread::spawn(move || {
+            apply_ordered(&state, Event::DictationStart, |_, effects| {
+                observed.lock().unwrap().extend(effects);
+                applied.send(()).unwrap();
+            })
+        });
+        let overtook = applied_wait
+            .recv_timeout(std::time::Duration::from_millis(100))
+            .is_ok();
+        release.send(()).unwrap();
+        capture.join().unwrap();
+        dictation.join().unwrap();
+        assert!(!overtook, "effects must dispatch in referee order");
+        assert_eq!(
+            *trace.lock().unwrap(),
+            [
+                Effect::OpenPopup {
+                    text: "original".into()
+                },
+                Effect::StopReading,
+                Effect::ClosePopup,
+                Effect::StartDictation
+            ]
+        );
+        assert!(referee
+            .lock()
+            .unwrap()
+            .apply(Event::Clipboard {
+                ticket,
+                text: "stale".into()
+            })
+            .is_empty());
+    }
+    #[test]
+    fn wbfix_unavailable_shortcut_reports_a_visible_notice() {
+        let logged = std::cell::Cell::new(false);
+        let notified = std::cell::Cell::new(false);
+        unavailable_with(
+            "tts.errors.starting",
+            |_| logged.set(true),
+            || notified.set(true),
+        );
+        assert!(
+            logged.get() && notified.get(),
+            "unavailable shortcut must report visibly"
+        );
+    }
+    #[test]
+    fn wbfix_bad_driver_and_device_probes_keep_cpu_available() {
+        assert!(driver_or_cpu::<(), _>(Err("unreadable driver")).is_none());
+        for output in [
+            None,
+            Some("not json"),
+            Some("{}"),
+            Some(r#"{"available":[]}"#),
+        ] {
+            assert_eq!(available_or_cpu(output), [Device::Cpu]);
+        }
+        assert_eq!(
+            available_or_cpu(Some(r#"{"available":["CPU","GPU"]}"#)),
+            [Device::Cpu, Device::Gpu]
+        );
+    }
+    #[test]
+    fn wbfix_dictation_is_active_before_preview_cancellation() {
+        let active = std::cell::Cell::new(false);
+        dictation_start_with(
+            || {
+                assert!(
+                    active.get(),
+                    "dictation must block new previews before cancellation"
+                );
+                Ok(())
+            },
+            || Ok(()),
+            || active.set(true),
+        )
+        .unwrap();
+    }
     #[test]
     fn tray_refresh_waits_for_events_without_periodic_model_scans() {
         let (refresh, events) = mpsc::channel();

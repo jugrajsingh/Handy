@@ -930,6 +930,7 @@
     "noOptionsFound": "未找到選項"
   },
   "errors": {
+    "readAloudUnavailableTitle": "Read Aloud Unavailable",
     "loadDirectory": "載入目錄時發生錯誤: {{error}}",
     "micPermissionDeniedTitle": "麥克風存取被拒絕",
     "micPermissionDenied": {

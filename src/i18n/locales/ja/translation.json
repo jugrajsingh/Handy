@@ -930,6 +930,7 @@
     "noOptionsFound": "オプションが見つかりません"
   },
   "errors": {
+    "readAloudUnavailableTitle": "Read Aloud Unavailable",
     "loadDirectory": "ディレクトリの読み込みエラー: {{error}}",
     "micPermissionDeniedTitle": "マイクへのアクセスが拒否されました",
     "micPermissionDenied": {

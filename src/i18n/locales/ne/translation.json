@@ -930,6 +930,7 @@
     "noOptionsFound": "कुनै विकल्प भेटिएन"
   },
   "errors": {
+    "readAloudUnavailableTitle": "Read Aloud Unavailable",
     "loadDirectory": "डाइरेक्टरी लोड गर्दा त्रुटि: {{error}}",
     "micPermissionDeniedTitle": "माइक्रोफोन पहुँच अस्वीकृत गरियो",
     "micPermissionDenied": {

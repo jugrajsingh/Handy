@@ -930,6 +930,7 @@
     "noOptionsFound": "לא נמצאו אפשרויות"
   },
   "errors": {
+    "readAloudUnavailableTitle": "Read Aloud Unavailable",
     "loadDirectory": "שגיאה בטעינת תיקייה: {{error}}",
     "micPermissionDeniedTitle": "הגישה למיקרופון נדחתה",
     "micPermissionDenied": {

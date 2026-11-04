@@ -930,6 +930,7 @@
     "noOptionsFound": "Опцій не знайдено"
   },
   "errors": {
+    "readAloudUnavailableTitle": "Read Aloud Unavailable",
     "loadDirectory": "Помилка завантаження папки: {{error}}",
     "micPermissionDeniedTitle": "Доступ до мікрофона заборонено",
     "micPermissionDenied": {

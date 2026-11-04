@@ -15,6 +15,7 @@ struct Lease {
 pub struct PreviewCoordinator {
     current: Mutex<Option<Lease>>,
     transitions: Mutex<()>,
+    dictating: AtomicBool,
 }
 impl PreviewCoordinator {
     pub fn begin(
@@ -23,6 +24,9 @@ impl PreviewCoordinator {
         stop: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     ) -> Result<Arc<AtomicBool>, String> {
         let _transition = self.transitions.lock().unwrap_or_else(|p| p.into_inner());
+        if self.dictating.load(Ordering::Acquire) {
+            return Err("tts.errors.busy".into());
+        }
         reading.pause_for_preview()?;
         self.cancel_current()?;
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -31,6 +35,10 @@ impl PreviewCoordinator {
             stop,
         });
         Ok(cancelled)
+    }
+    /// Records microphone ownership before any preview cancellation.
+    pub fn set_dictating(&self, active: bool) {
+        self.dictating.store(active, Ordering::Release);
     }
     pub fn cancel(&self) -> Result<(), String> {
         let _transition = self.transitions.lock().unwrap_or_else(|p| p.into_inner());
@@ -57,6 +65,15 @@ impl PreviewCoordinator {
         {
             current.take();
         }
+    }
+    /// Sends Stop even when an active preview cannot acknowledge cancellation.
+    pub fn stopping_command(
+        &self,
+        command: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let result = command();
+        let cancelled = self.cancel();
+        result.and(cancelled)
     }
     pub fn reading_command(
         &self,
@@ -85,6 +102,58 @@ mod tests {
             self.paused.store(true, Ordering::Release);
             Ok(())
         }
+    }
+    #[test]
+    fn wbfix_failed_preview_cancellation_cannot_veto_stop() {
+        let reading = Reading {
+            document: "original".into(),
+            paused: AtomicBool::new(false),
+            fail_pause: false,
+        };
+        let coordinator = PreviewCoordinator::default();
+        coordinator
+            .begin(&reading, Arc::new(|| Err("stop pending".into())))
+            .unwrap();
+        let sent = AtomicBool::new(false);
+        assert_eq!(
+            coordinator.stopping_command(|| {
+                sent.store(true, Ordering::Release);
+                Ok(())
+            }),
+            Err("stop pending".into())
+        );
+        assert!(
+            sent.load(Ordering::Acquire),
+            "failed preview cancellation must still dispatch Stop"
+        );
+    }
+    #[test]
+    fn wbfix_preview_is_refused_throughout_dictation_and_reenabled_after_settlement() {
+        let reading = Reading {
+            document: "original".into(),
+            paused: AtomicBool::new(false),
+            fail_pause: false,
+        };
+        let coordinator = PreviewCoordinator::default();
+        coordinator.set_dictating(true);
+        assert_eq!(
+            coordinator
+                .begin(&reading, Arc::new(|| Ok(())))
+                .unwrap_err(),
+            "tts.errors.busy"
+        );
+        assert!(!reading.paused.load(Ordering::Acquire));
+        coordinator.set_dictating(false);
+        let flag = coordinator.begin(&reading, Arc::new(|| Ok(()))).unwrap();
+        coordinator.set_dictating(true);
+        coordinator.cancel().unwrap();
+        assert!(flag.load(Ordering::Acquire));
+        assert_eq!(
+            coordinator
+                .begin(&reading, Arc::new(|| Ok(())))
+                .unwrap_err(),
+            "tts.errors.busy"
+        );
     }
     #[test]
     fn preview_preserves_document_and_play_cancels_before_reading_without_stale_completion() {

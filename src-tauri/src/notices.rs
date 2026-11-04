@@ -34,6 +34,7 @@ pub enum NoticeSource {
     Dictation,
     File,
     Model,
+    ReadAloud,
 }
 
 /// The frontend maps each code to its text in `src/lib/notices.ts`.
@@ -45,6 +46,7 @@ pub enum NoticeCode {
     MicPermissionDenied,
     RecordingFailed,
     ModelLoadFailed,
+    ReadAloudUnavailable,
     PostProcessFailed,
     FileTranscriptionFailed,
     FilePostProcessFailed,
@@ -58,6 +60,7 @@ impl NoticeCode {
             | Self::NoMicrophone
             | Self::MicPermissionDenied
             | Self::RecordingFailed
+            | Self::ReadAloudUnavailable
             | Self::ModelLoadFailed
             | Self::FileTranscriptionFailed => NoticeLevel::Error,
             Self::PostProcessFailed | Self::FilePostProcessFailed => NoticeLevel::Warning,
@@ -73,6 +76,7 @@ impl NoticeCode {
             Self::MicPermissionDenied => &strings.mic_permission_denied_title,
             Self::RecordingFailed => &strings.recording_failed_title,
             Self::ModelLoadFailed => &strings.model_load_failed_title,
+            Self::ReadAloudUnavailable => &strings.read_aloud_unavailable_title,
             Self::PostProcessFailed => &strings.post_process_failed_title,
             Self::FileTranscriptionFailed => &strings.file_transcription_failed_title,
             Self::FilePostProcessFailed => &strings.file_post_process_failed_title,

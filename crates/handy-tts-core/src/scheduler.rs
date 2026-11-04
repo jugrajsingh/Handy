@@ -555,7 +555,11 @@ impl Queue {
     /// Releases the current chunk and advances playback.
     pub fn playback_finished(&mut self) {
         self.playing = None;
-        self.advance();
+        if self.state == PlaybackState::Paused {
+            self.playing = self.waiting.pop_front();
+        } else {
+            self.advance();
+        }
     }
     /// Pauses output and generation requests while preserving queued audio.
     pub fn pause(&mut self) {

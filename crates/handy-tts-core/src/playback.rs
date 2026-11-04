@@ -68,6 +68,10 @@ pub mod segment {
         fn resume(&mut self);
         /// Clears audio, events and clocks, keeping the stream open and unpaused.
         fn stop(&mut self);
+        /// Releases native stream resources when the popup closes.
+        fn close(&mut self) {
+            self.stop();
+        }
     }
 
     /// Retains appended segments until sample events confirm their completion.
@@ -111,6 +115,14 @@ pub mod segment {
                 is_open: false,
                 past_content: 0,
             }
+        }
+
+        /// Clears content and releases the stream until the next Play.
+        pub fn close(&mut self) {
+            self.stop();
+            self.output.close();
+            self.is_open = false;
+            self.past_content = 0;
         }
 
         pub fn ensure_open(
