@@ -146,13 +146,17 @@ fn split_samples(
     let pause_seconds = crate::edges::pause_samples(pause_ms, plan.requested, pcm.sample_rate)
         as f64
         / f64::from(pcm.sample_rate);
-    let part_seconds = (QUEUED_AUDIO_CEILING - pause_seconds)
-        .min(crate::scheduler::STORED_SECONDS_CEILING / (1.0 + f64::from(plan.stretch)));
-    let limit = (part_seconds * f64::from(pcm.sample_rate)).floor() as usize;
     let output_len = pcm.samples.len();
+    let native_len = native.len();
+    let played_limit =
+        ((QUEUED_AUDIO_CEILING - pause_seconds) * f64::from(pcm.sample_rate)).floor() as usize;
+    let stored_frames =
+        (crate::scheduler::STORED_SECONDS_CEILING * f64::from(pcm.sample_rate)).floor() as usize;
+    let retained_samples = (output_len as u128 + native_len as u128).max(1);
+    let stored_limit = (stored_frames as u128 * output_len as u128 / retained_samples) as usize;
+    let limit = played_limit.min(stored_limit);
     let mut data = pcm.samples.into_iter();
     let mut native_data = native.into_iter();
-    let native_len = native_data.len();
     let mut consumed = 0;
     let mut native_consumed = 0;
     let mut samples = VecDeque::new();
@@ -162,7 +166,8 @@ fn split_samples(
             break;
         }
         consumed += next.len();
-        let native_end = (consumed as f64 * native_len as f64 / output_len as f64).round() as usize;
+        let native_end = ((consumed as u128 * native_len as u128 + output_len as u128 / 2)
+            / output_len as u128) as usize;
         let native_part = native_data
             .by_ref()
             .take(native_end - native_consumed)
@@ -2118,6 +2123,112 @@ mod tests {
                 })
                 .sum();
             assert_eq!(delivered, 320_000 + 7200);
+        }
+
+        #[test]
+        fn retained_edge_pcm_is_delivered_in_order_with_bounded_parts_after_rerender() {
+            let speech: Vec<_> = (0..66 * 8000)
+                .map(|i| 0.1 + (i % 257) as f32 * 0.0001)
+                .collect();
+            let mut raw = vec![0.0; 72 * 8000];
+            raw[2 * 8000..68 * 8000].copy_from_slice(&speech);
+            let mut expected = vec![0.0; 80];
+            expected.extend_from_slice(&speech);
+            expected.resize(expected.len() + 80 + 3600, 0.0);
+            for initial_speed in [1.0, 2.0] {
+                let mut s = create(
+                    "A paragraph with one long native result.\n\n",
+                    initial_speed,
+                );
+                s.selection.model_id = "supertonic-3".into();
+                s.tick(0.0).unwrap();
+                s.pause();
+                let mut completion = s.worker.pending.pop_front().unwrap();
+                completion.result = Ok(Pcm {
+                    id: 0,
+                    sample_rate: 8000,
+                    samples: raw.clone(),
+                });
+                s.received(completion);
+                assert_eq!(s.metadata[&0].pause_ms, 450);
+                assert_eq!(
+                    s.parts[&0]
+                        .samples
+                        .iter()
+                        .map(|(_, n)| n.len())
+                        .sum::<usize>(),
+                    552000
+                );
+                if initial_speed != 1.0 {
+                    s.set_speed_pitch(1.0, 0.0).unwrap();
+                }
+                s.play().unwrap();
+                let mut delivered = Vec::new();
+                for step in 0..2000 {
+                    s.tick(0.01 + f64::from(step) * 0.1).unwrap();
+                    assert!(
+                        s.queue.failed_index.is_none(),
+                        "residual-edge PCM must not fail admission"
+                    );
+                    assert_ne!(s.queue.state, PlaybackState::Error);
+                    assert!(s.queue.queued_seconds() <= 30.0 + 0.00001);
+                    assert!(s.queue.stored_seconds() <= 60.0 + 0.00001);
+                    for parts in s.parts.values() {
+                        assert!(
+                            parts
+                                .samples
+                                .iter()
+                                .all(|(pcm, native)| pcm.samples.len() + native.len() <= 60 * 8000)
+                        );
+                    }
+                    if s.queue.state == PlaybackState::Finished {
+                        break;
+                    }
+                    if s.queue.state == PlaybackState::Playing {
+                        let before = s.playback.output.feed.content_samples();
+                        let mut block = [0.0; 800];
+                        s.playback.output.feed.pull(&mut block);
+                        let count = (s.playback.output.feed.content_samples() - before) as usize;
+                        delivered.extend_from_slice(&block[..count]);
+                    }
+                }
+                assert_eq!(
+                    s.queue.state,
+                    PlaybackState::Finished,
+                    "long PCM must finish in bounded time"
+                );
+                assert_eq!(delivered, expected);
+                let finished: Vec<_> = s
+                    .playback
+                    .output
+                    .trace
+                    .iter()
+                    .filter_map(|event| {
+                        if let OutputEvent::Finished { index, delivered } = event {
+                            Some((*index, *delivered))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert_eq!(finished.len(), s.playback.output.appended.len());
+                for (position, ((index, delivered), (appended, speech))) in
+                    finished.iter().zip(&s.playback.output.appended).enumerate()
+                {
+                    assert_eq!(index, appended);
+                    assert_eq!(
+                        *delivered,
+                        speech
+                            + if position + 1 == finished.len() {
+                                3600
+                            } else {
+                                0
+                            }
+                    );
+                }
+                assert_eq!(s.worker.requests.len(), 1);
+                assert!(s.parts.is_empty());
+            }
         }
         #[test]
         fn stop_with_three_lanes_returns_without_waiting_and_drops_late_replies() {
