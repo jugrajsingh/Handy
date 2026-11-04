@@ -21,8 +21,167 @@ static PASTE_LOCK: Mutex<()> = Mutex::new(());
 
 const PASTE_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub(crate) fn paste_timeout(settings: &crate::settings::AppSettings) -> Duration {
-    PASTE_TOOL_TIMEOUT * 6
+#[cfg(all(test, unix))]
+mod wbfix3 {
+    use super::*;
+
+    #[test]
+    fn typing_and_watchdog_budgets_scale_with_characters() {
+        for count in [0, 30, 3000] {
+            let text = "語".repeat(count);
+            assert_eq!(
+                typing_timeout(&text),
+                Duration::from_millis(30_000 + 100 * count as u64),
+                "typing budget must scale by characters"
+            );
+            let settings = crate::settings::AppSettings::default();
+            assert!(
+                paste_timeout(&settings, &text) > typing_timeout(&text),
+                "watchdog must cover typing and cleanup"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "Runs the real 330-second typing deadline; invoked explicitly for wbfix3"]
+    fn long_typing_completes_and_hung_typing_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let delivered = dir.path().join("delivered");
+        let text = "a".repeat(3000);
+        let result = typing_tool(Command::new("python3").args(["-c", "import pathlib,sys,time; f=open(sys.argv[1],'w'); [(f.write(c),f.flush(),time.sleep(.04)) for c in sys.argv[2]]"]).arg(&delivered).arg(&text), None, &text).unwrap();
+        assert!(result.status.success());
+        assert_eq!(
+            std::fs::read_to_string(&delivered).unwrap(),
+            text,
+            "long typing must deliver every character"
+        );
+        let began = std::time::Instant::now();
+        let result = typing_tool(
+            Command::new("sh").args(["-c", "exec sleep 600"]),
+            None,
+            &text,
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(began.elapsed() >= typing_timeout(&text));
+        assert!(
+            began.elapsed() < typing_timeout(&text) + Duration::from_secs(2),
+            "hung typing must expire within scaled budget"
+        );
+    }
+
+    #[test]
+    fn stderr_flood_is_bounded_and_still_obeys_deadline() {
+        let output = paste_tool(
+            Command::new("python3").args([
+                "-c",
+                "import sys; sys.stderr.write('x'*200000); sys.exit(9)",
+            ]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(9));
+        assert_eq!(
+            output.stderr.len(),
+            MAX_PROBE_BYTES,
+            "stderr must be bounded without failing the tool"
+        );
+        let began = std::time::Instant::now();
+        let result = paste_tool_with_timeout(
+            Command::new("python3").args([
+                "-c",
+                "import os; exec('while True: os.write(2,b\"x\"*8192)')",
+            ]),
+            None,
+            Duration::from_millis(100),
+        );
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(began.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_parent_fixture() {
+        let Some(pidfile) = std::env::var_os("HANDY_TEST_HELPER_PIDFILE") else {
+            return;
+        };
+        let _ = paste_tool(Command::new("python3").args(["-c", "import os,pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(30)"]).arg(pidfile), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn running_helper_dies_with_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("helper.pid");
+        let mut parent = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "clipboard::wbfix3::helper_parent_fixture",
+                "--nocapture",
+            ])
+            .env("HANDY_TEST_HELPER_PIDFILE", &pidfile)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !pidfile.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let pid = std::fs::read_to_string(&pidfile)
+            .ok()
+            .and_then(|p| p.parse::<i32>().ok());
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+        let pid = pid.expect("helper must start before parent is killed");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let stopped = loop {
+            let state = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+            if state
+                .as_ref()
+                .map_or(true, |s| s.split_whitespace().nth(2) == Some("Z"))
+            {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        if !stopped {
+            // SAFETY: this PID names the test helper which has not exited.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        assert!(stopped, "helper must die when its parent process dies");
+    }
+
+    #[test]
+    fn failures_preserve_bounded_stderr() {
+        let output = paste_tool(
+            Command::new("sh").args(["-c", "printf 'fixture failure' >&2; exit 7"]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.status.code(), Some(7));
+        assert_eq!(
+            output.stderr, b"fixture failure",
+            "tool failure must retain stderr"
+        );
+    }
+}
+
+fn typing_timeout(text: &str) -> Duration {
+    PASTE_TOOL_TIMEOUT.saturating_add(Duration::from_millis(
+        u64::try_from(text.chars().count())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(100),
+    ))
+}
+
+pub(crate) fn paste_timeout(settings: &crate::settings::AppSettings, text: &str) -> Duration {
+    typing_timeout(text)
+        + PASTE_TOOL_TIMEOUT * 5
         + PASTE_PROBE_TIMEOUT * 7
         + crate::paste_tx::RESTORE_TIMEOUT
         + Duration::from_secs(2)
@@ -39,6 +198,26 @@ fn paste_tool(
 ) -> Result<std::process::Output, std::io::Error> {
     paste_tool_with_timeout(command, input, PASTE_TOOL_TIMEOUT)
 }
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn typing_tool(
+    command: &mut Command,
+    input: Option<Vec<u8>>,
+    text: &str,
+) -> std::io::Result<std::process::Output> {
+    paste_tool_with_timeout(command, input, typing_timeout(text))
+}
+
+fn quiet_tool(command: &mut Command, timeout: Duration) -> std::io::Result<std::process::Output> {
+    run_paste_process(command, None, timeout, ProcessCapture::None)
+}
+
+#[derive(Clone, Copy)]
+enum ProcessCapture {
+    None,
+    Stderr,
+    Probe,
+}
+
 const PASTE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_PROBE_BYTES: usize = 64 * 1024;
 
@@ -47,29 +226,29 @@ fn paste_probe_with_timeout(
     command: &mut Command,
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
-    run_paste_process(command, None, timeout, true)
+    run_paste_process(command, None, timeout, ProcessCapture::Probe)
 }
 fn paste_tool_with_timeout(
     command: &mut Command,
     input: Option<Vec<u8>>,
     timeout: Duration,
 ) -> std::io::Result<std::process::Output> {
-    run_paste_process(command, input, timeout, false)
+    run_paste_process(command, input, timeout, ProcessCapture::Stderr)
 }
 fn run_paste_process(
     command: &mut Command,
     input: Option<Vec<u8>>,
     timeout: Duration,
-    capture: bool,
+    capture: ProcessCapture,
 ) -> std::io::Result<std::process::Output> {
     use std::{io::Write, process::Stdio};
     let deadline = std::time::Instant::now() + timeout;
-    command.stdout(if capture {
+    command.stdout(if matches!(capture, ProcessCapture::Probe) {
         Stdio::piped()
     } else {
         Stdio::null()
     });
-    command.stderr(if capture {
+    command.stderr(if !matches!(capture, ProcessCapture::None) {
         Stdio::piped()
     } else {
         Stdio::null()
@@ -84,7 +263,10 @@ fn run_paste_process(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn()?;
+    #[cfg(target_os = "linux")]
+    crate::process_supervisor::set_parent_death_signal(command);
+    let owned = std::mem::replace(command, Command::new(""));
+    let mut child = crate::process_supervisor::spawn_from_supervisor(owned)?;
     let result = (|| {
         let mut stdout = child.stdout.take();
         let mut stderr = child.stderr.take();
@@ -127,7 +309,11 @@ fn run_paste_process(
                 }
             }
             let stdout_eof = drain_probe(&mut stdout, &mut out, err.len())?;
-            let stderr_eof = drain_probe(&mut stderr, &mut err, out.len())?;
+            let stderr_eof = if matches!(capture, ProcessCapture::Probe) {
+                drain_probe(&mut stderr, &mut err, out.len())?
+            } else {
+                drain_tool_stderr(&mut stderr, &mut err)?
+            };
             if child_exited(&mut child)? && stdout_eof && stderr_eof {
                 return Ok(std::process::Output {
                     status: child.wait()?,
@@ -281,6 +467,28 @@ fn drain_probe<R: ProbeRead>(
     }
 }
 
+fn drain_tool_stderr<R: ProbeRead>(
+    pipe: &mut Option<R>,
+    bytes: &mut Vec<u8>,
+) -> std::io::Result<bool> {
+    let Some(reader) = pipe else {
+        return Ok(true);
+    };
+    let mut buffer = [0; 8192];
+    match reader.read_ready(&mut buffer)? {
+        Some(0) => {
+            *pipe = None;
+            Ok(true)
+        }
+        Some(count) => {
+            let keep = count.min(MAX_PROBE_BYTES.saturating_sub(bytes.len()));
+            bytes.extend_from_slice(&buffer[..keep]);
+            Ok(false)
+        }
+        None => Ok(false),
+    }
+}
+
 fn input_if_current<T>(
     cancelled: &std::sync::atomic::AtomicBool,
     input: impl FnOnce() -> Result<T, String>,
@@ -295,6 +503,14 @@ fn input_if_current<T>(
 /// and waits for the result. Runs inline if already on the main thread, so no deadlock.
 fn with_enigo<T: Send + 'static>(
     app_handle: &AppHandle,
+    f: impl FnOnce(&mut Enigo) -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    with_enigo_timeout(app_handle, PASTE_TOOL_TIMEOUT, f)
+}
+
+fn with_enigo_timeout<T: Send + 'static>(
+    app_handle: &AppHandle,
+    timeout: Duration,
     f: impl FnOnce(&mut Enigo) -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
     let app = app_handle.clone();
@@ -314,7 +530,7 @@ fn with_enigo<T: Send + 'static>(
                 .map_err(|e| format!("Failed to lock Enigo: {e}"))?;
             f(&mut enigo)
         },
-        PASTE_TOOL_TIMEOUT,
+        timeout,
     )
 }
 fn queued_input<T: Send + 'static>(
@@ -729,11 +945,12 @@ fn is_wl_copy_available() -> Result<bool, String> {
 /// Type text directly via wtype on Wayland.
 #[cfg(target_os = "linux")]
 fn type_text_via_wtype(text: &str) -> Result<(), String> {
-    let output = paste_tool(
+    let output = typing_tool(
         Command::new("wtype")
             .arg("--") // Protect against text starting with -
             .arg(text),
         None,
+        text,
     )
     .map_err(|e| format!("Failed to execute wtype: {}", e))?;
 
@@ -748,13 +965,14 @@ fn type_text_via_wtype(text: &str) -> Result<(), String> {
 /// Type text directly via xdotool on X11.
 #[cfg(target_os = "linux")]
 fn type_text_via_xdotool(text: &str) -> Result<(), String> {
-    let output = paste_tool(
+    let output = typing_tool(
         Command::new("xdotool")
             .arg("type")
             .arg("--clearmodifiers")
             .arg("--")
             .arg(text),
         None,
+        text,
     )
     .map_err(|e| format!("Failed to execute xdotool: {}", e))?;
 
@@ -787,11 +1005,9 @@ fn type_text_via_xdotool(text: &str) -> Result<(), String> {
         None,
     ) {
         Ok(cleanup_output) if !cleanup_output.status.success() => {
-            let stderr = String::from_utf8_lossy(&cleanup_output.stderr);
             log::warn!(
-                "xdotool modifier cleanup failed with status {:?}: {}",
-                cleanup_output.status.code(),
-                stderr.trim()
+                "xdotool modifier cleanup failed with status {:?}",
+                cleanup_output.status.code()
             );
         }
         Err(error) => log::warn!("Failed to execute xdotool modifier cleanup: {}", error),
@@ -832,13 +1048,17 @@ fn dotool_type_script(text: &str) -> String {
 /// Type text directly via dotool (works on both Wayland and X11 via uinput).
 #[cfg(target_os = "linux")]
 fn type_text_via_dotool(text: &str) -> Result<(), String> {
-    let output = paste_tool(
+    let output = typing_tool(
         &mut Command::new("dotool"),
         Some(dotool_type_script(text).into_bytes()),
+        text,
     )
     .map_err(|e| format!("Failed to execute dotool: {e}"))?;
     if !output.status.success() {
-        return Err("dotool failed".into());
+        return Err(format!(
+            "dotool failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     Ok(())
 }
@@ -846,9 +1066,10 @@ fn type_text_via_dotool(text: &str) -> Result<(), String> {
 /// Type text directly via ydotool (uinput-based, requires ydotoold daemon).
 #[cfg(target_os = "linux")]
 fn type_text_via_ydotool(text: &str) -> Result<(), String> {
-    let output = paste_tool(
+    let output = typing_tool(
         Command::new("ydotool").arg("type").arg("--").arg(text),
         None,
+        text,
     )
     .map_err(|e| format!("Failed to execute ydotool: {}", e))?;
 
@@ -863,7 +1084,7 @@ fn type_text_via_ydotool(text: &str) -> Result<(), String> {
 /// Type text directly via kwtype (KDE Wayland virtual keyboard, uses KDE Fake Input protocol).
 #[cfg(target_os = "linux")]
 fn type_text_via_kwtype(text: &str) -> Result<(), String> {
-    let output = paste_tool(Command::new("kwtype").arg("--").arg(text), None)
+    let output = typing_tool(Command::new("kwtype").arg("--").arg(text), None, text)
         .map_err(|e| format!("Failed to execute kwtype: {}", e))?;
 
     if !output.status.success() {
@@ -880,13 +1101,13 @@ fn type_text_via_kwtype(text: &str) -> Result<(), String> {
 #[cfg(target_os = "linux")]
 fn write_clipboard_via_wl_copy(text: &str) -> Result<(), String> {
     use std::process::Stdio;
-    let status = paste_tool(
+    let status = quiet_tool(
         Command::new("wl-copy")
             .arg("--")
             .arg(text)
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
-        None,
+        PASTE_TOOL_TIMEOUT,
     )
     .map(|output| output.status)
     .map_err(|e| format!("Failed to execute wl-copy: {}", e))?;
@@ -932,7 +1153,7 @@ fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), String> {
         _ => return Err("Unsupported paste method".into()),
     }
     use std::process::Stdio;
-    let status = paste_tool(
+    let output = paste_tool(
         Command::new("sh")
             .arg("-c")
             .arg(command)
@@ -940,10 +1161,12 @@ fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), String> {
             .stderr(Stdio::null()),
         None,
     )
-    .map(|output| output.status)
     .map_err(|e| format!("Failed to execute dotool: {}", e))?;
-    if !status.success() {
-        return Err("dotool failed".into());
+    if !output.status.success() {
+        return Err(format!(
+            "dotool failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
 
     Ok(())
@@ -1020,7 +1243,7 @@ fn send_key_combo_via_xdotool(paste_method: &PasteMethod) -> Result<(), String> 
 /// Pastes text by invoking an external script.
 /// The script receives the text to paste as a single argument.
 fn paste_via_external_script(text: &str, script_path: &str) -> Result<(), String> {
-    info!("Pasting via external script: {}", script_path);
+    info!("Pasting via external script");
 
     // Do not capture the script's stdio. Wayland clipboard helpers such as
     // wl-copy may fork a background selection daemon that inherits those file
@@ -1028,13 +1251,13 @@ fn paste_via_external_script(text: &str, script_path: &str) -> Result<(), String
     // clipboard selection is replaced instead of returning after the script
     // itself exits.
     use std::process::Stdio;
-    let status = paste_tool(
+    let status = quiet_tool(
         Command::new(script_path)
             .arg(text)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null()),
-        None,
+        typing_timeout(text),
     )
     .map(|output| output.status)
     .map_err(|e| format!("Failed to execute external script '{}': {}", script_path, e))?;
@@ -1064,7 +1287,7 @@ fn paste_direct(
     paste_with_fallback(handled, || {
         info!("Falling back to enigo for direct text input");
         let text = text.to_string();
-        with_enigo(app_handle, move |enigo| {
+        with_enigo_timeout(app_handle, typing_timeout(&text), move |enigo| {
             input::paste_text_direct(enigo, &text)
         })
     })
@@ -1245,10 +1468,10 @@ fn paste_inner(
     if should_send_auto_submit(settings.auto_submit, paste_method) {
         std::thread::sleep(Duration::from_millis(50));
         let auto_submit_key = settings.auto_submit_key;
-        if let Err(error) = with_enigo(&app_handle, move |enigo| {
+        if let Err(_error) = with_enigo(&app_handle, move |enigo| {
             send_return_key(enigo, auto_submit_key)
         }) {
-            log::warn!("Paste succeeded, but auto-submit failed: {error}");
+            log::warn!("Paste succeeded, but auto-submit failed");
         }
     }
 

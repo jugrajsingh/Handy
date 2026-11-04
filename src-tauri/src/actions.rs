@@ -1026,7 +1026,10 @@ impl ShortcutAction for TranscribeAction {
                                 let failure_app = ah.clone();
                                 let completion =
                                     handy_tts_core::handoff::PasteCompletion::with_timeout(
-                                        crate::clipboard::paste_timeout(&get_settings(&ah)),
+                                        crate::clipboard::paste_timeout(
+                                            &get_settings(&ah),
+                                            &final_text,
+                                        ),
                                         move || {
                                             if let (Some(service), Some(generation)) =
                                                 (service, generation)
@@ -1085,14 +1088,17 @@ impl ShortcutAction for TranscribeAction {
                                                 });
                                                 (TranscriptionOutcome::Typed, notice)
                                             }
-                                            Err(e) => {
-                                                error!("Failed to paste transcription: {}", e);
+                                            Err(error) => {
+                                                error!("Failed to paste transcription");
                                                 (
                                                     TranscriptionOutcome::Failed,
-                                                    Some(Notice::new(
-                                                        NoticeCode::PasteFailed,
-                                                        NoticeSource::Dictation,
-                                                    )),
+                                                    Some(
+                                                        Notice::new(
+                                                            NoticeCode::PasteFailed,
+                                                            NoticeSource::Dictation,
+                                                        )
+                                                        .with_detail(error),
+                                                    ),
                                                 )
                                             }
                                         };
