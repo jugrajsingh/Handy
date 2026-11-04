@@ -393,17 +393,21 @@ impl HistoryManager {
     ) -> Result<HistoryEntry> {
         entry.id = Self::insert_history_entry_with_conn(conn, &entry)?;
         debug!("Saved history entry with id {}", entry.id);
-        Self::cleanup_and_notify_with_connection(
-            conn,
-            recordings_dir,
-            retention_period,
-            history_limit,
-            now,
-            &mut notify,
-        )?;
         notify(HistoryUpdatePayload::Added {
             entry: entry.clone(),
         });
+        if entry.source_name.is_none() {
+            if let Err(error) = Self::cleanup_and_notify_with_connection(
+                conn,
+                recordings_dir,
+                retention_period,
+                history_limit,
+                now,
+                &mut notify,
+            ) {
+                error!("Failed to clean up history retention: {error}");
+            }
+        }
         Ok(entry)
     }
 
@@ -545,25 +549,27 @@ impl HistoryManager {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    fn delete_entries_and_files_with_conn(
-        conn: &Connection,
-        recordings_dir: &Path,
-        entries: &[(i64, String)],
-    ) -> Result<HistoryClearSummary> {
-        let mut removed = HistoryClearSummary::default();
-        for (id, file_name) in entries {
-            let path = recordings_dir.join(file_name);
-            match fs::remove_file(&path) {
-                Ok(()) => removed.recordings += 1,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => error!("Failed to delete WAV file {}: {}", file_name, error),
-            }
-            removed.entries += conn.execute(
+    fn delete_entries_with_conn(conn: &Connection, entries: &[(i64, String)]) -> Result<usize> {
+        let mut removed = 0;
+        for (id, _) in entries {
+            removed += conn.execute(
                 "DELETE FROM transcription_history WHERE id = ?1",
                 params![id],
             )?;
         }
         Ok(removed)
+    }
+
+    fn delete_recording_files(recordings_dir: &Path, entries: &[(i64, String)]) -> usize {
+        let mut removed = 0;
+        for (_, file_name) in entries {
+            match fs::remove_file(recordings_dir.join(file_name)) {
+                Ok(()) => removed += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => error!("Failed to delete WAV file {}: {}", file_name, error),
+            }
+        }
+        removed
     }
 
     fn clear_history_with_connection(
@@ -572,12 +578,17 @@ impl HistoryManager {
         keep_saved: bool,
         mut cancel: impl FnMut(i64),
     ) -> Result<HistoryClearSummary> {
-        Self::with_clear_transaction(conn, |transaction| {
+        let (removed, entries) = Self::with_clear_transaction(conn, |transaction| {
             let entries = Self::clear_candidates(transaction, keep_saved)?;
             for (id, _) in &entries {
                 cancel(*id);
             }
-            Self::delete_entries_and_files_with_conn(transaction, recordings_dir, &entries)
+            let removed = Self::delete_entries_with_conn(transaction, &entries)?;
+            Ok((removed, entries))
+        })?;
+        Ok(HistoryClearSummary {
+            entries: removed,
+            recordings: Self::delete_recording_files(recordings_dir, &entries),
         })
     }
 
@@ -661,10 +672,13 @@ impl HistoryManager {
         let (removed, entries) = Self::with_clear_transaction(conn, |transaction| {
             let entries =
                 Self::retention_candidates(transaction, retention_period, history_limit, now)?;
-            let removed =
-                Self::delete_entries_and_files_with_conn(transaction, recordings_dir, &entries)?;
+            let removed = Self::delete_entries_with_conn(transaction, &entries)?;
             Ok((removed, entries))
         })?;
+        let removed = HistoryClearSummary {
+            entries: removed,
+            recordings: Self::delete_recording_files(recordings_dir, &entries),
+        };
         for (id, _) in entries {
             notify(HistoryUpdatePayload::Deleted { id });
         }
@@ -1110,7 +1124,116 @@ mod tests {
     }
 
     #[test]
-    fn count_retention_notifies_deleted_ids_after_commit_before_added() {
+    fn wbfix3_failed_delete_or_commit_preserves_recordings() {
+        for (commit_failure, retention) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let mut conn = Connection::open_in_memory().unwrap();
+            HistoryManager::apply_migrations(&mut conn).unwrap();
+            for timestamp in [100, 200] {
+                insert_entry(&conn, timestamp, "raw", None);
+                fs::write(dir.path().join(format!("handy-{timestamp}.wav")), b"audio").unwrap();
+            }
+            if commit_failure {
+                conn.execute_batch("PRAGMA foreign_keys=ON; CREATE TABLE failure (id INTEGER REFERENCES transcription_history(id) DEFERRABLE INITIALLY DEFERRED); CREATE TRIGGER fail_commit AFTER DELETE ON transcription_history BEGIN INSERT INTO failure VALUES (99999); END;").unwrap();
+            } else {
+                conn.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON transcription_history WHEN OLD.id = 2 BEGIN SELECT RAISE(ABORT, 'fixture deletion failure'); END;").unwrap();
+            }
+            let result = if retention {
+                HistoryManager::cleanup_and_notify_with_connection(
+                    &mut conn,
+                    dir.path(),
+                    crate::settings::RecordingRetentionPeriod::PreserveLimit,
+                    0,
+                    300,
+                    |_| panic!("failed retention must not notify"),
+                )
+            } else {
+                HistoryManager::clear_history_with_connection(&mut conn, dir.path(), false, |_| {})
+            };
+            assert!(result.is_err());
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM transcription_history", [], |r| r
+                    .get::<_, usize>(0))
+                    .unwrap(),
+                2
+            );
+            for timestamp in [100, 200] {
+                assert!(
+                    dir.path().join(format!("handy-{timestamp}.wav")).exists(),
+                    "failed transaction must preserve audio"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wbfix3_retention_failure_does_not_fail_saved_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        HistoryManager::apply_migrations(&mut conn).unwrap();
+        insert_entry(&conn, 100, "raw", None);
+        let entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_delete BEFORE DELETE ON transcription_history BEGIN SELECT RAISE(ABORT, 'fixture retention failure'); END;").unwrap();
+        let mut events = Vec::new();
+        let result = HistoryManager::save_entry_and_notify_with_connection(
+            &mut conn,
+            dir.path(),
+            entry,
+            crate::settings::RecordingRetentionPeriod::PreserveLimit,
+            1,
+            200,
+            |e| events.push(e),
+        );
+        assert!(
+            result.is_ok(),
+            "retention failure must not fail a committed save"
+        );
+        assert!(
+            matches!(events.as_slice(), [HistoryUpdatePayload::Added { .. }]),
+            "save must notify Added before failed retention"
+        );
+    }
+
+    #[test]
+    fn wbfix3_file_import_does_not_trigger_dictation_retention() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        HistoryManager::apply_migrations(&mut conn).unwrap();
+        insert_entry(&conn, 100, "raw", None);
+        let mut entry = HistoryManager::get_latest_entry_with_conn(&conn)
+            .unwrap()
+            .unwrap();
+        entry.source_name = Some("fixture.wav".into());
+        let mut events = Vec::new();
+        HistoryManager::save_entry_and_notify_with_connection(
+            &mut conn,
+            dir.path(),
+            entry,
+            crate::settings::RecordingRetentionPeriod::PreserveLimit,
+            0,
+            200,
+            |e| events.push(e),
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM transcription_history", [], |r| r
+                .get::<_, usize>(0))
+                .unwrap(),
+            2,
+            "file import must not trigger retention"
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [HistoryUpdatePayload::Added { .. }]
+        ));
+    }
+
+    #[test]
+    fn count_retention_notifies_added_then_deleted_ids_after_commit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
         let mut conn = Connection::open(&path).unwrap();
@@ -1143,6 +1266,18 @@ mod tests {
             2,
             600,
             |event| {
+                if matches!(event, HistoryUpdatePayload::Added { .. }) {
+                    assert_eq!(
+                        observer
+                            .query_row("SELECT COUNT(*) FROM transcription_history", [], |r| r
+                                .get::<_, usize>(0))
+                            .unwrap(),
+                        6,
+                        "Added must precede retention"
+                    );
+                    events.push(serde_json::to_value(event).unwrap());
+                    return;
+                }
                 let mut statement = observer
                     .prepare("SELECT id FROM transcription_history ORDER BY id")
                     .unwrap();
@@ -1165,12 +1300,12 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                serde_json::to_value(HistoryUpdatePayload::Added { entry: added }).unwrap(),
                 serde_json::json!({"action": "deleted", "id": 4}),
                 serde_json::json!({"action": "deleted", "id": 3}),
                 serde_json::json!({"action": "deleted", "id": 2}),
-                serde_json::to_value(HistoryUpdatePayload::Added { entry: added }).unwrap(),
             ],
-            "Count retention must notify every removed id before Added"
+            "Count retention must notify Added before every removed id"
         );
         for timestamp in [100, 500, 600] {
             assert!(dir.path().join(format!("handy-{timestamp}.wav")).exists());
@@ -1187,7 +1322,7 @@ mod tests {
     }
 
     #[test]
-    fn time_retention_notifies_deleted_ids_after_commit_before_added() {
+    fn time_retention_notifies_added_then_deleted_ids_after_commit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
         let mut conn = Connection::open(&path).unwrap();
@@ -1226,6 +1361,18 @@ mod tests {
             0,
             now,
             |event| {
+                if matches!(event, HistoryUpdatePayload::Added { .. }) {
+                    assert_eq!(
+                        observer
+                            .query_row("SELECT COUNT(*) FROM transcription_history", [], |r| r
+                                .get::<_, usize>(0))
+                            .unwrap(),
+                        6,
+                        "Added must precede retention"
+                    );
+                    events.push(serde_json::to_value(event).unwrap());
+                    return;
+                }
                 let mut statement = observer
                     .prepare("SELECT id FROM transcription_history ORDER BY id")
                     .unwrap();
@@ -1249,11 +1396,11 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                serde_json::to_value(HistoryUpdatePayload::Added { entry: added }).unwrap(),
                 serde_json::json!({"action": "deleted", "id": 1}),
                 serde_json::json!({"action": "deleted", "id": 2}),
-                serde_json::to_value(HistoryUpdatePayload::Added { entry: added }).unwrap(),
             ],
-            "Time retention must notify every removed id before Added"
+            "Time retention must notify Added before every removed id"
         );
         for timestamp in [now - 3 * day, now, now - 5 * day, now + 1] {
             assert!(dir.path().join(format!("handy-{timestamp}.wav")).exists());
@@ -1427,7 +1574,7 @@ mod tests {
         );
         assert_eq!(failed.unwrap_err().to_string(), "blocked");
         assert_eq!(events.len(), 1, "failed deletion must not notify");
-        assert!(!dir.path().join("handy-200.wav").exists());
+        assert!(dir.path().join("handy-200.wav").exists());
         conn.execute_batch("DROP TRIGGER stop_delete;").unwrap();
         conn.pragma_update(None, "foreign_keys", true).unwrap();
         conn.execute_batch("CREATE TABLE history_reference (history_id INTEGER REFERENCES transcription_history(id) DEFERRABLE INITIALLY DEFERRED); INSERT INTO history_reference SELECT id FROM transcription_history;").unwrap();
@@ -1572,7 +1719,7 @@ mod tests {
         let (attempted_tx, attempted_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let writer_dir = recordings.clone();
-        let (removed, writer) = HistoryManager::with_clear_transaction(&mut conn, |transaction| {
+        let (candidates, writer) = HistoryManager::with_clear_transaction(&mut conn, |transaction| {
             let writer = std::thread::spawn(move || {
                 let conn = Connection::open(path).unwrap();
                 conn.busy_timeout(Duration::ZERO).unwrap();
@@ -1591,11 +1738,14 @@ mod tests {
                 "writer must reach SQLite and encounter Clear's write lock");
             assert!(matches!(done_rx.recv_timeout(Duration::from_millis(50)), Err(mpsc::RecvTimeoutError::Timeout)));
             let candidates = HistoryManager::clear_candidates(transaction, true).unwrap();
-            let removed = HistoryManager::delete_entries_and_files_with_conn(transaction, &recordings, &candidates).unwrap();
-            assert_eq!(removed.entries, 1);
-            Ok((removed, writer))
+            let removed = HistoryManager::delete_entries_with_conn(transaction, &candidates).unwrap();
+            assert_eq!(removed, 1);
+            Ok((candidates, writer))
         }).unwrap();
-        assert_eq!(removed.recordings, 1);
+        assert_eq!(
+            HistoryManager::delete_recording_files(&recordings, &candidates),
+            1
+        );
         done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         writer.join().unwrap();
         let entry = HistoryManager::get_latest_entry_with_conn(&conn)
@@ -1607,18 +1757,17 @@ mod tests {
     }
 
     #[test]
-    fn clear_removes_file_before_attempting_database_delete() {
-        let conn = setup_conn();
+    fn clear_preserves_file_when_database_delete_fails() {
+        let mut conn = setup_conn();
         let dir = tempfile::tempdir().unwrap();
         insert_entry(&conn, 100, "raw", None);
         fs::write(dir.path().join("handy-100.wav"), b"audio").unwrap();
         conn.execute_batch("CREATE TRIGGER stop_delete BEFORE DELETE ON transcription_history BEGIN SELECT RAISE(ABORT, 'blocked'); END;").unwrap();
-        let candidates = HistoryManager::clear_candidates(&conn, true).unwrap();
         assert!(
-            HistoryManager::delete_entries_and_files_with_conn(&conn, dir.path(), &candidates)
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true, |_| {})
                 .is_err()
         );
-        assert!(!dir.path().join("handy-100.wav").exists());
+        assert!(dir.path().join("handy-100.wav").exists());
     }
 
     #[test]
