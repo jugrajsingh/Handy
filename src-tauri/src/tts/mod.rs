@@ -14,6 +14,8 @@ pub enum TtsError {
     Model,
     #[error("tts.errors.notDownloaded")]
     NotDownloaded,
+    #[error("tts.errors.localIo")]
+    Read,
     #[error("tts.errors.invalidVoice")]
     Voice,
     #[error("tts.errors.start")]

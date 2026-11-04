@@ -25,6 +25,7 @@ pub const BINARY_ENV: &str = "HANDY_LLAMA_SERVER";
 /// Where the RPM installs the static CPU build.
 pub const INSTALLED_BINARY: &str = "/usr/lib/Handy/llm/llama-server";
 
+const LOCAL_AUTHORITY: &str = "localhost";
 const HEALTH_POLL: Duration = Duration::from_millis(100);
 const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 /// Retry an early child exit once with a new socket.
@@ -186,17 +187,18 @@ pub fn wait_healthy(
     deadline: Instant,
     cancel: &AtomicBool,
 ) -> Result<(), HealthError> {
-    wait_healthy_inner(client, child, deadline, cancel, None)
+    wait_healthy_inner(client, LOCAL_AUTHORITY, child, deadline, cancel, None)
 }
 
 fn wait_healthy_inner(
     client: &reqwest::blocking::Client,
+    authority: &str,
     child: &mut Child,
     deadline: Instant,
     cancel: &AtomicBool,
     kill: Option<&ChildKillSwitch>,
 ) -> Result<(), HealthError> {
-    let url = "http://localhost/health";
+    let url = format!("http://{authority}/health");
     loop {
         if cancel.load(Ordering::SeqCst) {
             return Err(HealthError::Cancelled);
@@ -215,7 +217,7 @@ fn wait_healthy_inner(
             return Err(HealthError::Timeout);
         }
         let per_try = (deadline - now).min(HEALTH_REQUEST_TIMEOUT);
-        if let Ok(resp) = client.get(url).timeout(per_try).send() {
+        if let Ok(resp) = client.get(&url).timeout(per_try).send() {
             if resp.status().is_success() {
                 let alive = match kill {
                     Some(kill) => kill.try_wait(child),
@@ -236,6 +238,7 @@ fn wait_healthy_inner(
 /// `POST /v1/chat/completions`, returning `choices[0].message.content`.
 pub fn post_chat(
     client: &reqwest::blocking::Client,
+    authority: &str,
     api_key: &str,
     req: &GenerateRequest,
 ) -> Result<String, LocalLlmError> {
@@ -247,7 +250,7 @@ pub fn post_chat(
         "chat_template_kwargs": { "enable_thinking": false },
     });
     let resp = client
-        .post("http://localhost/v1/chat/completions")
+        .post(format!("http://{authority}/v1/chat/completions"))
         .bearer_auth(api_key)
         .timeout(req.timeout)
         .json(&body)
@@ -397,6 +400,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 struct Running {
     child: Child,
+    http_authority: String,
     _socket: Arc<PrivateSocket>,
     api_key: String,
     model_path: PathBuf,
@@ -412,6 +416,7 @@ enum StartOutcome {
 /// The llama-server runtime.
 pub struct LlamaServerBackend {
     binary_env: Option<OsString>,
+    http_authority: String,
     installed: PathBuf,
     data_dir: Option<PathBuf>,
     runtime_dir: Option<PathBuf>,
@@ -430,6 +435,7 @@ impl LlamaServerBackend {
     pub fn new() -> Self {
         Self {
             binary_env: std::env::var_os(BINARY_ENV),
+            http_authority: LOCAL_AUTHORITY.into(),
             installed: PathBuf::from(INSTALLED_BINARY),
             data_dir: None,
             runtime_dir: std::env::var_os("XDG_RUNTIME_DIR")
@@ -445,6 +451,7 @@ impl LlamaServerBackend {
     pub fn with_binary(binary: PathBuf) -> Self {
         Self {
             binary_env: None,
+            http_authority: LOCAL_AUTHORITY.into(),
             data_dir: binary.parent().map(Path::to_path_buf),
             runtime_dir: None,
             installed: binary,
@@ -519,6 +526,7 @@ impl LlamaServerBackend {
         };
         match wait_healthy_inner(
             &client,
+            &self.http_authority,
             &mut child,
             deadline,
             &opts.cancel,
@@ -526,6 +534,7 @@ impl LlamaServerBackend {
         ) {
             Ok(()) => StartOutcome::Ready(Running {
                 child,
+                http_authority: self.http_authority.clone(),
                 _socket: socket,
                 api_key,
                 model_path: opts.model_path.clone(),
@@ -609,7 +618,12 @@ impl TextModelBackend for LlamaServerBackend {
                 "llama-server exited before request".into(),
             ));
         }
-        post_chat(&running.client, &running.api_key, req)
+        post_chat(
+            &running.client,
+            &running.http_authority,
+            &running.api_key,
+            req,
+        )
     }
 
     fn unload(&mut self) {
@@ -726,6 +740,7 @@ mod tests {
         let published_pid = backend.kill.pid.load(Ordering::SeqCst);
         backend.running = Some(Running {
             child,
+            http_authority: LOCAL_AUTHORITY.into(),
             api_key: String::new(),
             model_path: dir.path().join("m.gguf"),
             client: socket_client(&dir.path().join("s.sock")).unwrap(),
@@ -795,35 +810,60 @@ mod tests {
 
     #[test]
     fn wbsec_socket_start_generate_kill_and_tcp_isolation() {
-        use std::process::Stdio;
+        struct ReapedChild(Child);
+        impl Drop for ReapedChild {
+            fn drop(&mut self) {
+                stop_child(&mut self.0);
+            }
+        }
         let root = tempfile::tempdir().unwrap();
-        let mut attacker = Command::new("python3")
-            .args([
-                "-u",
-                "-c",
-                r#"
-import socket
+        let mut attacker = ReapedChild(Command::new("python3").args(["-u", "-c", r#"
+import json, select, socket, sys, time
 s = socket.socket()
 s.bind(('127.0.0.1', 0))
-s.listen(1)
-s.settimeout(3)
-print('ready', flush=True)
-try:
+s.listen(2)
+print('127.0.0.1:' + str(s.getsockname()[1]), flush=True)
+traffic = False
+private_request = False
+deadline = time.monotonic() + 15
+for _ in range(8):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0: raise SystemExit(3)
+    ready, _, _ = select.select([s, sys.stdin], [], [], remaining)
+    if not ready: raise SystemExit(3)
+    if sys.stdin in ready:
+        if sys.stdin.readline() != 'done\n': raise SystemExit(3)
+        print('intercepted' if private_request else 'traffic' if traffic else 'isolated', flush=True)
+        raise SystemExit(1 if traffic else 0)
     connection, _ = s.accept()
-except TimeoutError:
-    raise SystemExit(0)
-connection.close()
-raise SystemExit(1)
-"#,
-            ])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut ready = String::new();
-        BufReader::new(attacker.stdout.take().unwrap())
-            .read_line(&mut ready)
-            .unwrap();
-        assert_eq!(ready.trim(), "ready");
+    connection.settimeout(2)
+    traffic = True
+    request = connection.makefile('rb')
+    first = request.readline().decode()
+    headers = {}
+    for _ in range(100):
+        line = request.readline()
+        if line == b'\r\n': break
+        key, value = line.decode().split(':', 1)
+        headers[key.lower()] = value.strip()
+    else: raise SystemExit(3)
+    size = int(headers.get('content-length', '0'))
+    assert size < 65536
+    body = request.read(size)
+    if first.startswith('POST /v1/chat/completions'):
+        private_request = (headers.get('authorization', '').startswith('Bearer ') and json.loads(body)['messages'][0]['content'] == 'synthetic transcript')
+        assert private_request
+    reply = b'{"choices":[{"message":{"content":"synthetic result"}}]}'
+    connection.sendall(b'HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: ' + str(len(reply)).encode() + b'\r\n\r\n' + reply)
+    request.close()
+    connection.close()
+raise SystemExit(3)
+"#]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap());
+        let mut observer = BufReader::new(attacker.0.stdout.take().unwrap());
+        let mut authority = String::new();
+        observer.read_line(&mut authority).unwrap();
+        let authority = authority.trim().to_owned();
+        assert!(authority.starts_with("127.0.0.1:"));
         let binary = fake_binary(
             root.path(),
             r#"exec python3 - "$@" <<'PY'
@@ -835,16 +875,14 @@ s.listen(2)
 for expected in ('GET /health', 'POST /v1/chat/completions'):
     connection, _ = s.accept()
     request = connection.makefile('rb')
-    first = request.readline().decode()
-    assert first.startswith(expected)
+    assert request.readline().decode().startswith(expected)
     headers = {}
     for _ in range(100):
         line = request.readline()
         if line == b'\r\n': break
         key, value = line.decode().split(':', 1)
         headers[key.lower()] = value.strip()
-    else:
-        raise AssertionError('request header limit exceeded')
+    else: raise SystemExit(3)
     body = request.read(int(headers.get('content-length', '0')))
     if expected.startswith('POST'):
         assert headers['authorization'] == 'Bearer ' + os.environ['LLAMA_API_KEY']
@@ -857,8 +895,11 @@ time.sleep(30)
 PY"#,
         );
         let mut backend = LlamaServerBackend::with_binary(binary);
-        let options = opts(root.path().join("m.gguf"), Duration::from_secs(5));
-        let result = backend.ensure_loaded(registry::find("s1-mini-q4km").unwrap(), &options);
+        backend.http_authority = authority;
+        let result = backend.ensure_loaded(
+            registry::find("s1-mini-q4km").unwrap(),
+            &opts(root.path().join("m.gguf"), Duration::from_secs(5)),
+        );
         let generated = result.and_then(|()| {
             backend.generate(&GenerateRequest {
                 messages: vec![ChatMessage {
@@ -876,7 +917,22 @@ PY"#,
         backend.kill_switch().trigger();
         let cleaned_before_unload = directory.as_ref().is_none_or(|path| !path.exists());
         backend.unload();
-        let intercepted = attacker.wait().unwrap();
+        attacker
+            .0
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"done\n")
+            .unwrap();
+        let mut observation = String::new();
+        observer.read_line(&mut observation).unwrap();
+        let status = attacker.0.wait().unwrap();
+        assert_eq!(
+            observation.trim(),
+            "isolated",
+            "TCP isolation must keep the synthetic transcript and key off the HTTP authority"
+        );
+        assert!(status.success());
         assert!(
             cleaned_before_unload,
             "kill switch must clean the socket even before unload"
@@ -886,16 +942,48 @@ PY"#,
             Ok("synthetic result".into()),
             "generation must use the private socket"
         );
-        assert!(
-            intercepted.success(),
-            "pre-existing TCP listener must receive no request"
-        );
         assert_eq!(
             std::fs::read_dir(root.path().join("llm-runtime"))
                 .unwrap()
                 .count(),
             0,
             "socket directories must be removed after cleanup"
+        );
+    }
+
+    #[test]
+    fn fix1_private_socket_rejects_symlinks_and_uses_xdg_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+        const CHILD: &str = "HANDY_TEST_WBSEC_RUNTIME";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let status = Command::new(std::env::current_exe().unwrap()).args(["--exact", "local_llm::llama_server::tests::fix1_private_socket_rejects_symlinks_and_uses_xdg_runtime", "--nocapture"])
+                .env(CHILD, "1").env("XDG_RUNTIME_DIR", directory.path()).status().unwrap();
+            assert!(
+                status.success(),
+                "private runtime selection and symlink refusal must hold in the child"
+            );
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        let mut backend = LlamaServerBackend::new();
+        backend.data_dir = Some(root.join("app-data"));
+        std::fs::create_dir(root.join("app-data")).unwrap();
+        assert_eq!(
+            backend.socket_root().unwrap(),
+            root,
+            "XDG_RUNTIME_DIR must select the private runtime root"
+        );
+        let socket = PrivateSocket::create(&backend.socket_root().unwrap()).unwrap();
+        assert_eq!(socket.path.parent().unwrap().parent().unwrap(), root);
+        drop(socket);
+        let link = root.join("linked-runtime");
+        std::os::unix::fs::symlink(&root, &link).unwrap();
+        assert!(
+            PrivateSocket::create(&link).is_err(),
+            "a symlink must not be accepted as a private socket directory"
         );
     }
 
@@ -943,6 +1031,7 @@ PY"#,
         let socket = Arc::new(PrivateSocket::create(&backend.socket_root().unwrap()).unwrap());
         backend.running = Some(Running {
             child,
+            http_authority: LOCAL_AUTHORITY.into(),
             client: socket_client(&socket.path).unwrap(),
             _socket: socket,
             api_key: "fixture".into(),
@@ -966,6 +1055,7 @@ PY"#,
         let (dir, server) = serve(vec![(302, "{}".into())]);
         let result = post_chat(
             &socket_client(&dir.path().join("s.sock")).unwrap(),
+            LOCAL_AUTHORITY,
             "fixture",
             &GenerateRequest {
                 messages: vec![],
@@ -1155,6 +1245,7 @@ PY"#,
         };
         let out = post_chat(
             &socket_client(&dir.path().join("s.sock")).unwrap(),
+            LOCAL_AUTHORITY,
             "k3y",
             &req,
         )
@@ -1183,6 +1274,7 @@ PY"#,
         let (dir, server) = serve(vec![(200, reply.into())]);
         let result = post_chat(
             &socket_client(&dir.path().join("s.sock")).unwrap(),
+            LOCAL_AUTHORITY,
             "fixture-key",
             &GenerateRequest {
                 messages: vec![],
@@ -1226,9 +1318,12 @@ PY"#,
             timeout: Duration::from_secs(5),
         };
         let client = socket_client(&dir.path().join("s.sock")).unwrap();
-        assert_eq!(post_chat(&client, "k", &req), Err(LocalLlmError::Http(401)));
+        assert_eq!(
+            post_chat(&client, LOCAL_AUTHORITY, "k", &req),
+            Err(LocalLlmError::Http(401))
+        );
         assert!(matches!(
-            post_chat(&client, "k", &req),
+            post_chat(&client, LOCAL_AUTHORITY, "k", &req),
             Err(LocalLlmError::BadOutput(_))
         ));
         server.join().unwrap();

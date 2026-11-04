@@ -1,5 +1,5 @@
 //! Lifecycle of the local model: warm-up, serial requests, idle unload,
-//! crash restart and the failed-start policy. One mutex serializes it all.
+//! crash restart and the failed-start policy. Verification runs outside the backend mutex.
 
 use super::backend::{BackendOpts, GenerateRequest, KillSwitch, TextModelBackend};
 use super::registry::{self, ModelEntry, PromptStyle};
@@ -83,13 +83,225 @@ struct Inner {
     last_start_failure: Option<(Instant, LocalLlmError)>,
 }
 
+type VerificationResult = Result<bool, LocalLlmError>;
+type ModelVerifier =
+    Arc<dyn Fn(&Path, &ModelEntry, &dyn Fn() -> bool) -> VerificationResult + Send + Sync>;
+type RecordingCancellation = Arc<dyn Fn() -> bool + Send + Sync>;
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileIdentity {
+    path: PathBuf,
+    inode: u64,
+    modified: std::time::SystemTime,
+    size: u64,
+}
+impl FileIdentity {
+    fn read(path: &Path, entry: &ModelEntry) -> Result<Self, LocalLlmError> {
+        let metadata = std::fs::metadata(path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => LocalLlmError::ModelMissing(entry.id.into()),
+            _ => LocalLlmError::ModelRead(entry.id.into()),
+        })?;
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            metadata.ino()
+        };
+        #[cfg(not(unix))]
+        let inode = 0;
+        Ok(Self {
+            path: path.to_path_buf(),
+            inode,
+            modified: metadata
+                .modified()
+                .map_err(|_| LocalLlmError::ModelRead(entry.id.into()))?,
+            size: metadata.len(),
+        })
+    }
+}
+struct HashJob {
+    cancelled: AtomicBool,
+    #[cfg(test)]
+    waiting: AtomicBool,
+    result: Mutex<Option<VerificationResult>>,
+    done: std::sync::Condvar,
+}
+struct ActiveHash {
+    identity: FileIdentity,
+    model: &'static str,
+    job: Arc<HashJob>,
+    thread: std::thread::JoinHandle<()>,
+}
+#[derive(Default)]
+struct VerificationState {
+    active: Option<ActiveHash>,
+    cache: std::collections::BTreeMap<&'static str, (FileIdentity, bool)>,
+}
+#[derive(Default)]
+struct Verification {
+    state: Mutex<VerificationState>,
+    epoch: std::sync::atomic::AtomicU64,
+}
+struct VerifiedFile {
+    identity: FileIdentity,
+    valid: bool,
+}
+struct VerificationWait<'a> {
+    deadline: Instant,
+    epoch: u64,
+    cancelled: &'a dyn Fn() -> bool,
+    shutdown: Arc<AtomicBool>,
+    recording: Option<RecordingCancellation>,
+}
+impl Verification {
+    fn cancel(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        if let Some(active) = &lock(&self.state).active {
+            active.job.cancelled.store(true, Ordering::SeqCst);
+            active.job.done.notify_all();
+        }
+    }
+    fn verify(
+        &self,
+        path: &Path,
+        entry: &'static ModelEntry,
+        verifier: ModelVerifier,
+        wait: VerificationWait<'_>,
+    ) -> Result<VerifiedFile, LocalLlmError> {
+        let VerificationWait {
+            deadline,
+            epoch,
+            cancelled,
+            shutdown,
+            recording,
+        } = wait;
+        let identity = FileIdentity::read(path, entry)?;
+        let mut waiting_for: Option<Arc<HashJob>> = None;
+        loop {
+            let mut state = lock(&self.state);
+            if cancelled() || self.epoch.load(Ordering::SeqCst) != epoch {
+                if let Some(active) = &state.active {
+                    if active.identity.path == identity.path {
+                        active.job.cancelled.store(true, Ordering::SeqCst);
+                        active.job.done.notify_all();
+                    }
+                }
+                return Err(LocalLlmError::VerificationCancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(LocalLlmError::VerificationTimeout);
+            }
+            if let Some(job) = &waiting_for {
+                if let Some(result) = lock(&job.result).clone() {
+                    return result.map(|valid| VerifiedFile { identity, valid });
+                }
+            }
+            let completed = state
+                .active
+                .as_ref()
+                .and_then(|active| lock(&active.job.result).clone());
+            if let Some(result) = completed {
+                if let Some(active) = state.active.take() {
+                    let _ = active.thread.join();
+                    if let Ok(valid) = result {
+                        state.cache.insert(active.model, (active.identity, valid));
+                    }
+                }
+            }
+            if let Some((cached, valid)) = state.cache.get(entry.id) {
+                if cached.path == identity.path
+                    && cached.inode == identity.inode
+                    && cached.modified == identity.modified
+                    && cached.size == identity.size
+                {
+                    return Ok(VerifiedFile {
+                        identity,
+                        valid: *valid,
+                    });
+                }
+            }
+            if state.active.is_none() {
+                let job = Arc::new(HashJob {
+                    cancelled: AtomicBool::new(false),
+                    #[cfg(test)]
+                    waiting: AtomicBool::new(false),
+                    result: Mutex::new(None),
+                    done: std::sync::Condvar::new(),
+                });
+                let work = job.clone();
+                let key = identity.clone();
+                let verify = verifier.clone();
+                let stopping = shutdown.clone();
+                let recording = recording.clone();
+                let thread = std::thread::Builder::new()
+                    .name("local-llm-verify".into())
+                    .spawn(move || {
+                        let cancelled = || {
+                            work.cancelled.load(Ordering::SeqCst)
+                                || stopping.load(Ordering::SeqCst)
+                                || recording.as_ref().is_some_and(|check| check())
+                        };
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            let valid = verify(&key.path, entry, &cancelled)?;
+                            if cancelled() {
+                                return Err(LocalLlmError::VerificationCancelled);
+                            }
+                            if FileIdentity::read(&key.path, entry)? != key {
+                                return Err(LocalLlmError::ModelRead(entry.id.into()));
+                            }
+                            Ok(valid)
+                        }))
+                        .unwrap_or_else(|_| Err(LocalLlmError::ModelRead(entry.id.into())));
+                        *lock(&work.result) = Some(result);
+                        work.done.notify_all();
+                    })
+                    .map_err(|_| LocalLlmError::Failed("cannot start model verification".into()))?;
+                state.active = Some(ActiveHash {
+                    identity: identity.clone(),
+                    model: entry.id,
+                    job,
+                    thread,
+                });
+            }
+            let Some(active) = &state.active else {
+                continue;
+            };
+            let same_file = active.identity == identity;
+            let job = active.job.clone();
+            if same_file {
+                waiting_for = Some(job.clone());
+            }
+            drop(state);
+            let result = lock(&job.result);
+            if let Some(result) = result.as_ref() {
+                if same_file {
+                    return result.clone().map(|valid| VerifiedFile { identity, valid });
+                }
+                continue;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            #[cfg(test)]
+            job.waiting.store(true, Ordering::SeqCst);
+            let _wait = job
+                .done
+                .wait_timeout(result, remaining.min(Duration::from_millis(10)))
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+}
+impl Drop for Verification {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
 pub struct LocalLlmManager {
     inner: Mutex<Inner>,
     status: Mutex<LocalLlmStatus>,
     cancel: Arc<AtomicBool>,
     kill_switch: Arc<dyn KillSwitch>,
     models_root: Option<PathBuf>,
-    pub(super) verify: fn(&Path, &ModelEntry) -> Result<bool, String>,
+    pub(super) verify: ModelVerifier,
+    verification: Verification,
     hooks: ManagerHooks,
     config: ManagerConfig,
 }
@@ -124,10 +336,16 @@ impl LocalLlmManager {
             cancel: Arc::new(AtomicBool::new(false)),
             kill_switch,
             models_root,
-            verify: super::download::verify_model,
+            verify: Arc::new(super::download::verify_model),
+            verification: Verification::default(),
             hooks,
             config,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn verification_timeout(&mut self, timeout: Duration) {
+        self.config.start_timeout = timeout;
     }
 
     /// Returns the model storage root without calling the backend.
@@ -142,12 +360,40 @@ impl LocalLlmManager {
 
     /// Starts the model on a std background thread; never blocks the caller.
     pub fn warm_up(self: &Arc<Self>, settings: &AppSettings) {
+        self.warm_up_inner(settings, None);
+    }
+
+    /// Keeps recording cancellation connected after a warm-up wait times out.
+    pub(super) fn warm_up_with_cancel(
+        self: &Arc<Self>,
+        settings: &AppSettings,
+        cancelled: RecordingCancellation,
+    ) {
+        self.warm_up_inner(settings, Some(cancelled));
+    }
+
+    fn warm_up_inner(
+        self: &Arc<Self>,
+        settings: &AppSettings,
+        cancelled: Option<RecordingCancellation>,
+    ) {
         let this = Arc::clone(self);
         let settings = settings.clone();
         let spawned = std::thread::Builder::new()
             .name("local-llm-warmup".into())
             .spawn(move || {
-                if let Err(e) = this.ensure_started(&settings) {
+                let result = if let Some(cancelled) = cancelled {
+                    this.ready(
+                        &settings,
+                        Instant::now(),
+                        &AtomicBool::new(false),
+                        Some(cancelled),
+                    )
+                    .map(|_| ())
+                } else {
+                    this.ensure_started(&settings)
+                };
+                if let Err(e) = result {
                     warn!("local-llm: warm-up failed: {e}");
                 }
             });
@@ -160,25 +406,33 @@ impl LocalLlmManager {
     pub fn ensure_started(&self, settings: &AppSettings) -> Result<(), LocalLlmError> {
         let call_started = Instant::now();
         on_std_thread(|| {
-            let mut inner = lock(&self.inner);
-            self.ready_locked(&mut inner, settings, call_started)
+            self.ready(settings, call_started, &AtomicBool::new(false), None)
                 .map(|_| ())
         })
     }
 
+    #[cfg(test)]
     /// Serial cleanup on a std thread; blocks the caller, so use spawn_blocking in async code.
     pub fn process(
         &self,
         transcript: &str,
         settings: &AppSettings,
     ) -> Result<String, LocalLlmError> {
+        self.process_with_cancel(transcript, settings, &AtomicBool::new(false))
+    }
+
+    pub(super) fn process_with_cancel(
+        &self,
+        transcript: &str,
+        settings: &AppSettings,
+        caller_cancelled: &AtomicBool,
+    ) -> Result<String, LocalLlmError> {
         let call_started = Instant::now();
         on_std_thread(|| {
             if self.cancel.load(Ordering::SeqCst) {
                 return Err(LocalLlmError::Failed("shutting down".into()));
             }
-            let mut inner = lock(&self.inner);
-            let entry = self.ready_locked(&mut inner, settings, call_started)?;
+            let (mut inner, entry) = self.ready(settings, call_started, caller_cancelled, None)?;
             let result = run_chunks(&mut inner, entry, transcript, settings);
             inner.last_used = Instant::now();
             match &result {
@@ -234,6 +488,7 @@ impl LocalLlmManager {
 
     /// Unloads on a std thread; blocks the caller, so use spawn_blocking in async code.
     pub fn unload(&self) {
+        self.cancel_verification();
         on_std_thread(|| {
             let mut inner = lock(&self.inner);
             self.stop_locked(&mut inner);
@@ -244,6 +499,7 @@ impl LocalLlmManager {
     pub fn shutdown(&self) {
         on_std_thread(|| {
             self.cancel.store(true, Ordering::SeqCst);
+            self.cancel_verification();
             self.kill_switch.trigger();
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
@@ -305,20 +561,117 @@ impl LocalLlmManager {
             .as_deref()
             .ok_or_else(|| LocalLlmError::ModelMissing(entry.id.into()))?;
         let path = registry::model_path(root, entry);
-        let meta =
-            std::fs::metadata(&path).map_err(|_| LocalLlmError::ModelMissing(entry.id.into()))?;
+        let meta = std::fs::metadata(&path).map_err(|error| match error.kind() {
+            std::io::ErrorKind::NotFound => LocalLlmError::ModelMissing(entry.id.into()),
+            _ => LocalLlmError::ModelRead(entry.id.into()),
+        })?;
         if meta.len() != entry.size_bytes {
             return Err(LocalLlmError::ModelCorrupt(entry.id.into()));
         }
         Ok(path)
     }
 
-    fn ready_locked(
+    fn ready(
+        &self,
+        settings: &AppSettings,
+        call_started: Instant,
+        caller_cancelled: &AtomicBool,
+        recording: Option<RecordingCancellation>,
+    ) -> Result<(MutexGuard<'_, Inner>, &'static ModelEntry), LocalLlmError> {
+        let epoch = self.verification.epoch.load(Ordering::SeqCst);
+        let cancelled = || {
+            self.cancel.load(Ordering::SeqCst)
+                || caller_cancelled.load(Ordering::SeqCst)
+                || recording.as_ref().is_some_and(|check| check())
+        };
+        if cancelled() {
+            return Err(LocalLlmError::VerificationCancelled);
+        }
+        let mut inner = lock(&self.inner);
+        let (entry, path, ready) = self.candidate_locked(&mut inner, settings, call_started)?;
+        if ready {
+            return Ok((inner, entry));
+        }
+        drop(inner);
+        let deadline = call_started + self.config.start_timeout;
+        let result = self.verification.verify(
+            &path,
+            entry,
+            self.verify.clone(),
+            VerificationWait {
+                deadline,
+                epoch,
+                cancelled: &cancelled,
+                shutdown: self.cancel.clone(),
+                recording: recording.clone(),
+            },
+        );
+        let verified = match result {
+            Ok(verified) => verified,
+            Err(error) => {
+                self.report_verification_error(entry, &error);
+                return Err(error);
+            }
+        };
+        if !verified.valid {
+            let error = LocalLlmError::ModelCorrupt(entry.id.into());
+            self.report_verification_error(entry, &error);
+            return Err(error);
+        }
+        let mut inner = lock(&self.inner);
+        if cancelled() || self.verification.epoch.load(Ordering::SeqCst) != epoch {
+            return Err(LocalLlmError::VerificationCancelled);
+        }
+        let (entry, path, ready) = self.candidate_locked(&mut inner, settings, call_started)?;
+        if ready {
+            return Ok((inner, entry));
+        }
+        if FileIdentity::read(&path, entry)? != verified.identity {
+            return Err(LocalLlmError::ModelRead(entry.id.into()));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(LocalLlmError::VerificationTimeout);
+        }
+        self.start_locked(&mut inner, entry, path, settings, remaining)?;
+        Ok((inner, entry))
+    }
+
+    fn report_verification_error(&self, entry: &ModelEntry, error: &LocalLlmError) {
+        let mut status = lock(&self.status);
+        if status.state != LocalLlmStateKind::Unloaded {
+            return;
+        }
+        status.model_id = Some(entry.id.into());
+        status.error = Some(error.to_string());
+        let snapshot = status.clone();
+        drop(status);
+        (self.hooks.on_status)(&snapshot);
+    }
+
+    /// Cancels the active verification without discarding completed byte checks.
+    pub(super) fn cancel_verification(&self) {
+        self.verification.cancel();
+    }
+
+    /// Clears a recovered model's error without waiting for a backend request.
+    pub(super) fn clear_download_error(&self, model: &str) {
+        let mut status = lock(&self.status);
+        if status.model_id.as_deref() == Some(model) && status.state == LocalLlmStateKind::Unloaded
+        {
+            status.error = None;
+            let snapshot = status.clone();
+            drop(status);
+            (self.hooks.on_status)(&snapshot);
+        }
+    }
+
+    fn candidate_locked(
         &self,
         inner: &mut Inner,
         settings: &AppSettings,
         call_started: Instant,
-    ) -> Result<&'static ModelEntry, LocalLlmError> {
+    ) -> Result<(&'static ModelEntry, PathBuf, bool), LocalLlmError> {
         if self.cancel.load(Ordering::SeqCst) {
             return Err(LocalLlmError::Failed("shutting down".into()));
         }
@@ -341,28 +694,23 @@ impl LocalLlmManager {
             Ok(p) => p,
             Err(e) => {
                 self.stop_locked(inner);
+                self.set_state_for(
+                    inner,
+                    LocalLlmState::Unloaded,
+                    Some(entry.id),
+                    Some(e.to_string()),
+                );
                 return Err(e);
             }
         };
         if inner.state == LocalLlmState::Ready {
             if inner.loaded == Some(entry) && inner.backend.is_alive() {
-                return Ok(entry);
+                return Ok((entry, path, true));
             }
             warn!("local-llm: llama-server gone or model changed; restarting");
             self.stop_locked(inner);
         }
-        if !(self.verify)(&path, entry).unwrap_or(false) {
-            let error = LocalLlmError::ModelCorrupt(entry.id.into());
-            self.set_state_for(
-                inner,
-                LocalLlmState::Unloaded,
-                Some(entry.id),
-                Some(error.to_string()),
-            );
-            return Err(error);
-        }
-        self.start_locked(inner, entry, path, settings)?;
-        Ok(entry)
+        Ok((entry, path, false))
     }
 
     fn start_locked(
@@ -371,13 +719,14 @@ impl LocalLlmManager {
         entry: &'static ModelEntry,
         model_path: PathBuf,
         settings: &AppSettings,
+        start_timeout: Duration,
     ) -> Result<(), LocalLlmError> {
         self.set_state_for(inner, LocalLlmState::Starting, Some(entry.id), None);
         let opts = BackendOpts {
             model_path,
             threads: settings.local_llm_threads.max(1),
             ctx: entry.default_ctx,
-            start_timeout: self.config.start_timeout,
+            start_timeout,
             cancel: Arc::clone(&self.cancel),
         };
         let result = inner.backend.ensure_loaded(entry, &opts);
@@ -662,7 +1011,7 @@ pub(crate) mod tests {
                 idle_tick: Duration::from_secs(3600),
             },
         );
-        manager.verify = |_, _| Ok(true);
+        manager.verify = Arc::new(|_, _, _| Ok(true));
         let manager = Arc::new(manager);
         let mut settings = get_default_settings();
         settings.post_process_provider_id = LOCAL_LLM_PROVIDER_ID.to_string();
@@ -678,6 +1027,427 @@ pub(crate) mod tests {
             model_file,
             _dir: dir,
         }
+    }
+
+    fn fix1_hash_probe(
+        h: &mut Harness,
+        good: bool,
+    ) -> (
+        Arc<AtomicBool>,
+        Arc<std::sync::atomic::AtomicUsize>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let release = Arc::new(AtomicBool::new(false));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (entered, ready) = std::sync::mpsc::channel();
+        let flag = release.clone();
+        let count = calls.clone();
+        let manager = Arc::get_mut(&mut h.manager).unwrap();
+        manager.config.start_timeout = Duration::from_millis(40);
+        manager.verify = Arc::new(move |_, _, cancelled| {
+            count.fetch_add(1, Ordering::SeqCst);
+            entered.send(()).unwrap();
+            for _ in 0..5000 {
+                if cancelled() {
+                    return Err(LocalLlmError::VerificationCancelled);
+                }
+                if flag.load(Ordering::SeqCst) {
+                    return Ok(good);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(LocalLlmError::ModelRead("fixture deadline".into()))
+        });
+        (release, calls, ready)
+    }
+    struct Fix1Release(Arc<AtomicBool>);
+    impl Drop for Fix1Release {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    fn fix1_finish_hash(manager: &LocalLlmManager) {
+        let job = lock(&manager.verification.state)
+            .active
+            .as_ref()
+            .unwrap()
+            .job
+            .clone();
+        let result = lock(&job.result);
+        let (result, _) = job
+            .done
+            .wait_timeout_while(result, Duration::from_secs(2), |value| value.is_none())
+            .unwrap();
+        assert!(
+            result.is_some(),
+            "background hash must settle after release or cancellation"
+        );
+    }
+
+    #[test]
+    fn fix1_recording_cancel_reaches_warmup_hash_after_raw_fallback() {
+        let mut h = harness();
+        let (release, _, entered) = fix1_hash_probe(&mut h, true);
+        let _release = Fix1Release(release);
+        let caller = Arc::new(AtomicBool::new(false));
+        let flag = caller.clone();
+        h.manager
+            .warm_up_with_cancel(&h.settings, Arc::new(move || flag.load(Ordering::SeqCst)));
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        for _ in 0..2000 {
+            if h.manager.status().error.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            h.manager.status().error.as_deref(),
+            Some(LocalLlmError::VerificationTimeout.to_string().as_str())
+        );
+        caller.store(true, Ordering::SeqCst);
+        let job = lock(&h.manager.verification.state)
+            .active
+            .as_ref()
+            .unwrap()
+            .job
+            .clone();
+        let result = lock(&job.result);
+        let (result, _) = job
+            .done
+            .wait_timeout_while(result, Duration::from_secs(1), |value| value.is_none())
+            .unwrap();
+        assert_eq!(
+            *result,
+            Some(Err(LocalLlmError::VerificationCancelled)),
+            "recording cancellation must reach a warm-up hash after raw fallback"
+        );
+        assert_eq!(lock(&h.fake).loads, 0);
+    }
+
+    #[test]
+    fn fix1_slow_hash_is_bounded_outside_inner_and_reused_without_a_queue() {
+        let mut h = harness();
+        let (release, calls, entered) = fix1_hash_probe(&mut h, true);
+        let _release = Fix1Release(release.clone());
+        let manager = h.manager.clone();
+        let settings = h.settings.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            tx.send(manager.process("preserve raw words", &settings))
+                .unwrap()
+        });
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let inner = h.manager.inner.try_lock();
+        assert!(inner.is_ok(), "hashing must release the lifecycle mutex");
+        let inner = inner.unwrap();
+        let result = rx.recv_timeout(Duration::from_secs(1));
+        drop(inner);
+        first.join().unwrap();
+        assert!(
+            matches!(result, Ok(Err(LocalLlmError::VerificationTimeout))),
+            "slow verification must return raw fallback at the cold-start bound"
+        );
+        for _ in 0..3 {
+            assert_eq!(
+                h.manager.ensure_started(&h.settings),
+                Err(LocalLlmError::VerificationTimeout)
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "only one background hash may run while callers time out"
+        );
+        assert_eq!(lock(&h.manager.inner).failed_starts, 0);
+        assert_eq!(h.manager.status().state, LocalLlmStateKind::Unloaded);
+        assert!(!h.manager.status().error.unwrap().contains("delete"));
+        release.store(true, Ordering::SeqCst);
+        fix1_finish_hash(&h.manager);
+        h.manager.ensure_started(&h.settings).unwrap();
+        h.manager.unload();
+        h.manager.ensure_started(&h.settings).unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a later cold load must reuse completed verification"
+        );
+    }
+
+    #[test]
+    fn fix1_cancel_and_shutdown_reach_the_active_hash_without_waiting_for_inner() {
+        for shutdown in [false, true] {
+            let mut h = harness();
+            let (entered, ready) = std::sync::mpsc::channel();
+            let (observed, cancelled_hash) = std::sync::mpsc::channel();
+            let manager = Arc::get_mut(&mut h.manager).unwrap();
+            manager.config.start_timeout = Duration::from_secs(3);
+            manager.verify = Arc::new(move |_, _, cancelled| {
+                entered.send(()).unwrap();
+                for _ in 0..2000 {
+                    if cancelled() {
+                        observed.send(()).unwrap();
+                        return Err(LocalLlmError::VerificationCancelled);
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Ok(true)
+            });
+            let caller_cancelled = Arc::new(AtomicBool::new(false));
+            let flag = caller_cancelled.clone();
+            let child = h.manager.clone();
+            let settings = h.settings.clone();
+            let request = std::thread::spawn(move || {
+                child.process_with_cancel("raw words", &settings, &flag)
+            });
+            ready.recv_timeout(Duration::from_secs(2)).unwrap();
+            if shutdown {
+                let started = Instant::now();
+                h.manager.shutdown();
+                assert!(
+                    started.elapsed() < Duration::from_millis(500),
+                    "shutdown must not spend its request-lock deadline on a hash"
+                );
+            } else {
+                caller_cancelled.store(true, Ordering::SeqCst);
+            }
+            assert!(
+                cancelled_hash.recv_timeout(Duration::from_secs(1)).is_ok(),
+                "caller cancellation must reach the active hash callback"
+            );
+            assert!(request.join().unwrap().is_err());
+            assert_eq!(lock(&h.fake).loads, 0);
+            fix1_finish_hash(&h.manager);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix1_cache_rehashes_changed_identity_and_remembers_corruption() {
+        use std::sync::atomic::AtomicUsize;
+        let mut h = harness();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(move |_, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        });
+        for _ in 0..2 {
+            assert!(matches!(
+                h.manager.ensure_started(&h.settings),
+                Err(LocalLlmError::ModelCorrupt(_))
+            ));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an unchanged corrupt GGUF must not be hashed twice"
+        );
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&h.model_file)
+            .unwrap();
+        let before = file.metadata().unwrap().modified().unwrap();
+        file.set_modified(before + Duration::from_secs(1)).unwrap();
+        assert!(h.manager.ensure_started(&h.settings).is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "changed mtime must invalidate verification"
+        );
+        let replacement = h.model_file.with_extension("replacement");
+        let next = std::fs::File::create(&replacement).unwrap();
+        next.set_len(file.metadata().unwrap().len()).unwrap();
+        next.set_modified(before + Duration::from_secs(1)).unwrap();
+        std::fs::rename(replacement, &h.model_file).unwrap();
+        assert!(h.manager.ensure_started(&h.settings).is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "changed inode must invalidate verification even at the same size and mtime"
+        );
+        let entry = registry::find("s1-mini-q4km").unwrap();
+        let alias = h.model_file.with_extension("alias");
+        std::fs::hard_link(&h.model_file, &alias).unwrap();
+        let epoch = h.manager.verification.epoch.load(Ordering::SeqCst);
+        h.manager
+            .verification
+            .verify(
+                &alias,
+                entry,
+                h.manager.verify.clone(),
+                VerificationWait {
+                    deadline: Instant::now() + Duration::from_secs(2),
+                    epoch,
+                    cancelled: &|| false,
+                    shutdown: h.manager.cancel.clone(),
+                    recording: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "changed path must invalidate verification even for a hard link"
+        );
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&alias)
+            .unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        file.set_len(entry.size_bytes + 1).unwrap();
+        file.set_modified(modified).unwrap();
+        h.manager
+            .verification
+            .verify(
+                &alias,
+                entry,
+                h.manager.verify.clone(),
+                VerificationWait {
+                    deadline: Instant::now() + Duration::from_secs(2),
+                    epoch,
+                    cancelled: &|| false,
+                    shutdown: h.manager.cancel.clone(),
+                    recording: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            5,
+            "changed size must invalidate verification at the same inode and mtime"
+        );
+    }
+
+    #[test]
+    fn fix1_file_changed_during_hash_is_not_loaded_and_is_rechecked() {
+        let mut h = harness();
+        let (release, calls, entered) = fix1_hash_probe(&mut h, true);
+        Arc::get_mut(&mut h.manager).unwrap().config.start_timeout = Duration::from_secs(3);
+        let _release = Fix1Release(release.clone());
+        let manager = h.manager.clone();
+        let settings = h.settings.clone();
+        let request = std::thread::spawn(move || manager.ensure_started(&settings));
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        let job = lock(&h.manager.verification.state)
+            .active
+            .as_ref()
+            .unwrap()
+            .job
+            .clone();
+        for _ in 0..2000 {
+            if job.waiting.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(job.waiting.load(Ordering::SeqCst));
+        let state = lock(&h.manager.verification.state);
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&h.model_file)
+            .unwrap();
+        file.set_modified(file.metadata().unwrap().modified().unwrap() + Duration::from_secs(1))
+            .unwrap();
+        release.store(true, Ordering::SeqCst);
+        let result = lock(&job.result);
+        let (result, _) = job
+            .done
+            .wait_timeout_while(result, Duration::from_secs(2), |value| value.is_none())
+            .unwrap();
+        assert!(result.is_some());
+        drop(result);
+        drop(state);
+        assert!(
+            matches!(request.join().unwrap(), Err(LocalLlmError::ModelRead(_))),
+            "completed verification errors must not restart hashing or load changed files"
+        );
+        assert_eq!(lock(&h.fake).loads, 0);
+        h.manager.ensure_started(&h.settings).unwrap();
+        assert!(
+            calls.load(Ordering::SeqCst) == 2,
+            "completed verification errors must not restart hashing or load changed files"
+        );
+    }
+
+    #[test]
+    fn fix1_production_constructor_verifies_current_gguf_bytes() {
+        let h = harness();
+        let manager = LocalLlmManager::new(
+            Box::new(FakeBackend(h.fake.clone())),
+            Some(
+                h.model_file
+                    .parent()
+                    .unwrap()
+                    .parent()
+                    .unwrap()
+                    .to_path_buf(),
+            ),
+            ManagerHooks {
+                idle_inputs: Box::new(|| IdleInputs {
+                    timeout: ModelUnloadTimeout::Never,
+                    recording: false,
+                }),
+                on_status: Box::new(|_| {}),
+            },
+            ManagerConfig {
+                start_timeout: Duration::from_secs(10),
+                idle_tick: Duration::from_secs(10),
+            },
+        );
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture.gguf");
+        std::fs::write(&path, b"WRONG!").unwrap();
+        let entry = ModelEntry {
+            size_bytes: 6,
+            sha256: "efa1f375d76194fa51a3556a97e641e61685f914d446979da50a551a4333ffd7",
+            ..registry::MODELS[0]
+        };
+        assert_eq!(
+            (manager.verify)(&path, &entry, &|| false),
+            Ok(false),
+            "production constructor must verify current GGUF bytes"
+        );
+        assert_eq!(lock(&h.fake).loads, 0);
+    }
+
+    #[test]
+    fn fix1_metadata_read_error_replaces_stale_corruption_guidance() {
+        let mut h = harness();
+        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(|_, _, _| Ok(false));
+        assert!(matches!(
+            h.manager.ensure_started(&h.settings),
+            Err(LocalLlmError::ModelCorrupt(_))
+        ));
+        std::fs::remove_file(&h.model_file).unwrap();
+        let parent = h.model_file.parent().unwrap();
+        std::fs::remove_dir(parent).unwrap();
+        std::fs::write(parent, b"not a directory").unwrap();
+        assert!(
+            matches!(
+                h.manager.ensure_started(&h.settings),
+                Err(LocalLlmError::ModelRead(_))
+            ),
+            "metadata read errors must not be classified as corruption"
+        );
+        assert!(
+            !h.manager.status().error.unwrap().contains("delete"),
+            "read errors must replace stale corruption guidance"
+        );
+        assert_eq!(lock(&h.fake).loads, 0);
+    }
+
+    #[test]
+    fn fix1_successful_redownload_clears_only_its_stale_status() {
+        let mut h = harness();
+        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(|_, _, _| Ok(false));
+        assert!(h.manager.ensure_started(&h.settings).is_err());
+        h.manager.clear_download_error("another-model");
+        assert!(h.manager.status().error.is_some());
+        h.manager.clear_download_error("s1-mini-q4km");
+        assert!(
+            h.manager.status().error.is_none(),
+            "successful re-download must clear stale corruption guidance"
+        );
     }
 
     #[test]

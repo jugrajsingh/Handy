@@ -66,6 +66,7 @@ pub async fn download_local_llm_model(
         let _ = progress_app.emit(download::PROGRESS_EVENT, p);
     };
     download_local_llm_model_with_refresh(download::download(&root, entry, &emit), || {
+        manager.clear_download_error(entry.id);
         crate::tray::update_tray_menu(&app);
     })
     .await

@@ -48,9 +48,18 @@ pub fn is_downloaded(models_root: &Path, entry: &ModelEntry) -> bool {
 }
 
 /// Hashes a model file against the compiled registry, without exposing its path.
-pub(super) fn verify_model(path: &Path, entry: &ModelEntry) -> Result<bool, String> {
-    handy_tts_core::download::verify_artifact(path, entry.size_bytes, entry.sha256, &|| false)
-        .map_err(|_| format!("cannot verify {}; delete and re-download", entry.id))
+pub(super) fn verify_model(
+    path: &Path,
+    entry: &ModelEntry,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<bool, super::LocalLlmError> {
+    handy_tts_core::download::verify_artifact(path, entry.size_bytes, entry.sha256, cancelled)
+        .map_err(|error| match error {
+            handy_tts_core::download::DownloadError::Cancelled => {
+                super::LocalLlmError::VerificationCancelled
+            }
+            _ => super::LocalLlmError::ModelRead(entry.id.into()),
+        })
 }
 
 /// Resumes a partial, deletes size/hash mismatches, and renames verified bytes into place.
@@ -63,9 +72,11 @@ pub async fn download(
     let final_path = registry::model_path(models_root, entry);
     if is_downloaded(models_root, entry) {
         let path = final_path.clone();
-        let valid = tokio::task::spawn_blocking(move || verify_model(&path, entry))
-            .await
-            .map_err(|_| format!("cannot verify {}", entry.id))??;
+        let valid = tokio::task::spawn_blocking(move || {
+            verify_model(&path, entry, &|| false).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|_| format!("cannot verify {}", entry.id))??;
         if !valid {
             return Err(format!(
                 "model file corrupt: {}; delete and re-download",
@@ -142,6 +153,27 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn fix1_read_error_and_cancel_are_not_corruption() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("fixture.gguf");
+        let entry = &registry::MODELS[0];
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let error = verify_model(&path, entry, &|| false).unwrap_err();
+        assert_eq!(
+            error,
+            super::super::LocalLlmError::ModelRead(entry.id.into()),
+            "read error must not advise deleting a model"
+        );
+        assert!(!error.to_string().contains("delete"));
+        assert_eq!(
+            verify_model(&path, entry, &|| true),
+            Err(super::super::LocalLlmError::VerificationCancelled),
+            "LLM verification must forward caller cancellation"
+        );
+    }
+
     #[tokio::test]
     async fn wbsec_preplaced_same_size_gguf_cannot_take_download_fast_path() {
         static ENTRY: ModelEntry = ModelEntry {
@@ -155,12 +187,12 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"WRONG!").unwrap();
         assert!(is_downloaded(root.path(), &ENTRY));
-        assert!(!verify_model(&path, &ENTRY).unwrap());
+        assert!(!verify_model(&path, &ENTRY, &|| false).unwrap());
         let error = download(root.path(), &ENTRY, &|_| {}).await.unwrap_err();
         assert!(error.contains("re-download"));
         assert!(!error.contains(&root.path().display().to_string()));
         std::fs::write(&path, b"public").unwrap();
-        assert!(verify_model(&path, &ENTRY).unwrap());
+        assert!(verify_model(&path, &ENTRY, &|| false).unwrap());
         assert_eq!(download(root.path(), &ENTRY, &|_| {}).await.unwrap(), path);
     }
 

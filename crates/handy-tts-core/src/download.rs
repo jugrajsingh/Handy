@@ -545,6 +545,72 @@ mod tests {
         entry
     }
     #[test]
+    fn fix1_public_hash_layers_observe_cancellation_after_reading_and_preserve_marker() {
+        use std::cell::Cell;
+        let root = root("fix1-public-cancel");
+        let mut entry = fixture();
+        let bytes = vec![7; 131072];
+        entry.files[0].bytes = bytes.len() as u64;
+        entry.files[0].sha256 = format!("{:x}", Sha256::digest(&bytes));
+        entry.bytes = entry.files.iter().map(|file| file.bytes).sum();
+        let directory = root.join(entry.id);
+        fs::create_dir_all(directory.join("voices")).unwrap();
+        fs::write(directory.join("public.bin"), &bytes).unwrap();
+        fs::write(directory.join("voices/alba.bin"), b"voice").unwrap();
+        fs::write(directory.join(".verified"), fingerprint(&entry)).unwrap();
+        for whole_model in [true, false] {
+            let checks = Cell::new(0);
+            let caller_cancelled = Cell::new(false);
+            let cancelled = || {
+                checks.set(checks.get() + 1);
+                if checks.get() == 3 {
+                    caller_cancelled.set(true);
+                }
+                caller_cancelled.get()
+            };
+            let result = if whole_model {
+                verify_model(&root, &entry, &cancelled)
+            } else {
+                verify_with_cancel(&directory.join("public.bin"), &entry.files[0], &cancelled)
+            };
+            assert!(
+                matches!(result, Err(DownloadError::Cancelled)),
+                "public hashing must observe caller cancellation after the first block"
+            );
+            assert!(caller_cancelled.get());
+            assert_eq!(checks.get(), 3);
+            assert!(
+                is_downloaded(&root, &entry),
+                "cancellation must preserve a valid marker"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fix1_model_read_error_preserves_marker() {
+        let root = root("fix1-read-error");
+        let entry = fixture();
+        let directory = root.join(entry.id);
+        fs::create_dir_all(&directory).unwrap();
+        let marker = fingerprint(&entry);
+        fs::write(directory.join(".verified"), &marker).unwrap();
+        let _listener =
+            std::os::unix::net::UnixListener::bind(directory.join("public.bin")).unwrap();
+        assert!(
+            matches!(
+                verify_model(&root, &entry, &|| false),
+                Err(DownloadError::LocalIo)
+            ),
+            "read errors must remain distinct from a mismatch"
+        );
+        assert_eq!(
+            fs::read_to_string(directory.join(".verified")).unwrap(),
+            marker
+        );
+    }
+
+    #[test]
     fn wbsec_same_size_substitution_is_refused_and_hashing_is_cancellable() {
         use std::io::Cursor;
         let root = root("wbsec-verify");

@@ -35,6 +35,12 @@ pub enum LocalLlmError {
     ModelMissing(String),
     #[error("model file corrupt: {0}; delete and re-download")]
     ModelCorrupt(String),
+    #[error("model files could not be read: {0}")]
+    ModelRead(String),
+    #[error("model verification exceeded the cold-start deadline")]
+    VerificationTimeout,
+    #[error("model verification cancelled")]
+    VerificationCancelled,
     #[error("llama-server did not become healthy before the start deadline")]
     StartTimeout,
     #[error("llama-server failed to start: {0}")]
@@ -101,6 +107,21 @@ pub async fn post_process(
     post_process_with_warning(manager, settings, transcript, |message| warn!("{message}")).await
 }
 
+struct VerificationCancellation {
+    manager: Arc<LocalLlmManager>,
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+    armed: bool,
+}
+impl Drop for VerificationCancellation {
+    fn drop(&mut self) {
+        if self.armed {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            self.manager.cancel_verification();
+        }
+    }
+}
+
 /// Calls the warning callback once when post-processing falls back to raw text.
 pub(crate) async fn post_process_with_warning(
     manager: Option<Arc<LocalLlmManager>>,
@@ -124,7 +145,18 @@ pub(crate) async fn post_process_with_warning(
     let settings = settings.clone();
     let transcript = transcript.to_string();
     let started = Instant::now();
-    match tokio::task::spawn_blocking(move || manager.process(&transcript, &settings)).await {
+    let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut cancellation = VerificationCancellation {
+        manager: manager.clone(),
+        cancelled: cancelled.clone(),
+        armed: true,
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        manager.process_with_cancel(&transcript, &settings, &cancelled)
+    })
+    .await;
+    cancellation.armed = false;
+    match result {
         Ok(Ok(text)) => {
             info!(
                 "local-llm: post-processing succeeded in {} ms ({} chars)",
@@ -156,7 +188,16 @@ pub fn warm_up_for_recording(app: &AppHandle) {
         return;
     }
     if let Some(manager) = app.try_state::<Arc<LocalLlmManager>>() {
-        manager.warm_up(&settings);
+        if let Some(recorder) = app.try_state::<Arc<AudioRecordingManager>>() {
+            let recorder = recorder.inner().clone();
+            let generation = recorder.cancel_generation();
+            manager.warm_up_with_cancel(
+                &settings,
+                Arc::new(move || recorder.was_cancelled_since(generation)),
+            );
+        } else {
+            manager.warm_up(&settings);
+        }
     }
 }
 
@@ -273,10 +314,119 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn fix1_verification_outcomes_preserve_raw_and_timeout_work_continues() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        };
+        use std::time::Duration;
+        for error in [
+            LocalLlmError::ModelRead("s1-mini-q4km".into()),
+            LocalLlmError::VerificationCancelled,
+        ] {
+            let mut h = harness();
+            let outcome = error.clone();
+            Arc::get_mut(&mut h.manager).unwrap().verify =
+                Arc::new(move |_, _, _| Err(outcome.clone()));
+            let warnings = Mutex::new(Vec::new());
+            let out = post_process_with_warning(
+                Some(h.manager.clone()),
+                &h.settings,
+                "every raw word survives",
+                |text| warnings.lock().unwrap().push(text.to_string()),
+            )
+            .await;
+            assert_eq!(out, None);
+            assert!(h.fake.lock().unwrap().requests.is_empty());
+            assert_eq!(h.fake.lock().unwrap().loads, 0);
+            assert!(warnings.lock().unwrap()[0].contains(&error.to_string()));
+            assert!(
+                !warnings.lock().unwrap()[0].contains("delete"),
+                "read and cancellation errors must not advise model deletion"
+            );
+        }
+        let mut h = harness();
+        let (resume, continue_hash) = std::sync::mpsc::channel();
+        let continue_hash = Mutex::new(continue_hash);
+        let (observed, after_timeout) = std::sync::mpsc::channel();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let manager = Arc::get_mut(&mut h.manager).unwrap();
+        manager.verification_timeout(Duration::from_millis(40));
+        manager.verify = Arc::new(move |_, _, cancelled| {
+            count.fetch_add(1, Ordering::SeqCst);
+            continue_hash
+                .lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            observed.send(cancelled()).unwrap();
+            Ok(true)
+        });
+        let warnings = Mutex::new(Vec::new());
+        let out = post_process_with_warning(
+            Some(h.manager.clone()),
+            &h.settings,
+            "every raw word survives",
+            |text| warnings.lock().unwrap().push(text.to_string()),
+        )
+        .await;
+        resume.send(()).unwrap();
+        assert_eq!(out, None);
+        assert!(warnings.lock().unwrap()[0].contains("deadline"));
+        assert!(!warnings.lock().unwrap()[0].contains("delete"));
+        assert!(
+            !after_timeout.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "normal raw fallback must leave the background hash running"
+        );
+        let recovered = post_process_with_warning(
+            Some(h.manager.clone()),
+            &h.settings,
+            "every raw word survives",
+            |_| {},
+        )
+        .await;
+        assert_eq!(recovered.as_deref(), Some("every raw word survives"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fix1_dropping_dictation_cleanup_cancels_its_background_hash() {
+        use std::time::Duration;
+        let mut h = harness();
+        let (entered, ready) = std::sync::mpsc::channel();
+        let (cancelled, observed) = std::sync::mpsc::channel();
+        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(move |_, _, is_cancelled| {
+            entered.send(()).unwrap();
+            for _ in 0..2000 {
+                if is_cancelled() {
+                    cancelled.send(()).unwrap();
+                    return Err(LocalLlmError::VerificationCancelled);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Ok(true)
+        });
+        let manager = h.manager.clone();
+        let settings = h.settings.clone();
+        let work = tokio::spawn(async move {
+            post_process_with_warning(Some(manager), &settings, "fixture raw words", |_| {}).await
+        });
+        ready.recv_timeout(Duration::from_secs(2)).unwrap();
+        work.abort();
+        let _ = work.await;
+        assert!(
+            observed.recv_timeout(Duration::from_secs(1)).is_ok(),
+            "dropping cleanup must cancel the active hash callback"
+        );
+        assert_eq!(h.fake.lock().unwrap().loads, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn wbsec_failed_model_verification_preserves_raw_dictation_and_reports_redownload() {
         use crate::actions::process_transcription_output_with_dependencies;
         let mut h = harness();
-        Arc::get_mut(&mut h.manager).unwrap().verify = |_, _| Ok(false);
+        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(|_, _, _| Ok(false));
         let raw = "Keep every word of the raw transcript.";
         let warnings = std::sync::Mutex::new(Vec::new());
         let processed = process_transcription_output_with_dependencies(

@@ -52,6 +52,15 @@ pub(super) struct Checks {
     pub(super) downloaded: fn(&Path, &catalog::ModelEntry) -> bool,
     pub(super) verify: ModelVerification,
 }
+impl Checks {
+    fn production() -> Self {
+        Self {
+            memory: super::memory_available,
+            downloaded: download::is_downloaded,
+            verify: verify_model,
+        }
+    }
+}
 struct Inner<B: Transport> {
     backend: B,
     lifecycle: Lifecycle,
@@ -91,7 +100,7 @@ fn verify_model(
 ) -> Result<bool, TtsError> {
     download::verify_model(root, entry, cancelled).map_err(|error| match error {
         download::DownloadError::Cancelled => TtsError::Cancelled,
-        _ => TtsError::NotDownloaded,
+        _ => TtsError::Read,
     })
 }
 
@@ -100,15 +109,7 @@ impl TtsManager {
         self.fork_with_backend(WorkerBackend::default())
     }
     pub fn new(config: ManagerConfig) -> Result<Arc<Self>, TtsError> {
-        Self::with_backend(
-            config,
-            WorkerBackend::default(),
-            Checks {
-                memory: super::memory_available,
-                downloaded: download::is_downloaded,
-                verify: verify_model,
-            },
-        )
+        Self::with_backend(config, WorkerBackend::default(), Checks::production())
     }
 }
 impl<B: Transport> TtsManager<B> {
@@ -1004,6 +1005,92 @@ mod tests {
     fn enough() -> Result<u64, TtsError> {
         Ok(handy_tts_core::memory::MIN_AVAILABLE_BYTES)
     }
+    #[cfg(unix)]
+    #[test]
+    fn fix1_tts_constructor_checks_real_bytes_and_distinguishes_read_errors() {
+        use std::os::unix::net::UnixListener;
+        let entry = catalog::entry("supertonic-3").unwrap();
+        for read_error in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = root.path().join(entry.id);
+            let path = directory.join(&entry.files[0].path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let _listener = if read_error {
+                Some(UnixListener::bind(&path).unwrap())
+            } else {
+                std::fs::File::create(&path)
+                    .unwrap()
+                    .set_len(entry.files[0].bytes)
+                    .unwrap();
+                None
+            };
+            std::fs::write(directory.join(".verified"), "preserve marker").unwrap();
+            let mut settings = config(RunOn::Cpu);
+            settings.root = root.path().to_path_buf();
+            let trace = Arc::new(Mutex::new(Trace::default()));
+            let manager = TtsManager::with_backend(
+                settings,
+                Fake {
+                    control: FakeControl::default(),
+                    trace: trace.clone(),
+                },
+                Checks {
+                    memory: enough,
+                    downloaded: |_, _| true,
+                    ..Checks::production()
+                },
+            )
+            .unwrap();
+            let expected = if read_error {
+                TtsError::Read
+            } else {
+                TtsError::NotDownloaded
+            };
+            assert_eq!(
+                manager.ensure(&selection()),
+                Err(expected),
+                "production TTS verifier must check bytes and preserve read errors"
+            );
+            assert!(trace.lock().unwrap().starts.is_empty());
+            if read_error {
+                assert_eq!(
+                    std::fs::read_to_string(directory.join(".verified")).unwrap(),
+                    "preserve marker"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fix1_tts_adapter_forwards_cancellation_into_real_hashing() {
+        use sha2::{Digest, Sha256};
+        let root = tempfile::tempdir().unwrap();
+        let mut entry = catalog::entry("supertonic-3").unwrap().clone();
+        entry.files.truncate(1);
+        let bytes = vec![5; 131072];
+        entry.files[0].bytes = bytes.len() as u64;
+        entry.files[0].sha256 = format!("{:x}", Sha256::digest(&bytes));
+        entry.bytes = entry.files.iter().map(|file| file.bytes).sum();
+        let path = root.path().join(entry.id).join(&entry.files[0].path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+        let checks = std::cell::Cell::new(0);
+        let caller_cancelled = std::cell::Cell::new(false);
+        let result = verify_model(root.path(), &entry, &|| {
+            checks.set(checks.get() + 1);
+            if checks.get() == 3 {
+                caller_cancelled.set(true);
+            }
+            caller_cancelled.get()
+        });
+        assert_eq!(
+            result,
+            Err(TtsError::Cancelled),
+            "TTS adapter must forward cancellation after hashing begins"
+        );
+        assert!(caller_cancelled.get());
+    }
+
     #[test]
     fn wbsec_cold_load_verifies_bytes_and_cancellation_before_backend() {
         let trace = Arc::new(Mutex::new(Trace::default()));
@@ -1024,8 +1111,26 @@ mod tests {
             trace.lock().unwrap().starts.is_empty(),
             "unverified bytes must never reach a loader"
         );
+        thread_local! {
+            static CALLER: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> = const { std::cell::RefCell::new(None) };
+        }
+        let caller = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        CALLER.with(|slot| *slot.borrow_mut() = Some(caller.clone()));
         let mut checks = model.checks.clone();
-        checks.verify = |_, _, _| Err(TtsError::Cancelled);
+        checks.verify = |_, _, cancelled| {
+            assert!(!cancelled());
+            CALLER.with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .unwrap()
+                    .store(true, Ordering::SeqCst)
+            });
+            assert!(
+                cancelled(),
+                "manager hash callback must observe changed caller cancellation"
+            );
+            Err(TtsError::Cancelled)
+        };
         let cancelled = TtsManager::with_backend(
             config(RunOn::Cpu),
             Fake {
@@ -1035,9 +1140,14 @@ mod tests {
             checks,
         )
         .unwrap();
-        assert_eq!(cancelled.ensure(&selection()), Err(TtsError::Cancelled));
+        assert_eq!(
+            cancelled.ensure_cancellable(&selection(), &caller),
+            Err(TtsError::Cancelled)
+        );
         assert!(trace.lock().unwrap().starts.is_empty());
+        CALLER.with(|slot| slot.borrow_mut().take());
     }
+
     #[test]
     fn submission_failure_after_worker_exit_retries_once() {
         for failures in [1, 2] {
