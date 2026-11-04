@@ -89,6 +89,7 @@ pub struct LocalLlmManager {
     cancel: Arc<AtomicBool>,
     kill_switch: Arc<dyn KillSwitch>,
     models_root: Option<PathBuf>,
+    pub(super) verify: fn(&Path, &ModelEntry) -> Result<bool, String>,
     hooks: ManagerHooks,
     config: ManagerConfig,
 }
@@ -123,6 +124,7 @@ impl LocalLlmManager {
             cancel: Arc::new(AtomicBool::new(false)),
             kill_switch,
             models_root,
+            verify: super::download::verify_model,
             hooks,
             config,
         }
@@ -348,6 +350,16 @@ impl LocalLlmManager {
             }
             warn!("local-llm: llama-server gone or model changed; restarting");
             self.stop_locked(inner);
+        }
+        if !(self.verify)(&path, entry).unwrap_or(false) {
+            let error = LocalLlmError::ModelCorrupt(entry.id.into());
+            self.set_state_for(
+                inner,
+                LocalLlmState::Unloaded,
+                Some(entry.id),
+                Some(error.to_string()),
+            );
+            return Err(error);
         }
         self.start_locked(inner, entry, path, settings)?;
         Ok(entry)
@@ -641,7 +653,7 @@ pub(crate) mod tests {
             }),
             on_status: Box::new(move |s| lock(&ev).push(s.clone())),
         };
-        let manager = Arc::new(LocalLlmManager::new(
+        let mut manager = LocalLlmManager::new(
             Box::new(FakeBackend(fake.clone())),
             Some(dir.path().to_path_buf()),
             hooks,
@@ -649,7 +661,9 @@ pub(crate) mod tests {
                 start_timeout: Duration::from_secs(2),
                 idle_tick: Duration::from_secs(3600),
             },
-        ));
+        );
+        manager.verify = |_, _| Ok(true);
+        let manager = Arc::new(manager);
         let mut settings = get_default_settings();
         settings.post_process_provider_id = LOCAL_LLM_PROVIDER_ID.to_string();
         settings.local_llm_model_id = Some(entry.id.to_string());

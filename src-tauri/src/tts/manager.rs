@@ -43,9 +43,14 @@ pub struct ManagerSnapshot {
     pub ready: Option<WorkerReady>,
     pub fallback_from: Option<Device>,
 }
+type ModelVerification =
+    fn(&Path, &catalog::ModelEntry, &dyn Fn() -> bool) -> Result<bool, TtsError>;
+
+#[derive(Clone)]
 pub(super) struct Checks {
     pub(super) memory: fn() -> Result<u64, TtsError>,
     pub(super) downloaded: fn(&Path, &catalog::ModelEntry) -> bool,
+    pub(super) verify: ModelVerification,
 }
 struct Inner<B: Transport> {
     backend: B,
@@ -79,6 +84,17 @@ pub struct TtsManager<B: Transport = WorkerBackend> {
     idle_events: Mutex<Option<mpsc::Receiver<()>>>,
     status_changed: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
+fn verify_model(
+    root: &Path,
+    entry: &catalog::ModelEntry,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<bool, TtsError> {
+    download::verify_model(root, entry, cancelled).map_err(|error| match error {
+        download::DownloadError::Cancelled => TtsError::Cancelled,
+        _ => TtsError::NotDownloaded,
+    })
+}
+
 impl TtsManager {
     pub fn fork(&self) -> Result<Arc<Self>, TtsError> {
         self.fork_with_backend(WorkerBackend::default())
@@ -90,6 +106,7 @@ impl TtsManager {
             Checks {
                 memory: super::memory_available,
                 downloaded: download::is_downloaded,
+                verify: verify_model,
             },
         )
     }
@@ -170,6 +187,7 @@ impl<B: Transport> TtsManager<B> {
             Checks {
                 memory: self.checks.memory,
                 downloaded: self.checks.downloaded,
+                verify: self.checks.verify,
             },
             self.invalid.clone(),
         )
@@ -384,6 +402,14 @@ impl<B: Transport> TtsManager<B> {
             inner.key = None;
             inner.lifecycle.stopped();
             self.publish(State::Unloaded, Preparation::Idle);
+        }
+        if !(self.checks.verify)(&inner.config.root, entry, &interrupted)? {
+            log::warn!(
+                "TTS worker start refused: {}: {}",
+                entry.id,
+                TtsError::NotDownloaded
+            );
+            return Err(TtsError::NotDownloaded);
         }
         let config = inner.config.clone();
         let choice = config.run_on.get(entry.id).copied().unwrap_or_default();
@@ -970,12 +996,47 @@ mod tests {
             Checks {
                 memory,
                 downloaded: |_, _| true,
+                verify: |_, _, _| Ok(true),
             },
         )
         .unwrap()
     }
     fn enough() -> Result<u64, TtsError> {
         Ok(handy_tts_core::memory::MIN_AVAILABLE_BYTES)
+    }
+    #[test]
+    fn wbsec_cold_load_verifies_bytes_and_cancellation_before_backend() {
+        let trace = Arc::new(Mutex::new(Trace::default()));
+        let model = manager(RunOn::Cpu, trace.clone(), enough);
+        let mut checks = model.checks.clone();
+        checks.verify = |_, _, _| Ok(false);
+        let model = TtsManager::with_backend(
+            config(RunOn::Cpu),
+            Fake {
+                control: FakeControl::default(),
+                trace: trace.clone(),
+            },
+            checks,
+        )
+        .unwrap();
+        assert_eq!(model.ensure(&selection()), Err(TtsError::NotDownloaded));
+        assert!(
+            trace.lock().unwrap().starts.is_empty(),
+            "unverified bytes must never reach a loader"
+        );
+        let mut checks = model.checks.clone();
+        checks.verify = |_, _, _| Err(TtsError::Cancelled);
+        let cancelled = TtsManager::with_backend(
+            config(RunOn::Cpu),
+            Fake {
+                control: FakeControl::default(),
+                trace: trace.clone(),
+            },
+            checks,
+        )
+        .unwrap();
+        assert_eq!(cancelled.ensure(&selection()), Err(TtsError::Cancelled));
+        assert!(trace.lock().unwrap().starts.is_empty());
     }
     #[test]
     fn submission_failure_after_worker_exit_retries_once() {
@@ -1022,6 +1083,7 @@ mod tests {
             Checks {
                 memory: || Ok(8 * 1024 * 1024 * 1024),
                 downloaded: |_, _| true,
+                verify: |_, _, _| Ok(true),
             },
         )
         .unwrap()
@@ -1087,6 +1149,7 @@ mod tests {
             Checks {
                 memory: enough,
                 downloaded: |_, _| false,
+                verify: |_, _, _| Ok(true),
             },
         )
         .unwrap();
@@ -1200,6 +1263,7 @@ for line in sys.stdin:
                 Checks {
                     memory: enough,
                     downloaded: |_, _| true,
+                    verify: |_, _, _| Ok(true),
                 },
             )
             .unwrap();
@@ -1275,6 +1339,7 @@ for line in sys.stdin:
             Checks {
                 memory: enough,
                 downloaded: |_, _| true,
+                verify: |_, _, _| Ok(true),
             },
         )
         .unwrap();
@@ -1966,6 +2031,7 @@ for line in sys.stdin:
             Checks {
                 memory: enough,
                 downloaded: |_, _| true,
+                verify: |_, _, _| Ok(true),
             },
         )
         .unwrap();

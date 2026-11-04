@@ -187,18 +187,51 @@ impl Transport for HttpTransport {
 }
 /// Verifies both the exact byte count and SHA-256 of a downloaded file.
 pub fn verify(path: &Path, file: &ModelFile) -> Result<bool, DownloadError> {
+    verify_with_cancel(path, file, &|| false)
+}
+
+/// Verifies an artifact while checking cancellation between 64 KiB read blocks.
+pub fn verify_with_cancel(
+    path: &Path,
+    file: &ModelFile,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<bool, DownloadError> {
+    verify_artifact(path, file.bytes, &file.sha256, cancelled)
+}
+
+/// Checks current artifact bytes against a compiled size and SHA-256.
+pub fn verify_artifact(
+    path: &Path,
+    bytes: u64,
+    sha256: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<bool, DownloadError> {
+    if cancelled() {
+        return Err(DownloadError::Cancelled);
+    }
     let mut reader = match File::open(path) {
         Ok(reader) => reader,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(_) => return Err(DownloadError::LocalIo),
     };
     let metadata = reader.metadata().map_err(|_| DownloadError::LocalIo)?;
-    if !metadata.is_file() || metadata.len() != file.bytes {
+    if !metadata.is_file() || metadata.len() != bytes {
         return Ok(false);
     }
+    verify_reader(&mut reader, sha256, cancelled)
+}
+
+fn verify_reader(
+    reader: &mut impl Read,
+    sha256: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<bool, DownloadError> {
     let mut digest = Sha256::new();
     let mut buffer = [0u8; 65536];
     loop {
+        if cancelled() {
+            return Err(DownloadError::Cancelled);
+        }
         let size = reader
             .read(&mut buffer)
             .map_err(|_| DownloadError::LocalIo)?;
@@ -207,8 +240,24 @@ pub fn verify(path: &Path, file: &ModelFile) -> Result<bool, DownloadError> {
         }
         digest.update(&buffer[..size]);
     }
-    Ok(format!("{:x}", digest.finalize()) == file.sha256)
+    Ok(format!("{:x}", digest.finalize()) == sha256)
 }
+
+/// Rehashes every required model artifact before a cold load.
+pub fn verify_model(
+    root: &Path,
+    entry: &ModelEntry,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<bool, DownloadError> {
+    for file in &entry.files {
+        if !verify_with_cancel(&root.join(entry.id).join(&file.path), file, cancelled)? {
+            remove_file_if_present(&root.join(entry.id).join(".verified"))?;
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn fingerprint(entry: &ModelEntry) -> String {
     const VERSION: &str = "handy-tts-manifest-v1";
     let mut files: Vec<_> = entry
@@ -494,6 +543,55 @@ mod tests {
         .collect();
         entry.bytes = entry.files.iter().map(|file| file.bytes).sum();
         entry
+    }
+    #[test]
+    fn wbsec_same_size_substitution_is_refused_and_hashing_is_cancellable() {
+        use std::io::Cursor;
+        let root = root("wbsec-verify");
+        let entry = fixture();
+        let file = &entry.files[0];
+        let path = root.join(&file.path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"WRONG!").unwrap();
+        assert!(!verify_with_cancel(&path, file, &|| false).unwrap());
+        let directory = root.join(entry.id);
+        std::fs::create_dir_all(directory.join("voices")).unwrap();
+        std::fs::write(directory.join("public.bin"), b"public").unwrap();
+        std::fs::write(directory.join("voices/alba.bin"), b"voice").unwrap();
+        std::fs::write(directory.join(".verified"), fingerprint(&entry)).unwrap();
+        assert!(verify_model(&root, &entry, &|| false).unwrap());
+        std::fs::write(directory.join("voices/alba.bin"), b"WRONG").unwrap();
+        assert!(is_downloaded(&root, &entry));
+        assert!(!verify_model(&root, &entry, &|| false).unwrap());
+        assert!(
+            !is_downloaded(&root, &entry),
+            "substitution must require a re-download"
+        );
+        let cancel = std::cell::Cell::new(false);
+        struct CancellingReader<'a> {
+            bytes: Cursor<Vec<u8>>,
+            cancel: &'a std::cell::Cell<bool>,
+        }
+        impl Read for CancellingReader<'_> {
+            fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+                let size = self.bytes.read(out)?;
+                self.cancel.set(true);
+                Ok(size)
+            }
+        }
+        let mut reader = CancellingReader {
+            bytes: Cursor::new(vec![0; 131072]),
+            cancel: &cancel,
+        };
+        assert!(matches!(
+            verify_reader(&mut reader, "unused", &|| cancel.get()),
+            Err(DownloadError::Cancelled)
+        ));
+        assert_eq!(
+            reader.bytes.position(),
+            65536,
+            "hashing must stop between read blocks"
+        );
     }
     #[test]
     fn gated_http_download_requires_token_resumes_public_and_never_exposes_secret() {

@@ -40,11 +40,17 @@ pub fn partial_path(final_path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Present with the registry size (the full hash is checked only after download).
+/// Present with the registry size; UI queries do not hash the file.
 pub fn is_downloaded(models_root: &Path, entry: &ModelEntry) -> bool {
     std::fs::metadata(registry::model_path(models_root, entry))
         .map(|m| m.len() == entry.size_bytes)
         .unwrap_or(false)
+}
+
+/// Hashes a model file against the compiled registry, without exposing its path.
+pub(super) fn verify_model(path: &Path, entry: &ModelEntry) -> Result<bool, String> {
+    handy_tts_core::download::verify_artifact(path, entry.size_bytes, entry.sha256, &|| false)
+        .map_err(|_| format!("cannot verify {}; delete and re-download", entry.id))
 }
 
 /// Resumes a partial, deletes size/hash mismatches, and renames verified bytes into place.
@@ -56,6 +62,16 @@ pub async fn download(
     let _claim = InFlight::claim(entry.id)?;
     let final_path = registry::model_path(models_root, entry);
     if is_downloaded(models_root, entry) {
+        let path = final_path.clone();
+        let valid = tokio::task::spawn_blocking(move || verify_model(&path, entry))
+            .await
+            .map_err(|_| format!("cannot verify {}", entry.id))??;
+        if !valid {
+            return Err(format!(
+                "model file corrupt: {}; delete and re-download",
+                entry.id
+            ));
+        }
         return Ok(final_path);
     }
     let dir = final_path
@@ -124,6 +140,28 @@ mod tests {
                 "download errors must not expose private paths"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn wbsec_preplaced_same_size_gguf_cannot_take_download_fast_path() {
+        static ENTRY: ModelEntry = ModelEntry {
+            id: "wbsec-gguf",
+            size_bytes: 6,
+            sha256: "efa1f375d76194fa51a3556a97e641e61685f914d446979da50a551a4333ffd7",
+            ..registry::MODELS[0]
+        };
+        let root = tempfile::tempdir().unwrap();
+        let path = registry::model_path(root.path(), &ENTRY);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"WRONG!").unwrap();
+        assert!(is_downloaded(root.path(), &ENTRY));
+        assert!(!verify_model(&path, &ENTRY).unwrap());
+        let error = download(root.path(), &ENTRY, &|_| {}).await.unwrap_err();
+        assert!(error.contains("re-download"));
+        assert!(!error.contains(&root.path().display().to_string()));
+        std::fs::write(&path, b"public").unwrap();
+        assert!(verify_model(&path, &ENTRY).unwrap());
+        assert_eq!(download(root.path(), &ENTRY, &|_| {}).await.unwrap(), path);
     }
 
     #[test]

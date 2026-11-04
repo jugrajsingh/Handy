@@ -33,7 +33,7 @@ pub enum LocalLlmError {
     BinaryMissing(String),
     #[error("model file missing: {0}")]
     ModelMissing(String),
-    #[error("model file corrupt: {0}")]
+    #[error("model file corrupt: {0}; delete and re-download")]
     ModelCorrupt(String),
     #[error("llama-server did not become healthy before the start deadline")]
     StartTimeout,
@@ -272,6 +272,37 @@ mod tests {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn wbsec_failed_model_verification_preserves_raw_dictation_and_reports_redownload() {
+        use crate::actions::process_transcription_output_with_dependencies;
+        let mut h = harness();
+        Arc::get_mut(&mut h.manager).unwrap().verify = |_, _| Ok(false);
+        let raw = "Keep every word of the raw transcript.";
+        let warnings = std::sync::Mutex::new(Vec::new());
+        let processed = process_transcription_output_with_dependencies(
+            raw,
+            true,
+            || h.settings.clone(),
+            |_, _| std::future::ready(None),
+            |settings, text| {
+                let manager = h.manager.clone();
+                let warnings = &warnings;
+                async move {
+                    post_process_with_warning(Some(manager), &settings, &text, |message| {
+                        warnings.lock().unwrap().push(message.to_string())
+                    })
+                    .await
+                }
+            },
+        )
+        .await;
+        assert_eq!(processed.final_text, raw);
+        assert!(processed.post_processed_text.is_none());
+        assert!(h.fake.lock().unwrap().requests.is_empty());
+        assert_eq!(h.fake.lock().unwrap().loads, 0);
+        assert!(warnings.lock().unwrap()[0].contains("re-download"));
+        assert!(h.manager.status().error.unwrap().contains("re-download"));
+    }
     #[tokio::test(flavor = "multi_thread")]
     async fn a_successful_local_run_returns_the_text() {
         let h = harness();
