@@ -22,7 +22,7 @@ impl Owners {
         }
     }
     fn active(&self) -> bool {
-        self.dictation || self.reading
+        self.reading || (!cfg!(target_os = "linux") && self.dictation)
     }
 }
 
@@ -152,6 +152,18 @@ mod tests {
     }
 
     #[test]
+    fn wbfix_linux_dictation_does_not_register_cancel() {
+        let mut owners = Owners::default();
+        owners.set(Owner::Dictation, true);
+        assert_eq!(owners.active(), !cfg!(target_os = "linux"));
+        owners.set(Owner::Reading, true);
+        assert!(owners.active());
+        owners.set(Owner::Dictation, false);
+        assert!(owners.active());
+        owners.set(Owner::Reading, false);
+        assert!(!owners.active());
+    }
+    #[test]
     fn fix1_reading_cancel_registration_survives_dictation_ownership() {
         let native = Native {
             actions: RefCell::new(Vec::new()),
@@ -204,9 +216,19 @@ mod tests {
         .unwrap();
         assert_eq!(
             *native.actions.borrow(),
-            ["register:cancel", "unregister:cancel"]
+            if cfg!(target_os = "linux") {
+                vec![
+                    "register:cancel",
+                    "unregister:cancel",
+                    "register:cancel",
+                    "unregister:cancel",
+                ]
+            } else {
+                vec!["register:cancel", "unregister:cancel"]
+            }
         );
-        assert_eq!(fallback, [true, true, true, true, true, false]);
+        let dictation_only = !cfg!(target_os = "linux");
+        assert_eq!(fallback, [true, true, dictation_only, true, true, false]);
         assert!(registered.is_none());
     }
 }
