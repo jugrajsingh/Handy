@@ -32,10 +32,17 @@ pub trait Control: Clone + Send + Sync + 'static {
     }
 }
 fn read_worker_diagnostics(
-    reader: impl std::io::BufRead,
+    mut reader: impl std::io::BufRead,
     preparation: &Arc<Mutex<Option<handy_tts_core::device::Preparation>>>,
 ) {
-    for line in reader.lines().map_while(Result::ok) {
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&bytes);
         if let Some(json) = line.strip_prefix("HANDY_TTS_PROGRESS ") {
             if let Ok(value) = serde_json::from_str(json) {
                 *preparation.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
@@ -435,6 +442,36 @@ impl Transport for WorkerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn followup_worker_diagnostics_survive_invalid_utf8() {
+        use handy_tts_core::device::{Device, Preparation};
+        let progress = Arc::default();
+        read_worker_diagnostics(
+            std::io::Cursor::new(
+                b"bad byte \xff\nHANDY_TTS_PROGRESS {\"state\":\"ready\",\"device\":\"gpu\"}",
+            ),
+            &progress,
+        );
+        assert_eq!(
+            *progress.lock().unwrap(),
+            Some(Preparation::Ready {
+                device: Device::Gpu
+            }),
+            "invalid diagnostics must not stop progress parsing"
+        );
+        read_worker_diagnostics(std::io::Cursor::new(b"HANDY_TTS_PROGRESS {\"state\":\"preparing\",\"device\":\"gpu\",\"completed\":1,\"total\":2,\"graph\":\"graph-\xff\"}\n"), &progress);
+        assert_eq!(
+            *progress.lock().unwrap(),
+            Some(Preparation::Preparing {
+                device: Device::Gpu,
+                completed: 1,
+                total: 2,
+                graph: "graph-�".into()
+            }),
+            "progress strings must use lossy decoding"
+        );
+    }
+
     #[test]
     fn wbfix3_worker_diagnostics_do_not_log_private_output() {
         if std::env::var_os("HANDY_TEST_DIAGNOSTIC_LOG").is_none() {
