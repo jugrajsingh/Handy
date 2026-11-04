@@ -757,13 +757,8 @@ impl LocalLlmManager {
             Err(e) => {
                 inner.backend.unload();
                 inner.loaded = None;
-                let verification_used_budget = start_timeout < self.config.start_timeout;
-                if e == LocalLlmError::StartTimeout && verification_used_budget {
-                    inner.last_start_failure = None;
-                } else {
-                    inner.failed_starts += 1;
-                    inner.last_start_failure = Some((Instant::now(), e.clone()));
-                }
+                inner.failed_starts += 1;
+                inner.last_start_failure = Some((Instant::now(), e.clone()));
                 let next = if inner.failed_starts >= MAX_FAILED_STARTS {
                     LocalLlmState::Failed {
                         reason: e.to_string(),
@@ -1465,37 +1460,38 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn fix2_reduced_start_budget_timeout_is_not_sticky_or_inherited() {
-        let mut h = harness();
-        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(|_, _, _| {
-            std::thread::sleep(Duration::from_millis(20));
-            Ok(true)
-        });
-        lock(&h.fake)
-            .start_results
-            .push_back(Err(LocalLlmError::StartTimeout));
-        let concurrent_call_started = Instant::now();
-        assert_eq!(
-            h.manager.ensure_started(&h.settings),
-            Err(LocalLlmError::StartTimeout)
-        );
+    fn fix3_start_timeouts_reach_sticky_failed_without_another_spawn() {
+        let h = harness();
+        for _ in 0..=MAX_FAILED_STARTS {
+            lock(&h.fake)
+                .start_results
+                .push_back(Err(LocalLlmError::StartTimeout));
+        }
+        for _ in 0..MAX_FAILED_STARTS {
+            assert_eq!(
+                h.manager.ensure_started(&h.settings),
+                Err(LocalLlmError::StartTimeout)
+            );
+        }
         assert_eq!(
             lock(&h.manager.inner).failed_starts,
-            0,
-            "verification-reduced start timeout must not cost a failed-start strike"
+            MAX_FAILED_STARTS,
+            "every backend start timeout must count as a failed start"
         );
+        assert_eq!(state(&h), LocalLlmStateKind::Failed);
+        assert_eq!(lock(&h.fake).loads, MAX_FAILED_STARTS);
         assert!(
-            h.manager
-                .ready(
-                    &h.settings,
-                    concurrent_call_started,
-                    &AtomicBool::new(false),
-                    None
-                )
-                .is_ok(),
-            "concurrent dictation must not inherit a verification-reduced start timeout"
+            matches!(
+                h.manager.ensure_started(&h.settings),
+                Err(LocalLlmError::Failed(_))
+            ),
+            "exhausted start timeouts must stay Failed"
         );
-        assert_eq!(lock(&h.fake).loads, 2);
+        assert_eq!(
+            lock(&h.fake).loads,
+            MAX_FAILED_STARTS,
+            "Failed must not spawn another backend"
+        );
     }
 
     #[cfg(unix)]
@@ -1822,7 +1818,7 @@ pub(crate) mod tests {
     #[test]
     fn a_call_waiting_on_a_failing_start_gets_its_error_without_a_second_start() {
         let h = harness();
-        let failure = LocalLlmError::StartFailed("fixture start failure".into());
+        let failure = LocalLlmError::StartTimeout;
         {
             let mut s = lock(&h.fake);
             s.start_delay = Duration::from_millis(300);

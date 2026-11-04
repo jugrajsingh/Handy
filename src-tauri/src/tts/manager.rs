@@ -1042,7 +1042,7 @@ mod tests {
                 marker_path.clone()
             } else {
                 directory
-                    .join(&entry.files[0].path)
+                    .join("onnx/duration_predictor.onnx")
                     .parent()
                     .unwrap()
                     .to_path_buf()
