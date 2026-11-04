@@ -31,6 +31,13 @@ const HEALTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 /// Retry an early child exit once with a new port.
 const SPAWN_ATTEMPTS: u32 = 2;
 
+fn binary_file_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// `HANDY_LLAMA_SERVER` if set and non-empty, else the installed binary.
 pub fn resolve_binary(
     env_value: Option<OsString>,
@@ -43,9 +50,7 @@ pub fn resolve_binary(
     if candidate.is_file() {
         Ok(candidate)
     } else {
-        Err(LocalLlmError::BinaryMissing(
-            candidate.display().to_string(),
-        ))
+        Err(LocalLlmError::BinaryMissing(binary_file_name(&candidate)))
     }
 }
 
@@ -381,7 +386,7 @@ impl LlamaServerBackend {
             Err(e) => {
                 return StartOutcome::Error(LocalLlmError::StartFailed(format!(
                     "spawn {}: {e}",
-                    binary.display()
+                    binary_file_name(binary)
                 )))
             }
         };
@@ -662,9 +667,7 @@ mod tests {
         );
         assert_eq!(
             resolve_binary(Some(OsString::new()), &installed),
-            Err(LocalLlmError::BinaryMissing(
-                installed.display().to_string()
-            ))
+            Err(LocalLlmError::BinaryMissing("installed".into()))
         );
         assert!(matches!(
             resolve_binary(None, &installed),

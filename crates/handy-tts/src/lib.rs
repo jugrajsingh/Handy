@@ -15,6 +15,12 @@ use ort::{
     session::{Session, builder::GraphOptimizationLevel},
 };
 use std::path::Path;
+
+/// The final path component used in worker and measurement diagnostics.
+pub(crate) fn diagnostic_file_name(path: &Path) -> std::borrow::Cow<'_, str> {
+    path.file_name().unwrap_or_default().to_string_lossy()
+}
+
 fn ort_session(path: &Path, threads: usize) -> Result<Session> {
     Session::builder()
         .context("create ORT session builder")?
@@ -27,7 +33,7 @@ fn ort_session(path: &Path, threads: usize) -> Result<Session> {
         .with_execution_providers([CPUExecutionProvider::default().build()])
         .map_err(|e| anyhow::anyhow!(e.to_string()))?
         .commit_from_file(path)
-        .with_context(|| format!("load ONNX graph {}", path.display()))
+        .with_context(|| format!("load ONNX graph {}", diagnostic_file_name(path)))
 }
 
 /// Dispatches a validated native speed before any model inference.
@@ -137,3 +143,17 @@ impl Engine {
 }
 
 pub mod measure;
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn followup_diagnostics_use_only_the_file_name() {
+        for path in ["/private/fixture/model.onnx", "/another/root/model.onnx"] {
+            assert_eq!(
+                super::diagnostic_file_name(std::path::Path::new(path)),
+                "model.onnx",
+                "diagnostics must not expose parent directories"
+            );
+        }
+    }
+}

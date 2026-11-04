@@ -60,8 +60,8 @@ pub async fn download(
     }
     let dir = final_path
         .parent()
-        .ok_or_else(|| format!("bad model path {}", final_path.display()))?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        .ok_or_else(|| format!("bad model path for {}", entry.id))?;
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", entry.id))?;
     let partial = partial_path(&final_path);
     let completed = ModelManager::download_verified_artifact(
         entry.id,
@@ -77,9 +77,12 @@ pub async fn download(
     if !completed {
         return Err(format!("download of {} was cancelled", entry.id));
     }
-    std::fs::rename(&partial, &final_path)
-        .map_err(|e| format!("rename {}: {e}", partial.display()))?;
+    finish_download(&partial, &final_path, entry)?;
     Ok(final_path)
+}
+
+fn finish_download(partial: &Path, final_path: &Path, entry: &ModelEntry) -> Result<(), String> {
+    std::fs::rename(partial, final_path).map_err(|e| format!("rename {}: {e}", entry.id))
 }
 
 /// Removes `<models_root>/<id>/` (the caller unloads the model first).
@@ -88,13 +91,40 @@ pub fn delete(models_root: &Path, entry: &ModelEntry) -> Result<(), String> {
     match std::fs::remove_dir_all(&dir) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("delete {}: {e}", dir.display())),
+        Err(e) => Err(format!("delete {}: {e}", entry.id)),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn followup_download_errors_identify_model_not_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        static ENTRY: ModelEntry = ModelEntry {
+            id: "followup-download",
+            ..registry::MODELS[0]
+        };
+        let entry = &ENTRY;
+        let blocked_root = dir.path().join("blocked");
+        std::fs::write(&blocked_root, b"file").unwrap();
+        let create = download(&blocked_root, entry, &|_| {}).await.unwrap_err();
+        let final_path = registry::model_path(dir.path(), entry);
+        let rename = finish_download(&partial_path(&final_path), &final_path, entry).unwrap_err();
+        std::fs::write(dir.path().join(entry.id), b"file").unwrap();
+        let delete = delete(dir.path(), entry).unwrap_err();
+        for error in [create, rename, delete] {
+            assert!(
+                error.contains(entry.id),
+                "download errors must identify the registry entry"
+            );
+            assert!(
+                !error.contains(&dir.path().display().to_string()),
+                "download errors must not expose private paths"
+            );
+        }
+    }
 
     #[test]
     fn partial_sits_next_to_the_final_file() {

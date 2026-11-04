@@ -396,7 +396,7 @@ pub fn run(
         )?;
         eprintln!(
             "FIRST_AUDIO model={id} device={device:?} input={} seconds={seconds:.6}",
-            path.display()
+            crate::diagnostic_file_name(path)
         );
         first_audio.push(seconds);
     }

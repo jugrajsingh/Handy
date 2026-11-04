@@ -301,17 +301,12 @@ impl LocalLlmManager {
         let root = self
             .models_root
             .as_deref()
-            .ok_or_else(|| LocalLlmError::ModelMissing("app data directory unknown".into()))?;
+            .ok_or_else(|| LocalLlmError::ModelMissing(entry.id.into()))?;
         let path = registry::model_path(root, entry);
-        let meta = std::fs::metadata(&path)
-            .map_err(|_| LocalLlmError::ModelMissing(path.display().to_string()))?;
+        let meta =
+            std::fs::metadata(&path).map_err(|_| LocalLlmError::ModelMissing(entry.id.into()))?;
         if meta.len() != entry.size_bytes {
-            return Err(LocalLlmError::ModelCorrupt(format!(
-                "{} is {} bytes, expected {}",
-                path.display(),
-                meta.len(),
-                entry.size_bytes
-            )));
+            return Err(LocalLlmError::ModelCorrupt(entry.id.into()));
         }
         Ok(path)
     }
@@ -669,6 +664,24 @@ pub(crate) mod tests {
             model_file,
             _dir: dir,
         }
+    }
+
+    #[test]
+    fn followup_model_errors_carry_entry_id() {
+        let h = harness();
+        let entry = registry::find("s1-mini-q4km").unwrap();
+        std::fs::remove_file(&h.model_file).unwrap();
+        assert_eq!(
+            h.manager.model_file(entry),
+            Err(LocalLlmError::ModelMissing(entry.id.into())),
+            "missing model must identify the registry entry"
+        );
+        std::fs::File::create(&h.model_file).unwrap();
+        assert_eq!(
+            h.manager.model_file(entry),
+            Err(LocalLlmError::ModelCorrupt(entry.id.into())),
+            "corrupt model must identify the registry entry"
+        );
     }
 
     fn state(h: &Harness) -> LocalLlmStateKind {

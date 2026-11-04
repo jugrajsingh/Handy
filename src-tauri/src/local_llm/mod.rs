@@ -160,6 +160,105 @@ mod tests {
     use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn followup_local_errors_do_not_log_private_paths() {
+        use super::backend::{BackendOpts, TextModelBackend};
+        use std::sync::Mutex;
+        if std::env::var_os("HANDY_TEST_LOCAL_PATH_LOG").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "local_llm::tests::followup_local_errors_do_not_log_private_paths",
+                    "--nocapture",
+                ])
+                .env("HANDY_TEST_LOCAL_PATH_LOG", "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "local model errors must not log private paths"
+            );
+            return;
+        }
+        struct Logs(Mutex<Vec<String>>);
+        impl log::Log for Logs {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                self.0.lock().unwrap().push(record.args().to_string());
+            }
+            fn flush(&self) {}
+        }
+        static LOGS: Logs = Logs(Mutex::new(Vec::new()));
+        log::set_logger(&LOGS).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+        let entry = registry::find("s1-mini-q4km").unwrap();
+        for corrupt in [false, true] {
+            let h = harness();
+            if corrupt {
+                std::fs::File::create(&h.model_file).unwrap();
+            } else {
+                std::fs::remove_file(&h.model_file).unwrap();
+            }
+            assert!(
+                post_process(Some(h.manager.clone()), &h.settings, "fixture transcript")
+                    .await
+                    .is_none()
+            );
+            let logs = LOGS.0.lock().unwrap();
+            assert!(logs.iter().any(|line| line.contains(entry.id)));
+            assert!(
+                logs.iter()
+                    .all(|line| !line
+                        .contains(&h.model_file.parent().unwrap().display().to_string())),
+                "local model errors must not log private paths"
+            );
+            drop(logs);
+            LOGS.0.lock().unwrap().clear();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("fixture-server");
+        let missing = llama_server::resolve_binary(None, &binary).unwrap_err();
+        std::fs::write(&binary, b"not executable").unwrap();
+        let model_path = dir.path().join("fixture.gguf");
+        let failed = tokio::task::spawn_blocking(move || {
+            let mut backend = llama_server::LlamaServerBackend::with_binary(binary);
+            backend
+                .ensure_loaded(
+                    entry,
+                    &BackendOpts {
+                        model_path,
+                        threads: 4,
+                        ctx: 4096,
+                        start_timeout: std::time::Duration::from_secs(2),
+                        cancel: Arc::default(),
+                    },
+                )
+                .unwrap_err()
+        })
+        .await
+        .unwrap();
+        for error in [missing, failed] {
+            let h = harness();
+            h.fake.lock().unwrap().start_results.push_back(Err(error));
+            assert!(
+                post_process(Some(h.manager.clone()), &h.settings, "fixture transcript")
+                    .await
+                    .is_none()
+            );
+            let logs = LOGS.0.lock().unwrap();
+            assert!(logs.iter().any(|line| line.contains("fixture-server")));
+            assert!(
+                logs.iter()
+                    .all(|line| !line.contains(&dir.path().display().to_string())),
+                "local model errors must not log private paths"
+            );
+            drop(logs);
+            LOGS.0.lock().unwrap().clear();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_successful_local_run_returns_the_text() {
         let h = harness();
         let out = post_process(Some(h.manager.clone()), &h.settings, "hello there friend").await;
