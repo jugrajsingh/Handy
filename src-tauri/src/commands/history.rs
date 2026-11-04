@@ -76,13 +76,17 @@ pub async fn get_history_clear_summary(
 #[specta::specta]
 pub async fn clear_history(
     history_manager: State<'_, Arc<HistoryManager>>,
+    jobs: State<'_, Arc<TranscriptionJobManager>>,
     keep_saved: bool,
 ) -> Result<HistoryClearSummary, String> {
     let manager = Arc::clone(history_manager.inner());
-    tauri::async_runtime::spawn_blocking(move || manager.clear_history(keep_saved))
-        .await
-        .map_err(|error| format!("History clear worker failed: {error}"))?
-        .map_err(|error| error.to_string())
+    let jobs = Arc::clone(jobs.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        manager.clear_history(keep_saved, |id| jobs.cancel(id))
+    })
+    .await
+    .map_err(|error| format!("History clear worker failed: {error}"))?
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]

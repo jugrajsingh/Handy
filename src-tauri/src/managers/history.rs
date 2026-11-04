@@ -570,9 +570,13 @@ impl HistoryManager {
         conn: &mut Connection,
         recordings_dir: &Path,
         keep_saved: bool,
+        mut cancel: impl FnMut(i64),
     ) -> Result<HistoryClearSummary> {
         Self::with_clear_transaction(conn, |transaction| {
             let entries = Self::clear_candidates(transaction, keep_saved)?;
+            for (id, _) in &entries {
+                cancel(*id);
+            }
             Self::delete_entries_and_files_with_conn(transaction, recordings_dir, &entries)
         })
     }
@@ -610,12 +614,17 @@ impl HistoryManager {
     }
 
     /// Clear a serialized snapshot of history and emit one update after commit.
-    pub fn clear_history(&self, keep_saved: bool) -> Result<HistoryClearSummary> {
+    pub fn clear_history(
+        &self,
+        keep_saved: bool,
+        cancel: impl FnMut(i64),
+    ) -> Result<HistoryClearSummary> {
         let mut conn = self.get_connection()?;
         Self::clear_history_and_notify_with_connection(
             &mut conn,
             &self.recordings_dir,
             keep_saved,
+            cancel,
             |event| {
                 if let Err(error) = event.emit(&self.app_handle) {
                     error!("Failed to emit cleared history event: {error}");
@@ -628,9 +637,11 @@ impl HistoryManager {
         conn: &mut Connection,
         recordings_dir: &Path,
         keep_saved: bool,
+        cancel: impl FnMut(i64),
         mut notify: impl FnMut(HistoryUpdatePayload),
     ) -> Result<HistoryClearSummary> {
-        let removed = Self::clear_history_with_connection(conn, recordings_dir, keep_saved)?;
+        let removed =
+            Self::clear_history_with_connection(conn, recordings_dir, keep_saved, cancel)?;
         notify(HistoryUpdatePayload::Cleared {});
         Ok(removed)
     }
@@ -900,6 +911,202 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         HistoryManager::apply_migrations(&mut conn).unwrap();
         conn
+    }
+
+    mod bulk_clear_jobs {
+        use super::*;
+        use crate::managers::transcription_jobs::{
+            execute_job, JobEnd, Jobs, TranscriptionJobStatus,
+        };
+        use std::cell::{Cell, RefCell};
+        use std::sync::atomic::Ordering;
+
+        #[test]
+        fn bulk_clear_cancels_only_removed_history_jobs() {
+            for (keep_saved, running_saved, new_after_snapshot) in [
+                (true, false, true),
+                (true, true, true),
+                (false, false, true),
+                (false, false, false),
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("history.db");
+                let mut conn = Connection::open(&path).unwrap();
+                HistoryManager::apply_migrations(&mut conn).unwrap();
+                let observer = Connection::open(&path).unwrap();
+                for timestamp in [100, 200, 300, 400] {
+                    insert_entry(&conn, timestamp, "pending", None);
+                    fs::write(dir.path().join(format!("handy-{timestamp}.wav")), b"audio").unwrap();
+                }
+                conn.execute(
+                    "UPDATE transcription_history SET saved = 1 WHERE id = 2",
+                    [],
+                )
+                .unwrap();
+                let jobs = RefCell::new(Jobs::default());
+                let model_active = Cell::new(false);
+                let running_id = if running_saved { 2 } else { 1 };
+                jobs.borrow_mut().queue(running_id, false);
+                let (_, cancelled) = jobs.borrow_mut().start_next().unwrap();
+                for id in [1, 2, 3, 4] {
+                    jobs.borrow_mut().queue(id, id == 4);
+                }
+                jobs.borrow().sync_active(|active| model_active.set(active));
+                assert!(model_active.get());
+                let expected = if keep_saved {
+                    vec![1, 3, 4]
+                } else {
+                    vec![1, 2, 3, 4]
+                };
+                let mut cancelled_ids = Vec::new();
+                let mut events = Vec::new();
+                let removed = HistoryManager::clear_history_and_notify_with_connection(
+                    &mut conn,
+                    dir.path(),
+                    keep_saved,
+                    |id| {
+                        for &candidate in &expected {
+                            let exists: bool = observer.query_row(
+                                "SELECT EXISTS(SELECT 1 FROM transcription_history WHERE id = ?1)",
+                                [candidate], |row| row.get(0),
+                            ).unwrap();
+                            assert!(exists, "all cancellation must precede row deletion");
+                            assert!(
+                                dir.path()
+                                    .join(format!("handy-{}.wav", candidate * 100))
+                                    .exists(),
+                                "all cancellation must precede file deletion"
+                            );
+                        }
+                        cancelled_ids.push(id);
+                        let mut jobs = jobs.borrow_mut();
+                        jobs.cancel(id);
+                        jobs.sync_active(|active| model_active.set(active));
+                    },
+                    |event| {
+                        assert!(matches!(event, HistoryUpdatePayload::Cleared {}));
+                        let rows: usize = observer
+                            .query_row("SELECT COUNT(*) FROM transcription_history", [], |row| {
+                                row.get(0)
+                            })
+                            .unwrap();
+                        assert_eq!(rows, usize::from(keep_saved), "notify follows commit");
+                        // A file import can commit and queue as soon as Clear releases its transaction.
+                        if new_after_snapshot {
+                            insert_entry(&observer, 500, "new import", None);
+                            fs::write(dir.path().join("handy-500.wav"), b"new audio").unwrap();
+                            assert_eq!(observer.last_insert_rowid(), 5);
+                            jobs.borrow_mut().queue(5, false);
+                            jobs.borrow().sync_active(|active| model_active.set(active));
+                        }
+                        events.push(event);
+                    },
+                )
+                .unwrap();
+                assert_eq!(
+                    cancelled_ids, expected,
+                    "bulk clear must cancel exactly its deletion snapshot"
+                );
+                assert_eq!(removed.entries, expected.len());
+                assert_eq!(removed.recordings, expected.len());
+                assert_eq!(events.len(), 1);
+                assert_eq!(
+                    cancelled.load(Ordering::Acquire),
+                    !running_saved || !keep_saved,
+                    "bulk clear must cancel a removed running job and preserve a saved running job"
+                );
+                assert!(
+                    model_active.get(),
+                    "a running job holds the model until it acknowledges cancellation"
+                );
+
+                let mut notices = Vec::new();
+                let mut executed = Vec::new();
+                let mut next = Some((running_id, cancelled));
+                while let Some((id, cancelled)) = next {
+                    executed.push(id);
+                    let status = execute_job(
+                        id,
+                        &cancelled,
+                        || {
+                            // An in-flight chunk may finish with a missing-row error after deliberate deletion.
+                            HistoryManager::update_transcription_with_conn(
+                                &conn,
+                                id,
+                                "completed".into(),
+                                None,
+                                None,
+                                None,
+                            )?;
+                            assert!(dir.path().join(format!("handy-{}.wav", id * 100)).is_file());
+                            Ok(JobEnd::Finished {
+                                post_process_failed: false,
+                            })
+                        },
+                        || {
+                            jobs.borrow_mut().finish(|active| model_active.set(active));
+                        },
+                        |notice| {
+                            if let Some(notice) = notice {
+                                notices.push(notice);
+                            }
+                        },
+                    );
+                    assert_eq!(
+                        status,
+                        TranscriptionJobStatus::Finished,
+                        "deliberate deletion must finish without FileTranscriptionFailed"
+                    );
+                    let has_remaining = if id == running_id {
+                        keep_saved && !running_saved || new_after_snapshot
+                    } else {
+                        id == 2 && new_after_snapshot
+                    };
+                    assert_eq!(
+                        model_active.get(),
+                        has_remaining,
+                        "the model lock must release after the final surviving job finishes"
+                    );
+                    next = jobs.borrow_mut().start_next();
+                    if let Some((id, flag)) = &next {
+                        assert!(
+                            keep_saved && *id == 2 || *id == 5,
+                            "removed queued jobs must never execute"
+                        );
+                        assert!(
+                            !flag.load(Ordering::Acquire),
+                            "saved and new jobs must stay uncancelled"
+                        );
+                    }
+                }
+                let mut expected_executed = vec![running_id];
+                if keep_saved && !running_saved {
+                    expected_executed.push(2);
+                }
+                if new_after_snapshot {
+                    expected_executed.push(5);
+                }
+                assert_eq!(executed, expected_executed);
+                assert!(
+                    notices.is_empty(),
+                    "intentional deletion must raise no failure notice"
+                );
+                assert!(!model_active.get(), "all jobs must release the model lock");
+                for id in expected_executed
+                    .into_iter()
+                    .filter(|id| !expected.contains(id))
+                {
+                    let text: String = conn
+                        .query_row(
+                            "SELECT transcription_text FROM transcription_history WHERE id = ?1",
+                            [id],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(text, "completed", "surviving jobs must finish successfully");
+                }
+            }
+        }
     }
 
     #[test]
@@ -1185,6 +1392,7 @@ mod tests {
             &mut conn,
             dir.path(),
             true,
+            |_| {},
             |event| {
                 assert!(matches!(event, HistoryUpdatePayload::Cleared {}));
                 let committed_rows: usize = observer
@@ -1214,6 +1422,7 @@ mod tests {
             &mut conn,
             dir.path(),
             true,
+            |_| {},
             |event| events.push(event),
         );
         assert_eq!(failed.unwrap_err().to_string(), "blocked");
@@ -1226,6 +1435,7 @@ mod tests {
             &mut conn,
             dir.path(),
             true,
+            |_| {},
             |event| events.push(event),
         );
         assert_eq!(
@@ -1269,7 +1479,8 @@ mod tests {
             attempted_tx.send(!entered && busy).unwrap();
             committed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             conn.busy_timeout(Duration::from_secs(30)).unwrap();
-            HistoryManager::clear_history_with_connection(&mut conn, &recordings, true).unwrap()
+            HistoryManager::clear_history_with_connection(&mut conn, &recordings, true, |_| {})
+                .unwrap()
         });
         let mut blocked_after_read = false;
         let saved = HistoryManager::toggle_saved_status_with_conn_after_read(&mut conn, id, || {
@@ -1307,7 +1518,8 @@ mod tests {
         fs::write(dir.path().join("handy-100.wav"), b"audio").unwrap();
         fs::write(dir.path().join("handy-200.wav"), b"starred").unwrap();
         let removed =
-            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true).unwrap();
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true, |_| {})
+                .unwrap();
         assert_eq!(
             removed,
             HistoryClearSummary {
@@ -1324,7 +1536,8 @@ mod tests {
             .unwrap();
         assert_eq!(remaining, 1);
         let all =
-            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), false).unwrap();
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), false, |_| {})
+                .unwrap();
         assert_eq!(
             all,
             HistoryClearSummary {
@@ -1333,7 +1546,8 @@ mod tests {
             }
         );
         assert_eq!(
-            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true).unwrap(),
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true, |_| {})
+                .unwrap(),
             HistoryClearSummary::default()
         );
     }
@@ -1416,12 +1630,13 @@ mod tests {
         fs::write(dir.path().join("handy-100.wav"), b"audio").unwrap();
         assert!(HistoryManager::toggle_saved_status_with_conn(&mut conn, id).unwrap());
         assert_eq!(
-            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true).unwrap(),
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true, |_| {})
+                .unwrap(),
             HistoryClearSummary::default()
         );
         assert!(!HistoryManager::toggle_saved_status_with_conn(&mut conn, id).unwrap());
         assert_eq!(
-            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true)
+            HistoryManager::clear_history_with_connection(&mut conn, dir.path(), true, |_| {})
                 .unwrap()
                 .entries,
             1

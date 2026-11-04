@@ -56,7 +56,7 @@ struct Running {
 }
 
 #[derive(Default)]
-struct Jobs {
+pub(super) struct Jobs {
     /// Entry ids waiting to be transcribed again. They go before files:
     /// someone is waiting on them.
     retries: VecDeque<i64>,
@@ -66,6 +66,49 @@ struct Jobs {
 }
 
 impl Jobs {
+    pub(super) fn queue(&mut self, entry_id: i64, retry: bool) -> bool {
+        if self.has(entry_id) {
+            return false;
+        }
+        if retry {
+            self.retries.push_back(entry_id);
+        } else {
+            self.files.push_back(entry_id);
+        }
+        true
+    }
+
+    pub(super) fn start_next(&mut self) -> Option<(i64, Arc<AtomicBool>)> {
+        let entry_id = self
+            .retries
+            .pop_front()
+            .or_else(|| self.files.pop_front())?;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.running = Some(Running {
+            entry_id,
+            cancelled: Arc::clone(&cancelled),
+        });
+        Some((entry_id, cancelled))
+    }
+
+    pub(super) fn cancel(&mut self, entry_id: i64) -> bool {
+        let was_queued = self.unqueue(entry_id);
+        if let Some(running) = self.running.as_ref().filter(|r| r.entry_id == entry_id) {
+            running.cancelled.store(true, Ordering::Release);
+        }
+        was_queued
+    }
+
+    pub(super) fn sync_active(&self, set_active: impl FnOnce(bool)) {
+        set_active(!self.is_idle());
+    }
+
+    pub(super) fn finish(&mut self, set_active: impl FnOnce(bool)) -> bool {
+        self.running = None;
+        self.sync_active(set_active);
+        self.is_idle()
+    }
+
     fn has(&self, entry_id: i64) -> bool {
         self.running
             .as_ref()
@@ -171,13 +214,8 @@ impl TranscriptionJobManager {
     fn queue(&self, entry_id: i64, retry: bool) {
         {
             let mut jobs = self.lock();
-            if jobs.has(entry_id) {
+            if !jobs.queue(entry_id, retry) {
                 return;
-            }
-            if retry {
-                jobs.retries.push_back(entry_id);
-            } else {
-                jobs.files.push_back(entry_id);
             }
             self.sync_job_active(&jobs);
         }
@@ -191,10 +229,7 @@ impl TranscriptionJobManager {
     pub fn cancel(&self, entry_id: i64) {
         let (was_queued, idle) = {
             let mut jobs = self.lock();
-            let was_queued = jobs.unqueue(entry_id);
-            if let Some(running) = jobs.running.as_ref().filter(|r| r.entry_id == entry_id) {
-                running.cancelled.store(true, Ordering::Release);
-            }
+            let was_queued = jobs.cancel(entry_id);
             self.sync_job_active(&jobs);
             (was_queued, jobs.is_idle())
         };
@@ -213,9 +248,11 @@ impl TranscriptionJobManager {
 
     /// Keeps the model held for as long as any job is queued or running.
     fn sync_job_active(&self, jobs: &Jobs) {
-        self.app
-            .state::<Arc<TranscriptionManager>>()
-            .set_job_active(!jobs.is_idle());
+        jobs.sync_active(|active| {
+            self.app
+                .state::<Arc<TranscriptionManager>>()
+                .set_job_active(active);
+        });
     }
 
     fn emit(&self, entry_id: i64, status: TranscriptionJobStatus) {
@@ -228,72 +265,40 @@ impl TranscriptionJobManager {
         loop {
             let (entry_id, cancelled) = {
                 let mut jobs = self.lock();
-                let entry_id = loop {
-                    if let Some(entry_id) =
-                        jobs.retries.pop_front().or_else(|| jobs.files.pop_front())
-                    {
-                        break entry_id;
+                loop {
+                    if let Some(job) = jobs.start_next() {
+                        break job;
                     }
                     jobs = self
                         .wake
                         .wait(jobs)
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
-                };
-                let cancelled = Arc::new(AtomicBool::new(false));
-                jobs.running = Some(Running {
-                    entry_id,
-                    cancelled: Arc::clone(&cancelled),
-                });
-                (entry_id, cancelled)
+                }
             };
             self.emit(entry_id, TranscriptionJobStatus::Running { percent: 0 });
 
             // A panic fails only this job; the rest of the loop still has to
             // run, or the model would stay held and the queue stuck.
-            let result = catch_unwind(AssertUnwindSafe(|| self.run_job(entry_id, &cancelled)))
-                .unwrap_or_else(|payload| Err(crashed(payload.as_ref())));
-
-            let idle = {
-                let mut jobs = self.lock();
-                jobs.running = None;
-                self.sync_job_active(&jobs);
-                jobs.is_idle()
-            };
-            let tm = self.app.state::<Arc<TranscriptionManager>>();
-            if idle {
-                // A dictation under way unloads the model itself when it ends.
-                if !crate::tray::dictation_in_progress(&self.app) {
-                    tm.maybe_unload_immediately("background transcription");
-                }
-                crate::tray::update_tray_menu(&self.app);
-            }
-            let status = match result {
-                Err(e) if !cancelled.load(Ordering::Acquire) => {
-                    warn!("Transcription of history entry {} failed: {}", entry_id, e);
-                    notices::raise(
-                        &self.app,
-                        Notice::new(NoticeCode::FileTranscriptionFailed, NoticeSource::File)
-                            .with_detail(e.to_string()),
-                    );
-                    TranscriptionJobStatus::Failed {
-                        error: e.to_string(),
+            let status = execute_job(
+                entry_id,
+                &cancelled,
+                || self.run_job(entry_id, &cancelled),
+                || {
+                    let tm = self.app.state::<Arc<TranscriptionManager>>();
+                    let idle = self.lock().finish(|active| tm.set_job_active(active));
+                    if idle {
+                        // A dictation under way unloads the model itself when it ends.
+                        if !crate::tray::dictation_in_progress(&self.app) {
+                            tm.maybe_unload_immediately("background transcription");
+                        }
+                        crate::tray::update_tray_menu(&self.app);
                     }
-                }
-                Ok(JobEnd::Finished {
-                    post_process_failed,
-                }) => {
-                    // Clear first, so the warning about this job survives it.
-                    notices::clear(&self.app, NoticeSource::File);
-                    if post_process_failed {
-                        notices::raise(
-                            &self.app,
-                            Notice::new(NoticeCode::FilePostProcessFailed, NoticeSource::File),
-                        );
-                    }
-                    TranscriptionJobStatus::Finished
-                }
-                _ => TranscriptionJobStatus::Finished,
-            };
+                },
+                |notice| match notice {
+                    Some(notice) => notices::raise(&self.app, notice),
+                    None => notices::clear(&self.app, NoticeSource::File),
+                },
+            );
             self.emit(entry_id, status);
         }
     }
@@ -351,9 +356,47 @@ impl TranscriptionJobManager {
 }
 
 /// A cancelled job changes no notices.
-enum JobEnd {
+pub(super) enum JobEnd {
     Finished { post_process_failed: bool },
     Cancelled,
+}
+
+pub(super) fn execute_job(
+    entry_id: i64,
+    cancelled: &AtomicBool,
+    run: impl FnOnce() -> Result<JobEnd>,
+    finish: impl FnOnce(),
+    mut notify: impl FnMut(Option<Notice>),
+) -> TranscriptionJobStatus {
+    let result = catch_unwind(AssertUnwindSafe(run))
+        .unwrap_or_else(|payload| Err(crashed(payload.as_ref())));
+    finish();
+    match result {
+        Err(e) if !cancelled.load(Ordering::Acquire) => {
+            warn!("Transcription of history entry {} failed: {}", entry_id, e);
+            notify(Some(
+                Notice::new(NoticeCode::FileTranscriptionFailed, NoticeSource::File)
+                    .with_detail(e.to_string()),
+            ));
+            TranscriptionJobStatus::Failed {
+                error: e.to_string(),
+            }
+        }
+        Ok(JobEnd::Finished {
+            post_process_failed,
+        }) => {
+            // Clear first, so the warning about this job survives it.
+            notify(None);
+            if post_process_failed {
+                notify(Some(Notice::new(
+                    NoticeCode::FilePostProcessFailed,
+                    NoticeSource::File,
+                )));
+            }
+            TranscriptionJobStatus::Finished
+        }
+        _ => TranscriptionJobStatus::Finished,
+    }
 }
 
 /// Best-effort cleanup; the caller is already reporting the failure.
