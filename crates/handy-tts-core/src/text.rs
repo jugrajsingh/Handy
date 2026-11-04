@@ -36,6 +36,7 @@ struct Fragment<'a> {
     base: Option<usize>,
     inline: bool,
     html: bool,
+    html_exhausted: bool,
 }
 /// An incremental Markdown preparation and chunking cursor.
 pub struct TextCursor<'a> {
@@ -57,6 +58,8 @@ pub struct TextCursor<'a> {
     version: Regex,
     #[cfg(test)]
     work_units: usize,
+    #[cfg(test)]
+    html_scan_bytes: usize,
     #[cfg(test)]
     event_reads: std::rc::Rc<std::cell::Cell<usize>>,
 }
@@ -102,6 +105,8 @@ impl<'a> TextCursor<'a> {
             version: Regex::new(r"\bv([0-9]+\.[0-9]+\.[0-9]+)")?,
             #[cfg(test)]
             work_units: 0,
+            #[cfg(test)]
+            html_scan_bytes: 0,
             #[cfg(test)]
             event_reads,
         })
@@ -178,6 +183,7 @@ impl<'a> TextCursor<'a> {
             base,
             inline,
             html: false,
+            html_exhausted: false,
         });
     }
     fn finish_word(&mut self) -> Option<Piece> {
@@ -261,7 +267,18 @@ impl<'a> TextCursor<'a> {
                 f.offset += ch.len_utf8();
                 if f.html
                     && ch == '<'
-                    && let Some(end) = f.value[f.offset..].find('>')
+                    && !f.html_exhausted
+                    && let Some(end) = {
+                        #[cfg(test)]
+                        {
+                            self.html_scan_bytes += f.value[f.offset..]
+                                .find('>')
+                                .map_or(f.value.len() - f.offset, |end| end + 1);
+                        }
+                        let end = f.value[f.offset..].find('>');
+                        f.html_exhausted = end.is_none();
+                        end
+                    }
                 {
                     let tag = &f.value[f.offset..f.offset + end];
                     let source_end = f
@@ -806,6 +823,18 @@ mod fixes {
         let quoted =
             chunks(r#""A quoted sentence with enough characters ends here." More follows."#);
         assert_eq!(quoted[0].pause_ms, 280);
+    }
+    #[test]
+    fn hostile_html_scans_each_suffix_at_most_once() {
+        let source = format!("<div>\n{}\n", "<".repeat(200_000));
+        let mut cursor = TextCursor::streaming(&source, false).unwrap();
+        assert!(cursor.next_chunk().unwrap().is_some());
+        assert!(
+            cursor.html_scan_bytes <= source.len(),
+            "HTML scan inspected {} bytes for {} input bytes",
+            cursor.html_scan_bytes,
+            source.len()
+        );
     }
     #[test]
     fn html_and_footnote_markers_are_dropped() {
