@@ -435,16 +435,16 @@ const footerSource = readFileSync(
 );
 assert.ok(
   footerSource.includes(
-    'className="flex justify-between items-center gap-3 min-w-0 text-xs px-4 pb-3 text-text/60"',
+    'className="flex justify-between items-center gap-3 min-w-0 text-xs px-4 pb-3 text-ink-2"',
   ),
 );
 assert.ok(
-  /<div className="flex items-center gap-4 min-w-0 flex-1">\s*<ModelSelector \/>\s*<LocalLlmModelSelector/u.test(
+  /<div className="flex items-center gap-4 min-w-0 flex-1">\s*<ModelSelector \/>\s*<TranscriptionStatus onShowHistory=\{onShowHistory\} \/>\s*<LocalLlmModelSelector/u.test(
     footerSource,
   ),
 );
 assert.ok(
-  /<div className="flex items-center gap-1 shrink-0">\s*<UpdateChecker/u.test(
+  /<div className="flex items-center gap-3 shrink-0">\s*\{\/\* Update Status \*\/\}\s*<div className="flex items-center gap-1">\s*<UpdateChecker/u.test(
     footerSource,
   ),
 );
@@ -463,8 +463,6 @@ const transcriptionModel: ModelInfo = {
   is_downloaded: true,
   is_downloading: false,
   partial_size: 0,
-  is_directory: false,
-  engine_type: "TranscribeCpp",
   accuracy_score: 0,
   speed_score: 0,
   supports_translation: false,
@@ -505,7 +503,7 @@ assert.ok(transcriptionSizeLine, "transcription row has its own size line");
 assert.equal(transcriptionSizeLine[1], "1235 MiB");
 assert.ok(
   transcriptionRow.includes(
-    `<div class="text-xs text-text/40 italic pe-4">${transcriptionModel.description}</div>${transcriptionSizeLine[0]}`,
+    `<div class="text-xs text-ink-3 italic pe-4">${transcriptionModel.description}</div>${transcriptionSizeLine[0]}`,
   ),
   "transcription size immediately follows its description",
 );

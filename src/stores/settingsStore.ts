@@ -391,11 +391,11 @@ export const useSettingsStore = create<SettingsStore>()(
       } catch (error) {
         console.error(`Failed to update setting ${String(key)}:`, error);
         if (key === "post_process_enabled") {
-          toast.error(
-            i18n.t("settings.general.shortcut.errors.set", {
+          notify({
+            title: i18n.t("settings.general.shortcut.errors.set", {
               error: String(error),
             }),
-          );
+          });
         }
         if (settings) {
           set({ settings: { ...settings, [key]: originalValue } });
@@ -495,11 +495,11 @@ export const useSettingsStore = create<SettingsStore>()(
         }
         await refreshSettings();
       } catch (error: unknown) {
-        toast.error(
-          i18n.t("settings.general.shortcut.errors.set", {
+        notify({
+          title: i18n.t("settings.general.shortcut.errors.set", {
             error: String(error),
           }),
-        );
+        });
       } finally {
         setUpdating(updateKey, false);
       }

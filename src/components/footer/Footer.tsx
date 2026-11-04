@@ -7,8 +7,14 @@ import UpdateChecker from "../update-checker";
 import NoticeChip from "./NoticeChip";
 import TranscriptionStatus from "./TranscriptionStatus";
 
-interface FooterProps { onShowHistory: () => void; onOpenPostProcessing: () => void; }
-const Footer: React.FC<FooterProps> = ({ onShowHistory, onOpenPostProcessing }) => {
+interface FooterProps {
+  onShowHistory: () => void;
+  onOpenPostProcessing: () => void;
+}
+const Footer: React.FC<FooterProps> = ({
+  onShowHistory,
+  onOpenPostProcessing,
+}) => {
   const [version, setVersion] = useState("");
 
   useEffect(() => {

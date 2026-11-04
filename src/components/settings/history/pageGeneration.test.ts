@@ -43,6 +43,9 @@ const row = (id: number): HistoryEntry => ({
   post_process_requested: false,
   post_process_provider: null,
   post_process_model: null,
+  source_name: null,
+  language: null,
+  language_source: null,
 });
 const page = (...ids: number[]): Result<PaginatedHistory, string> => ({
   status: "ok",

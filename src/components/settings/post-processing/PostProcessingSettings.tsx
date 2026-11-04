@@ -2,7 +2,10 @@ import React, { useEffect, useState } from "react";
 import { Trans, useTranslation } from "react-i18next";
 import { RefreshCcw } from "lucide-react";
 import { commands, type PostProcessApiFormat } from "@/bindings";
-import { promptControls, providerGroupKey } from "@/lib/utils/localLlmPresentation";
+import {
+  promptControls,
+  providerGroupKey,
+} from "@/lib/utils/localLlmPresentation";
 
 import { Alert } from "../../ui/Alert";
 import {

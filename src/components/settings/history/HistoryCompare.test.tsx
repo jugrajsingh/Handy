@@ -215,6 +215,8 @@ mock.module("@/stores/settingsStore", () => ({
 mock.module("../post-processing/LocalLlmSettings", () => ({
   useLocalLlmModels: () => ({ models: [] }),
 }));
+mock.module("@/stores/noticeStore", () => ({ notify: () => undefined }));
+mock.module("@/i18n", () => ({ default: i18next }));
 const { HistorySettings } = await import("./HistorySettings");
 const history = renderToStaticMarkup(<HistorySettings />);
 assert.match(

@@ -39,6 +39,7 @@ impl CommandContext for tauri::AppHandle {
             KeyboardImplementation::HandyKeys => {
                 super::handy_keys::unregister_shortcut(self, binding)
             }
+            KeyboardImplementation::None => Ok(()),
         }
     }
 
@@ -86,6 +87,7 @@ impl RegistrationContext for tauri::AppHandle {
             KeyboardImplementation::HandyKeys => {
                 super::handy_keys::register_nonempty_shortcut(self, binding)
             }
+            KeyboardImplementation::None => Ok(()),
         }
     }
 
@@ -118,6 +120,7 @@ pub(crate) fn normalized_binding(
             .parse::<::handy_keys::Hotkey>()
             .map(|shortcut| shortcut.to_handy_string())
             .map_err(|error| error.to_string()),
+        KeyboardImplementation::None => Ok(raw),
     }
 }
 
@@ -339,6 +342,7 @@ mod registration_path_tests {
             KeyboardImplementation::HandyKeys => {
                 handy_keys::validate_shortcut(&binding.current_binding)?
             }
+            KeyboardImplementation::None => return Ok(()),
         }
         calls
             .borrow_mut()
@@ -431,6 +435,7 @@ mod registration_path_tests {
                     handy_keys::init_shortcuts(&context).unwrap();
                     assert!(*context.managed.borrow());
                 }
+                KeyboardImplementation::None => unreachable!("fixture uses native implementations"),
             }
             context.assert_clean_and_read_aloud(implementation);
             context.calls.borrow_mut().clear();

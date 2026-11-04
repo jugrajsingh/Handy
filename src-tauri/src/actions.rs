@@ -4,13 +4,15 @@ use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, S
 use crate::audio_toolkit::VadPolicy;
 use crate::local_llm::LocalLlmManager;
 use crate::managers::audio::{recording_notice_code, AudioRecordingManager};
-use crate::managers::history::{HistoryManager, PostProcessProvenance};
+use crate::managers::history::{HistoryManager, HistoryMetadata, PostProcessProvenance};
 use crate::managers::model::ModelManager;
 use crate::managers::transcription::policy::{live_decode, LiveDecode, ModelTraits};
 use crate::managers::transcription::StreamWorkKind;
 use crate::managers::transcription::{Transcription, TranscriptionManager};
 use crate::notices::{self, Notice, NoticeCode, NoticeSource};
-use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID, LOCAL_LLM_PROVIDER_ID};
+use crate::settings::{
+    get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID, LOCAL_LLM_PROVIDER_ID,
+};
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
 use crate::utils::{
@@ -203,7 +205,10 @@ enum PostProcessOutcome {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum PostProcessRoute { LocalLlm, Remote }
+enum PostProcessRoute {
+    LocalLlm,
+    Remote,
+}
 
 fn post_process_route(settings: &AppSettings) -> PostProcessRoute {
     if settings.post_process_provider_id == LOCAL_LLM_PROVIDER_ID {
@@ -213,11 +218,21 @@ fn post_process_route(settings: &AppSettings) -> PostProcessRoute {
     }
 }
 
-async fn post_process_with_provider(app: &AppHandle, settings: &AppSettings, transcription: &str) -> PostProcessOutcome {
-    if is_blank_transcription(transcription) { return PostProcessOutcome::Skipped; }
+async fn post_process_with_provider(
+    app: &AppHandle,
+    settings: &AppSettings,
+    transcription: &str,
+) -> PostProcessOutcome {
+    if is_blank_transcription(transcription) {
+        return PostProcessOutcome::Skipped;
+    }
     if post_process_route(settings) == PostProcessRoute::LocalLlm {
-        let manager = app.try_state::<Arc<LocalLlmManager>>().map(|m| Arc::clone(m.inner()));
-        return crate::local_llm::post_process(manager, settings, transcription).await.map_or(PostProcessOutcome::Failed, PostProcessOutcome::Done);
+        let manager = app
+            .try_state::<Arc<LocalLlmManager>>()
+            .map(|m| Arc::clone(m.inner()));
+        return crate::local_llm::post_process(manager, settings, transcription)
+            .await
+            .map_or(PostProcessOutcome::Failed, PostProcessOutcome::Done);
     }
     post_process_transcription(settings, transcription).await
 }
@@ -549,6 +564,8 @@ where
                 }
             }
         }
+    } else if final_text != transcription {
+        post_processed_text = Some(final_text.clone());
     }
 
     ProcessedTranscription {
@@ -590,7 +607,9 @@ impl TranscribeAction {
         // Load ASR model and VAD model in parallel
         let kickoff_started = Instant::now();
         let load_started = tm.initiate_model_load(true);
-        if self.post_process { crate::local_llm::warm_up_for_recording(app); }
+        if self.post_process {
+            crate::local_llm::warm_up_for_recording(app);
+        }
         let rm_clone = Arc::clone(&rm);
         std::thread::spawn(move || {
             if let Err(e) = rm_clone.preload_vad() {
@@ -948,8 +967,10 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
-                                    language,
-                                    processed.provenance.clone(),
+                                    HistoryMetadata {
+                                        language,
+                                        provenance: processed.provenance.clone(),
+                                    },
                                 ) {
                                     error!("Failed to save history entry: {}", err);
                                 }
@@ -1006,7 +1027,11 @@ impl ShortcutAction for TranscribeAction {
                                 let session = RECORDING_SESSION.load(Ordering::SeqCst);
                                 fence.queue_native(
                                     Arc::new(move |job| {
-                                        std::thread::Builder::new().name("paste".into()).spawn(job).map(|_| ()).map_err(|error| error.to_string())
+                                        std::thread::Builder::new()
+                                            .name("paste".into())
+                                            .spawn(job)
+                                            .map(|_| ())
+                                            .map_err(|error| error.to_string())
                                     }),
                                     Box::new(move || {
                                         if rm_for_paste.was_cancelled_since(cancel_generation) {
@@ -1023,39 +1048,42 @@ impl ShortcutAction for TranscribeAction {
                                         // UI while this paste ran.
                                         let owns_ui =
                                             || RECORDING_SESSION.load(Ordering::SeqCst) == session;
-                                        let (outcome, notice) =
-                                            match utils::paste(final_text, ah_clone.clone(), completion) {
-                                                Ok(()) => {
-                                                    debug!(
-                                                        "Text pasted successfully in {:?}",
-                                                        paste_time.elapsed()
+                                        let (outcome, notice) = match utils::paste(
+                                            final_text,
+                                            ah_clone.clone(),
+                                            completion,
+                                        ) {
+                                            Ok(()) => {
+                                                debug!(
+                                                    "Text pasted successfully in {:?}",
+                                                    paste_time.elapsed()
+                                                );
+                                                // Leave a newer session's notice alone.
+                                                if owns_ui() {
+                                                    notices::clear(
+                                                        &ah_clone,
+                                                        NoticeSource::Dictation,
                                                     );
-                                                    // Leave a newer session's notice alone.
-                                                    if owns_ui() {
-                                                        notices::clear(
-                                                            &ah_clone,
-                                                            NoticeSource::Dictation,
-                                                        );
-                                                    }
-                                                    let notice = post_process_failed.then(|| {
-                                                        Notice::new(
-                                                            NoticeCode::PostProcessFailed,
-                                                            NoticeSource::Dictation,
-                                                        )
-                                                    });
-                                                    (TranscriptionOutcome::Typed, notice)
                                                 }
-                                                Err(e) => {
-                                                    error!("Failed to paste transcription: {}", e);
-                                                    (
-                                                        TranscriptionOutcome::Failed,
-                                                        Some(Notice::new(
-                                                            NoticeCode::PasteFailed,
-                                                            NoticeSource::Dictation,
-                                                        )),
+                                                let notice = post_process_failed.then(|| {
+                                                    Notice::new(
+                                                        NoticeCode::PostProcessFailed,
+                                                        NoticeSource::Dictation,
                                                     )
-                                                }
-                                            };
+                                                });
+                                                (TranscriptionOutcome::Typed, notice)
+                                            }
+                                            Err(e) => {
+                                                error!("Failed to paste transcription: {}", e);
+                                                (
+                                                    TranscriptionOutcome::Failed,
+                                                    Some(Notice::new(
+                                                        NoticeCode::PasteFailed,
+                                                        NoticeSource::Dictation,
+                                                    )),
+                                                )
+                                            }
+                                        };
                                         match (owns_ui(), notice) {
                                             (true, Some(notice)) => {
                                                 notices::raise(&ah_clone, notice)
@@ -1082,7 +1110,12 @@ impl ShortcutAction for TranscribeAction {
                                         error!("Failed to queue transcription paste: {error}");
                                         utils::hide_recording_overlay(&failure_app);
                                         set_tray_state(&failure_app, TrayIconState::Idle);
-                                        emit_transcription_complete(&failure_app, TranscriptionOutcome::Failed, sample_count, stop_time);
+                                        emit_transcription_complete(
+                                            &failure_app,
+                                            TranscriptionOutcome::Failed,
+                                            sample_count,
+                                            stop_time,
+                                        );
                                         failed_completion.settle_with(|| {});
                                     }),
                                 );
@@ -1115,7 +1148,7 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     None,
                                     None,
-                                    None,
+                                    HistoryMetadata::default(),
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
@@ -1212,11 +1245,10 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     use super::{
-        complete_unless_cancelled, is_blank_transcription, non_blank_post_processed_text,
-        post_process_transcription, should_use_streaming_overlay, strip_invisible_chars,
-        strip_think_block, PostProcessOutcome, post_process_route, PostProcessRoute,
-        cleanup_provenance,
-        process_transcription_output_with_dependencies,
+        cleanup_provenance, complete_unless_cancelled, is_blank_transcription,
+        non_blank_post_processed_text, post_process_route, post_process_transcription,
+        process_transcription_output_with_dependencies, should_use_streaming_overlay,
+        strip_invisible_chars, strip_think_block, PostProcessOutcome, PostProcessRoute,
     };
     use crate::settings::{get_default_settings, AppSettings, OverlayStyle};
     use std::future;

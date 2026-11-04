@@ -5,7 +5,8 @@ use handy_tts_core::coverage::{
     relative_anchors_in_order, Coverage,
 };
 use handy_tts_core::text::TextCursor;
-use rubato::{FftFixedIn, Resampler};
+use rubato::audioadapter_buffers::direct::InterleavedSlice;
+use rubato::{Fft, FixedSync, Indexing, Resampler};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -91,32 +92,41 @@ fn read_wav(path: &Path) -> Result<(u32, Vec<f32>)> {
     Ok((spec.sample_rate, mono))
 }
 
+fn resample_block(resampler: &mut Fft<f32>, samples: &[f32]) -> Result<Vec<f32>> {
+    let input = InterleavedSlice::new(samples, 1, samples.len()).context("read resampler input")?;
+    let mut samples_out = vec![0.0; resampler.output_frames_max()];
+    let frames = samples_out.len();
+    let mut output = InterleavedSlice::new_mut(&mut samples_out, 1, frames)
+        .context("allocate resampler output")?;
+    let mut indexing = Indexing::new();
+    indexing.partial_len = Some(samples.len());
+    let (_, produced) = resampler
+        .process_into_buffer(&input, &mut output, Some(&indexing))
+        .context("resample WAV block")?;
+    samples_out.truncate(produced);
+    Ok(samples_out)
+}
+
 fn resample(sample_rate: u32, pcm: &[f32]) -> Result<Vec<f32>> {
     const RATE: usize = 16_000;
     const BLOCK: usize = 1024;
     if sample_rate == RATE as u32 {
         return Ok(pcm.to_vec());
     }
-    let mut resampler = FftFixedIn::<f32>::new(sample_rate as usize, RATE, BLOCK, 1, 1)
+    let mut resampler = Fft::<f32>::new(sample_rate as usize, RATE, BLOCK, 1, FixedSync::Input)
         .context("create 16 kHz resampler")?;
     let delay = resampler.output_delay();
     let target = (pcm.len() as f64 * RATE as f64 / f64::from(sample_rate)).round() as usize;
     let mut output = Vec::new();
     for chunk in pcm.chunks(BLOCK) {
-        let block = resampler
-            .process_partial(Some(&[chunk]), None)
-            .context("resample WAV block")?;
-        output.extend_from_slice(&block[0]);
+        output.extend(resample_block(&mut resampler, chunk)?);
     }
     let flush_rounds = (delay + target).div_ceil(resampler.output_frames_max()) + 2;
     for _ in 0..flush_rounds {
         if output.len() >= delay + target {
             break;
         }
-        let block = resampler
-            .process_partial::<&[f32]>(None, None)
-            .context("flush resampler tail")?;
-        output.extend_from_slice(&block[0]);
+        output.extend(resample_block(&mut resampler, &[]).context("flush resampler tail")?);
     }
     if output.len() < delay + target {
         bail!("resampler did not flush the complete WAV");

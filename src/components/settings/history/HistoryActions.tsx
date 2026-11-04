@@ -95,19 +95,25 @@ export function HistoryActions(props: HistoryActionsProps): React.JSX.Element {
         />
       </IconButton>
       {props.retrying && props.onCancel ? (
-        <IconButton onClick={props.onCancel} disabled={props.cancelling ?? false} title={t("settings.history.cancelTranscription")}><X width={16} height={16} /></IconButton>
+        <IconButton
+          onClick={props.onCancel}
+          disabled={props.cancelling ?? false}
+          title={t("settings.history.cancelTranscription")}
+        >
+          <X width={16} height={16} />
+        </IconButton>
       ) : (
-      <IconButton
-        onClick={props.onRetranscribe}
-        disabled={props.retrying}
-        title={t("settings.history.retranscribe")}
-      >
-        <RotateCcw
-          width={16}
-          height={16}
-          className={props.retrying ? "animate-spin" : ""}
-        />
-      </IconButton>
+        <IconButton
+          onClick={props.onRetranscribe}
+          disabled={props.retrying}
+          title={t("settings.history.retranscribe")}
+        >
+          <RotateCcw
+            width={16}
+            height={16}
+            className={props.retrying ? "animate-spin" : ""}
+          />
+        </IconButton>
       )}
       <IconButton
         onClick={props.onDelete}

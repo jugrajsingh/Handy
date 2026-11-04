@@ -74,8 +74,8 @@ mock.module("@/bindings", () => ({
   },
 }));
 mock.module("@/i18n", () => ({ default: i18n }));
-mock.module("sonner", () => ({
-  toast: { error: (message: string) => notifications.push(message) },
+mock.module("@/stores/noticeStore", () => ({
+  notify: ({ title }: { title: string }) => notifications.push(title),
 }));
 mock.module("@tauri-apps/api/event", () => ({
   listen: () => {

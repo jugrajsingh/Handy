@@ -220,7 +220,7 @@ export const HistorySettings: React.FC = () => {
               title: t("settings.history.clearHistory"),
               kind: "warning",
               okLabel: t("settings.history.clearHistory"),
-              cancelLabel: t("modelSelector.cancel"),
+              cancelLabel: t("settings.models.cancel"),
             },
           ),
         setClearing,
@@ -411,7 +411,11 @@ export const HistorySettings: React.FC = () => {
             >
               {t("settings.history.clearHistory")}
             </Button>
-            <HeaderButton onClick={transcribeFile} label={t("settings.history.transcribeFile")} icon={FilePlus} />
+            <HeaderButton
+              onClick={transcribeFile}
+              label={t("settings.history.transcribeFile")}
+              icon={FilePlus}
+            />
             <HeaderButton
               onClick={openRecordingsFolder}
               label={t("settings.history.openFolder")}
@@ -473,7 +477,9 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
 
   // Queued or being transcribed in the background.
   const retrying = job !== undefined;
-  useLayoutEffect(() => { restoreAnchor(); }, [retrying, restoreAnchor]);
+  useLayoutEffect(() => {
+    restoreAnchor();
+  }, [retrying, restoreAnchor]);
   useEffect(() => {
     if (!retrying) setCancelling(false);
   }, [retrying]);
@@ -522,8 +528,12 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
 
   const handleRetranscribe = async () => {
     captureAnchor();
-    try { await retryTranscription(entry.id); }
-    catch (error) { console.error("Failed to re-transcribe:", error); notify({ title: t("settings.history.retranscribeError") }); }
+    try {
+      await retryTranscription(entry.id);
+    } catch (error) {
+      console.error("Failed to re-transcribe:", error);
+      notify({ title: t("settings.history.retranscribeError") });
+    }
   };
 
   const formattedDate = formatDateTime(String(entry.timestamp), i18n.language);
@@ -538,7 +548,10 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
   }
 
   return (
-    <div data-history-entry-id={entry.id} className="px-4 py-2 pb-5 flex flex-col gap-3">
+    <div
+      data-history-entry-id={entry.id}
+      className="px-4 py-2 pb-5 flex flex-col gap-3"
+    >
       <div className="flex justify-between items-center gap-3">
         <div className="flex items-center gap-2 min-w-0">
           <p className="text-sm font-medium shrink-0">{formattedDate}</p>
@@ -567,7 +580,10 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
           }
           onToggleSaved={onToggleSaved}
           onRetranscribe={() => void handleRetranscribe()}
-          onCancel={() => { setCancelling(true); void cancelTranscription(entry.id); }}
+          onCancel={() => {
+            setCancelling(true);
+            void cancelTranscription(entry.id);
+          }}
           cancelling={cancelling}
           onDelete={() => void handleDeleteEntry()}
         />
@@ -576,51 +592,51 @@ const HistoryEntryComponent: React.FC<HistoryEntryProps> = ({
       {!retrying && cleanedText(entry) !== null ? (
         <HistoryCompare entry={entry} view={view} modelName={modelName} />
       ) : (
-      <div className="flex flex-col items-start gap-1 pb-2">
-        <p
-          ref={textRef}
-          className={`italic text-sm w-full ${
-            retrying
-              ? ""
-              : hasTranscription
-                ? "text-text select-text cursor-text whitespace-pre-wrap break-words"
-                : "text-ink-3"
-          }`}
-          style={
-            retrying
-              ? TRANSCRIBE_PULSE
-              : folded
-                ? {
-                    display: "-webkit-box",
-                    WebkitLineClamp: FOLDED_LINES,
-                    WebkitBoxOrient: "vertical",
-                    overflow: "hidden",
-                  }
-                : undefined
-          }
-        >
-          {retrying && <TranscribePulseKeyframes />}
-          {retrying
-            ? progressText
-            : hasTranscription
-              ? entry.transcription_text
-              : entry.source_name
-                ? // Cancelled, interrupted by a quit, or failed.
-                  t("settings.history.notTranscribed")
-                : t("settings.history.transcriptionFailed")}
-        </p>
-        {hasTranscription && !retrying && (expanded || overflows) && (
-          <button
-            type="button"
-            onClick={() => setExpanded(!expanded)}
-            className="text-xs font-medium text-ink-3 hover:text-logo-primary cursor-pointer"
+        <div className="flex flex-col items-start gap-1 pb-2">
+          <p
+            ref={textRef}
+            className={`italic text-sm w-full ${
+              retrying
+                ? ""
+                : hasTranscription
+                  ? "text-text select-text cursor-text whitespace-pre-wrap break-words"
+                  : "text-ink-3"
+            }`}
+            style={
+              retrying
+                ? TRANSCRIBE_PULSE
+                : folded
+                  ? {
+                      display: "-webkit-box",
+                      WebkitLineClamp: FOLDED_LINES,
+                      WebkitBoxOrient: "vertical",
+                      overflow: "hidden",
+                    }
+                  : undefined
+            }
           >
-            {expanded
-              ? t("settings.history.showLess")
-              : t("settings.history.showMore")}
-          </button>
-        )}
-      </div>
+            {retrying && <TranscribePulseKeyframes />}
+            {retrying
+              ? progressText
+              : hasTranscription
+                ? entry.transcription_text
+                : entry.source_name
+                  ? // Cancelled, interrupted by a quit, or failed.
+                    t("settings.history.notTranscribed")
+                  : t("settings.history.transcriptionFailed")}
+          </p>
+          {hasTranscription && !retrying && (expanded || overflows) && (
+            <button
+              type="button"
+              onClick={() => setExpanded(!expanded)}
+              className="text-xs font-medium text-ink-3 hover:text-logo-primary cursor-pointer"
+            >
+              {expanded
+                ? t("settings.history.showLess")
+                : t("settings.history.showMore")}
+            </button>
+          )}
+        </div>
       )}
 
       <AudioPlayer onLoadRequest={handleLoadAudio} className="w-full" />

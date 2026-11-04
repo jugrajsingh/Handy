@@ -937,7 +937,8 @@ fn build_menu(app: &AppHandle, inputs: &MenuInputs) -> tauri::Result<(Menu<tauri
             tray_label(&strings.transcription_model, &english.transcription_model),
             selected_name
         );
-        let model_submenu = Submenu::with_id(app, "model_submenu", &submenu_label, !inputs.models_locked)?;
+        let model_submenu =
+            Submenu::with_id(app, "model_submenu", &submenu_label, !inputs.models_locked)?;
         for choice in model_choices(
             &inputs.downloaded_models,
             Some(&inputs.selected_model),

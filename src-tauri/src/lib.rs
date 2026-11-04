@@ -1339,7 +1339,9 @@ pub fn run(cli_args: CliArgs) {
                 let service = service.inner().clone();
                 std::thread::spawn(move || service.shutdown());
             }
-            if let Some(llm) = app.try_state::<Arc<local_llm::LocalLlmManager>>() { llm.shutdown(); }
+            if let Some(llm) = app.try_state::<Arc<local_llm::LocalLlmManager>>() {
+                llm.shutdown();
+            }
         }
         _ => {}
     });

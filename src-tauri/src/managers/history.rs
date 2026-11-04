@@ -102,6 +102,13 @@ pub struct PostProcessProvenance {
     pub model: Option<String>,
 }
 
+/// Language and cleanup provenance produced for one dictation.
+#[derive(Default)]
+pub struct HistoryMetadata {
+    pub language: Option<LanguageDecision>,
+    pub provenance: Option<PostProcessProvenance>,
+}
+
 pub struct HistoryManager {
     app_handle: AppHandle,
     recordings_dir: PathBuf,
@@ -311,10 +318,10 @@ impl HistoryManager {
         post_process_requested: bool,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
-        language: Option<LanguageDecision>,
-        provenance: Option<PostProcessProvenance>,
+        metadata: HistoryMetadata,
     ) -> Result<HistoryEntry> {
-        let (language, language_source) = split_language(language);
+        let (language, language_source) = split_language(metadata.language);
+        let provenance = metadata.provenance;
         let entry = self.insert_entry(HistoryEntry {
             id: 0,
             file_name,
@@ -360,7 +367,6 @@ impl HistoryManager {
     /// Insert `entry`, filling in its id and title, and announce it.
     fn insert_entry(&self, mut entry: HistoryEntry) -> Result<HistoryEntry> {
         entry.title = self.format_timestamp_title(entry.timestamp);
-
 
         let mut conn = self.get_connection()?;
         let retention_period = crate::settings::get_recording_retention_period(&self.app_handle);
@@ -445,8 +451,18 @@ impl HistoryManager {
         let (language, language_source) = split_language(language);
         let mut conn = self.get_connection()?;
         let tx = conn.transaction()?;
-        tx.execute("UPDATE transcription_history SET language = ?1, language_source = ?2 WHERE id = ?3", params![language, language_source.map(LanguageSource::as_str), id])?;
-        let entry = Self::update_transcription_with_conn(&tx, id, transcription_text, post_processed_text, post_process_prompt, provenance)?;
+        tx.execute(
+            "UPDATE transcription_history SET language = ?1, language_source = ?2 WHERE id = ?3",
+            params![language, language_source.map(LanguageSource::as_str), id],
+        )?;
+        let entry = Self::update_transcription_with_conn(
+            &tx,
+            id,
+            transcription_text,
+            post_processed_text,
+            post_process_prompt,
+            provenance,
+        )?;
         tx.commit()?;
 
         debug!("Updated transcription for history entry {}", id);
@@ -493,12 +509,11 @@ impl HistoryManager {
             return Err(anyhow!("History entry {} not found", id));
         }
 
-        let entry = conn
-            .query_row(
-                &format!("SELECT {ENTRY_COLUMNS} FROM transcription_history WHERE id = ?1"),
-                params![id],
-                Self::map_history_entry,
-            )?;
+        let entry = conn.query_row(
+            &format!("SELECT {ENTRY_COLUMNS} FROM transcription_history WHERE id = ?1"),
+            params![id],
+            Self::map_history_entry,
+        )?;
 
         Ok(entry)
     }
@@ -892,9 +907,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
         let mut conn = Connection::open(&path).unwrap();
-        Migrations::new(MIGRATIONS.to_vec())
-            .to_latest(&mut conn)
-            .unwrap();
+        HistoryManager::apply_migrations(&mut conn).unwrap();
         let observer = Connection::open(&path).unwrap();
         observer.busy_timeout(Duration::ZERO).unwrap();
         for timestamp in [100, 200, 300, 400, 500] {
@@ -971,9 +984,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
         let mut conn = Connection::open(&path).unwrap();
-        Migrations::new(MIGRATIONS.to_vec())
-            .to_latest(&mut conn)
-            .unwrap();
+        HistoryManager::apply_migrations(&mut conn).unwrap();
         let observer = Connection::open(&path).unwrap();
         observer.busy_timeout(Duration::ZERO).unwrap();
         let now = 2_000_000;
@@ -1061,9 +1072,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("history.db");
             let mut conn = Connection::open(&path).unwrap();
-            Migrations::new(MIGRATIONS.to_vec())
-                .to_latest(&mut conn)
-                .unwrap();
+            HistoryManager::apply_migrations(&mut conn).unwrap();
             let observer = Connection::open(&path).unwrap();
             insert_entry(&conn, 100, "raw", None);
             let mut events = Vec::new();
@@ -1166,9 +1175,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.db");
         let mut conn = Connection::open(&path).unwrap();
-        Migrations::new(MIGRATIONS.to_vec())
-            .to_latest(&mut conn)
-            .unwrap();
+        HistoryManager::apply_migrations(&mut conn).unwrap();
         let observer = Connection::open(path).unwrap();
         observer.busy_timeout(Duration::ZERO).unwrap();
         insert_entry(&conn, 100, "raw", None);
@@ -1240,9 +1247,7 @@ mod tests {
         let path = dir.path().join("history.db");
         let mut conn = Connection::open(&path).unwrap();
         conn.busy_timeout(Duration::ZERO).unwrap();
-        Migrations::new(MIGRATIONS.to_vec())
-            .to_latest(&mut conn)
-            .unwrap();
+        HistoryManager::apply_migrations(&mut conn).unwrap();
         insert_entry(&conn, 100, "raw", None);
         let id = conn.last_insert_rowid();
         fs::write(dir.path().join("handy-100.wav"), b"audio").unwrap();
@@ -1341,9 +1346,7 @@ mod tests {
         fs::create_dir(&recordings).unwrap();
         let mut conn = Connection::open(&path).unwrap();
         conn.busy_timeout(Duration::from_secs(30)).unwrap();
-        Migrations::new(MIGRATIONS.to_vec())
-            .to_latest(&mut conn)
-            .unwrap();
+        HistoryManager::apply_migrations(&mut conn).unwrap();
         insert_entry(&conn, 100, "before clear", None);
         fs::write(recordings.join("handy-100.wav"), b"before").unwrap();
         let mut pending = HistoryManager::get_latest_entry_with_conn(&conn)
@@ -1454,9 +1457,7 @@ mod tests {
             .to_latest(&mut conn)
             .unwrap();
         insert_entry(&conn, 100, "before migration", Some("Before migration."));
-        Migrations::new(MIGRATIONS.to_vec())
-            .to_latest(&mut conn)
-            .unwrap();
+        HistoryManager::apply_migrations(&mut conn).unwrap();
         let entry = HistoryManager::get_latest_entry_with_conn(&conn)
             .unwrap()
             .unwrap();
@@ -1516,6 +1517,9 @@ mod tests {
             post_process_requested: true,
             post_process_provider: Some("local_llm".into()),
             post_process_model: Some("s1-mini-q4km".into()),
+            source_name: Some("fixture.wav".into()),
+            language: Some("en".into()),
+            language_source: Some(LanguageSource::Selected),
         };
         entry.id = HistoryManager::insert_history_entry_with_conn(&conn, &entry).unwrap();
         let stored = HistoryManager::get_latest_entry_with_conn(&conn)
@@ -1525,6 +1529,9 @@ mod tests {
         assert_eq!(stored.post_processed_text, entry.post_processed_text);
         assert_eq!(stored.post_process_provider, entry.post_process_provider);
         assert_eq!(stored.post_process_model, entry.post_process_model);
+        assert_eq!(stored.source_name, entry.source_name);
+        assert_eq!(stored.language, entry.language);
+        assert_eq!(stored.language_source, entry.language_source);
     }
 
     #[test]

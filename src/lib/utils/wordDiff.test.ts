@@ -84,7 +84,7 @@ mock.module("@/bindings", () => ({
   },
 }));
 mock.module("@/i18n", () => ({ default: { t: (key: string) => key } }));
-mock.module("sonner", () => ({ toast: { error: () => undefined } }));
+mock.module("@/stores/noticeStore", () => ({ notify: () => undefined }));
 mock.module("@tauri-apps/api/event", () => ({
   listen: () => {
     throw new Error("Unexpected subscription in compare setting test");

@@ -887,6 +887,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         allow_base_url_edit: false,
         models_endpoint: None,
         supports_structured_output: false,
+        api_format: PostProcessApiFormat::OpenAi,
     });
 
     // Custom provider always comes last

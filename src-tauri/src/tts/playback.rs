@@ -1,4 +1,3 @@
-use cpal::traits::{DeviceTrait, HostTrait};
 use handy_tts_core::{
     feed::{Feed, Segment, SharedFeed},
     playback::{
@@ -6,9 +5,11 @@ use handy_tts_core::{
         PlaybackError,
     },
 };
+use rodio::cpal::traits::HostTrait;
 use rodio::{
-    mixer::Mixer, queue::SourcesQueueOutput, source::UniformSourceIterator, OutputStream,
-    OutputStreamBuilder, Sink, Source,
+    mixer::Mixer, queue::SourcesQueueOutput, source::UniformSourceIterator, ChannelCount,
+    DeviceSinkBuilder as OutputStreamBuilder, MixerDeviceSink as OutputStream, Player as Sink,
+    SampleRate, Source,
 };
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -66,16 +67,19 @@ impl Source for FeedSource {
         let format = self.format.lock().unwrap_or_else(|p| p.into_inner());
         Some(format.spans.front().map(|span| span.remaining).unwrap_or(0))
     }
-    fn channels(&self) -> u16 {
-        1
+    fn channels(&self) -> ChannelCount {
+        ChannelCount::MIN
     }
-    fn sample_rate(&self) -> u32 {
+    fn sample_rate(&self) -> SampleRate {
         let format = self.format.lock().unwrap_or_else(|p| p.into_inner());
-        format
-            .spans
-            .front()
-            .map(|span| span.rate)
-            .unwrap_or(format.rate)
+        SampleRate::new(
+            format
+                .spans
+                .front()
+                .map(|span| span.rate)
+                .unwrap_or(format.rate),
+        )
+        .unwrap_or(SampleRate::MIN)
     }
     fn total_duration(&self) -> Option<Duration> {
         None
@@ -114,16 +118,19 @@ impl Source for NativeSource {
         let format = self.format.lock().unwrap_or_else(|p| p.into_inner());
         Some(format.spans.front().map(|span| span.remaining).unwrap_or(0))
     }
-    fn channels(&self) -> u16 {
-        1
+    fn channels(&self) -> ChannelCount {
+        ChannelCount::MIN
     }
-    fn sample_rate(&self) -> u32 {
+    fn sample_rate(&self) -> SampleRate {
         let format = self.format.lock().unwrap_or_else(|p| p.into_inner());
-        format
-            .spans
-            .front()
-            .map(|span| span.rate)
-            .unwrap_or(format.rate)
+        SampleRate::new(
+            format
+                .spans
+                .front()
+                .map(|span| span.rate)
+                .unwrap_or(format.rate),
+        )
+        .unwrap_or(SampleRate::MIN)
     }
     fn total_duration(&self) -> Option<Duration> {
         None
@@ -155,8 +162,8 @@ impl Iterator for MixerFeedSource {
         if conversion.converted.is_none() {
             conversion.converted = Some(UniformSourceIterator::new(
                 conversion.input.clone(),
-                self.output.channels,
-                self.output.rate,
+                ChannelCount::new(self.output.channels).unwrap_or(ChannelCount::MIN),
+                SampleRate::new(self.output.rate).unwrap_or(SampleRate::MIN),
             ));
         }
         if let Some(sample) = conversion.converted.as_mut().and_then(Iterator::next) {
@@ -187,11 +194,11 @@ impl Source for MixerFeedSource {
     fn current_span_len(&self) -> Option<usize> {
         None
     }
-    fn channels(&self) -> u16 {
-        self.output.channels
+    fn channels(&self) -> ChannelCount {
+        ChannelCount::new(self.output.channels).unwrap_or(ChannelCount::MIN)
     }
-    fn sample_rate(&self) -> u32 {
-        self.output.rate
+    fn sample_rate(&self) -> SampleRate {
+        SampleRate::new(self.output.rate).unwrap_or(SampleRate::MIN)
     }
     fn total_duration(&self) -> Option<Duration> {
         None
@@ -335,7 +342,10 @@ impl Output for RodioOutput {
         crate::audio_toolkit::get_cpal_host()
             .output_devices()
             .map_err(|_| PlaybackError::Unavailable)?
-            .map(|d| d.name().map_err(|_| PlaybackError::Unavailable))
+            .map(|device| {
+                crate::audio_toolkit::audio::output_device_name(&device)
+                    .ok_or(PlaybackError::Unavailable)
+            })
             .collect()
     }
     fn open(&mut self, name: Option<&str>) -> Result<(), PlaybackError> {
@@ -577,7 +587,9 @@ impl RodioOutput {
                 .output_devices()
                 .map_err(|_| PlaybackError::Unavailable)?;
             let device = devices
-                .find(|d| d.name().is_ok_and(|n| n == name))
+                .find(|device| {
+                    crate::audio_toolkit::audio::output_device_name(device).as_deref() == Some(name)
+                })
                 .ok_or(PlaybackError::Unavailable)?;
             OutputStreamBuilder::from_device(device).map_err(|_| PlaybackError::Unavailable)?
         } else {
@@ -590,8 +602,8 @@ impl RodioOutput {
             .open_stream()
             .map_err(|_| PlaybackError::Unavailable)?;
         let mixer_format = MixerFormat {
-            rate: stream.config().sample_rate(),
-            channels: stream.config().channel_count(),
+            rate: stream.config().sample_rate().get(),
+            channels: stream.config().channel_count().get(),
         };
         Ok(PreparedStream::new(
             stream.mixer().clone(),
@@ -629,7 +641,10 @@ mod tests {
 
     #[test]
     fn stop_then_queued_rate_change_preserves_duration() {
-        let (mixer, mut mixed) = rodio::mixer::mixer(1, 24_000);
+        let (mixer, mut mixed) = rodio::mixer::mixer(
+            ChannelCount::new(1).unwrap(),
+            SampleRate::new(24_000).unwrap(),
+        );
         let mut output = RodioOutput::new(24_000).unwrap();
         output.attach_mixer(&mixer).unwrap();
         let identity = output.sink.as_ref().unwrap().clone();
@@ -675,7 +690,10 @@ mod tests {
                 for first in [24_000, 44_100] {
                     for second in [24_000, 44_100] {
                         for timing in 0..3 {
-                            let (mixer, mut mixed) = rodio::mixer::mixer(channels, target);
+                            let (mixer, mut mixed) = rodio::mixer::mixer(
+                                ChannelCount::new(channels).unwrap(),
+                                SampleRate::new(target).unwrap(),
+                            );
                             let mut output = RodioOutput::new(initial).unwrap();
                             output.attach_mixer_format(&mixer, device).unwrap();
                             let identity = output.sink.as_ref().unwrap().clone();
@@ -767,7 +785,10 @@ mod tests {
     fn retraction_and_reopen_preserve_later_native_rate_boundaries() {
         for rate in [24_000, 44_100] {
             let next_rate = if rate == 24_000 { 44_100 } else { 24_000 };
-            let (mixer, mut mixed) = rodio::mixer::mixer(1, rate);
+            let (mixer, mut mixed) = rodio::mixer::mixer(
+                ChannelCount::new(1).unwrap(),
+                SampleRate::new(rate).unwrap(),
+            );
             let mut output = RodioOutput::new(rate).unwrap();
             output.attach_mixer(&mixer).unwrap();
             SegmentOutput::append(&mut output, burst(0, rate as usize / 5, 0)).unwrap();
@@ -824,7 +845,10 @@ mod tests {
             );
             SegmentOutput::append(&mut output, burst(6, next_rate as usize / 5, 0)).unwrap();
             pull(&mut mixed, rate as usize / 100);
-            let (replacement, mut replaced) = rodio::mixer::mixer(2, 48_000);
+            let (replacement, mut replaced) = rodio::mixer::mixer(
+                ChannelCount::new(2).unwrap(),
+                SampleRate::new(48_000).unwrap(),
+            );
             let prepared = PreparedStream::new(
                 replacement,
                 None,
@@ -865,7 +889,10 @@ mod tests {
     #[test]
     fn production_model_rates_preserve_duration_after_stop_and_replacement() {
         for rate in [24_000, 44_100] {
-            let (mixer, mut mixed) = rodio::mixer::mixer(1, rate);
+            let (mixer, mut mixed) = rodio::mixer::mixer(
+                ChannelCount::new(1).unwrap(),
+                SampleRate::new(rate).unwrap(),
+            );
             let mut output = RodioOutput::new(rate).unwrap();
             output.attach_mixer(&mixer).unwrap();
             for index in 0..2 {
@@ -889,7 +916,10 @@ mod tests {
                 assert_eq!(heard.len() as f64 / f64::from(rate), 0.25);
                 SegmentOutput::stop(&mut output);
             }
-            let (replacement, mut replaced) = rodio::mixer::mixer(1, rate);
+            let (replacement, mut replaced) = rodio::mixer::mixer(
+                ChannelCount::new(1).unwrap(),
+                SampleRate::new(rate).unwrap(),
+            );
             let prepared = output.prepare_mixer(replacement, None);
             SegmentOutput::commit(&mut output, prepared);
             let samples = rate as usize / 4;
@@ -919,7 +949,10 @@ mod tests {
     fn queued_rate_changes_keep_native_frames_duration_pitch_and_order() {
         for rates in [[44_100, 24_000, 44_100], [24_000, 44_100, 24_000]] {
             let target = rates[0];
-            let (mixer, mut mixed) = rodio::mixer::mixer(1, target);
+            let (mixer, mut mixed) = rodio::mixer::mixer(
+                ChannelCount::new(1).unwrap(),
+                SampleRate::new(target).unwrap(),
+            );
             let mut output = RodioOutput::new(target).unwrap();
             output.attach_mixer(&mixer).unwrap();
             let identity = output.sink.as_ref().unwrap().clone();
@@ -984,7 +1017,10 @@ mod tests {
 
     #[test]
     fn stop_after_model_rate_change_uses_the_new_rate_for_next_play() {
-        let (mixer, mut mixed) = rodio::mixer::mixer(1, 44_100);
+        let (mixer, mut mixed) = rodio::mixer::mixer(
+            ChannelCount::new(1).unwrap(),
+            SampleRate::new(44_100).unwrap(),
+        );
         let mut output = RodioOutput::new(44_100).unwrap();
         output.attach_mixer(&mixer).unwrap();
         SegmentOutput::append(&mut output, burst(0, 11_025, 0)).unwrap();
@@ -1021,7 +1057,10 @@ mod tests {
             !adapter.contains(concat!("sink.", "clear(")),
             "normal append cannot clear the persistent sink"
         );
-        let (mixer, mut mixed) = rodio::mixer::mixer(1, 44_100);
+        let (mixer, mut mixed) = rodio::mixer::mixer(
+            ChannelCount::new(1).unwrap(),
+            SampleRate::new(44_100).unwrap(),
+        );
         let mut output = RodioOutput::with_mixer(&mixer, 44_100);
         let lengths = [125_358, 81_681, 180_109];
         let pauses = [0, 5_513, 5_513];
@@ -1093,7 +1132,10 @@ mod tests {
 
     #[test]
     fn appending_during_playback_has_no_gap() {
-        let (mixer, mut mixed) = rodio::mixer::mixer(1, 24_000);
+        let (mixer, mut mixed) = rodio::mixer::mixer(
+            ChannelCount::new(1).unwrap(),
+            SampleRate::new(24_000).unwrap(),
+        );
         let mut output = RodioOutput::with_mixer(&mixer, 24_000);
         let first = burst(0, 4_800, 240);
         let second = burst(1, 7_200, 120);
@@ -1134,7 +1176,10 @@ mod tests {
 
     #[test]
     fn stop_clears_feed_without_replacing_sink() {
-        let (mixer, mut mixed) = rodio::mixer::mixer(1, 24_000);
+        let (mixer, mut mixed) = rodio::mixer::mixer(
+            ChannelCount::new(1).unwrap(),
+            SampleRate::new(24_000).unwrap(),
+        );
         let mut output = RodioOutput::with_mixer(&mixer, 24_000);
         let identity = output.sink.as_ref().unwrap().clone();
         SegmentOutput::append(&mut output, burst(0, 4_800, 240)).unwrap();
@@ -1161,7 +1206,10 @@ mod tests {
 
     #[test]
     fn stop_from_paused_resets_sink_for_audible_next_play() {
-        let (mixer, mut mixed) = rodio::mixer::mixer(1, 24_000);
+        let (mixer, mut mixed) = rodio::mixer::mixer(
+            ChannelCount::new(1).unwrap(),
+            SampleRate::new(24_000).unwrap(),
+        );
         let mut output = RodioOutput::with_mixer(&mixer, 24_000);
         SegmentOutput::append(&mut output, burst(0, 4_800, 0)).unwrap();
         SegmentOutput::pause(&mut output);
@@ -1192,7 +1240,10 @@ mod tests {
 
     #[test]
     fn pause_and_retract_preserve_the_current_sample_and_completion_clock() {
-        let (mixer, mut mixed) = rodio::mixer::mixer(1, 24_000);
+        let (mixer, mut mixed) = rodio::mixer::mixer(
+            ChannelCount::new(1).unwrap(),
+            SampleRate::new(24_000).unwrap(),
+        );
         let mut output = RodioOutput::with_mixer(&mixer, 24_000);
         let first = burst(0, 4_800, 240);
         let second = burst(1, 240, 120);
@@ -1234,7 +1285,10 @@ mod tests {
 
     #[test]
     fn segment_finishes_only_on_the_last_pulled_pause_sample() {
-        let (mixer, mut mixed) = rodio::mixer::mixer(1, 24_000);
+        let (mixer, mut mixed) = rodio::mixer::mixer(
+            ChannelCount::new(1).unwrap(),
+            SampleRate::new(24_000).unwrap(),
+        );
         let mut output = RodioOutput::with_mixer(&mixer, 24_000);
         SegmentOutput::append(
             &mut output,
@@ -1271,7 +1325,10 @@ mod tests {
 
     #[test]
     fn device_loss_follows_already_pulled_events_and_is_reported_once() {
-        let (mixer, mut mixed) = rodio::mixer::mixer(1, 24_000);
+        let (mixer, mut mixed) = rodio::mixer::mixer(
+            ChannelCount::new(1).unwrap(),
+            SampleRate::new(24_000).unwrap(),
+        );
         let mut output = RodioOutput::with_mixer(&mixer, 24_000);
         SegmentOutput::append(&mut output, burst(0, 240, 0)).unwrap();
         pull(&mut mixed, 240);

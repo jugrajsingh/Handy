@@ -5,9 +5,164 @@
 
 
 export const commands = {
+async getTtsModels() : Promise<Result<TtsModelInfo[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_tts_models") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getTtsStatus() : Promise<Result<ManagerSnapshot, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_tts_status") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getTtsDevices() : Promise<Result<Device[], string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_tts_devices") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getReadAloudState() : Promise<Result<SessionView, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_read_aloud_state") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async readAloudReplaceText(text: string, clientRevision: number) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_aloud_replace_text", { text, clientRevision }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async readAloudPlay() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_aloud_play") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async readAloudPause() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_aloud_pause") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async readAloudStop() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_aloud_stop") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async readAloudClose() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_aloud_close") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setTtsSelection(chosen: Selection) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_tts_selection", { chosen }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setTtsModel(modelId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_tts_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setTtsRunOn(modelId: string, choice: RunOn) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_tts_run_on", { modelId, choice }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async unloadTtsModel() : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("unload_tts_model") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async downloadTtsModel(modelId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("download_tts_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async cancelTtsDownload(modelId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("cancel_tts_download", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteTtsModel(modelId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_tts_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async setTtsHfToken(token: string) : Promise<Result<boolean, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_tts_hf_token", { token }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async previewTtsVoice(voice: string, text: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("preview_tts_voice", { voice, text }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async changeBinding(id: string, binding: string) : Promise<Result<BindingResponse, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("change_binding", { id, binding }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Clear an optional dictation shortcut while preserving another assigned binding.
+ */
+async clearBinding(id: string) : Promise<Result<ShortcutBinding, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_binding", { id }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -955,6 +1110,17 @@ async getHistoryEntries(cursor: number | null, limit: number | null) : Promise<R
     else return { status: "error", error: e  as any };
 }
 },
+/**
+ * Persist the layout used to compare raw and cleaned history transcripts.
+ */
+async changeHistoryCompareViewSetting(view: HistoryCompareView) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_history_compare_view_setting", { view }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
 async toggleHistoryEntrySaved(id: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("toggle_history_entry_saved", { id }) };
@@ -974,6 +1140,22 @@ async getAudioFilePath(fileName: string) : Promise<Result<string, string>> {
 async deleteHistoryEntry(id: number) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("delete_history_entry", { id }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getHistoryClearSummary(keepSaved: boolean) : Promise<Result<HistoryClearSummary, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_history_clear_summary", { keepSaved }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async clearHistory(keepSaved: boolean) : Promise<Result<HistoryClearSummary, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("clear_history", { keepSaved }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -1023,10 +1205,8 @@ async updateRecordingRetentionPeriod(period: string) : Promise<Result<null, stri
 }
 },
 /**
- * Checks if the Mac is a laptop by detecting battery presence
- * 
- * This uses pmset to check for battery information.
- * Returns true if a battery is detected (laptop), false otherwise (desktop)
+ * Stub implementation for non-macOS platforms
+ * Always returns false since laptop detection is macOS-specific
  */
 async isLaptop() : Promise<Result<boolean, string>> {
     try {
@@ -1051,6 +1231,60 @@ async dismissNotice(source: NoticeSource, code: NoticeCode) : Promise<void> {
  */
 async dismissOverlayNotice() : Promise<void> {
     await TAURI_INVOKE("dismiss_overlay_notice");
+},
+async getLocalLlmModels() : Promise<LocalLlmModelInfo[]> {
+    return await TAURI_INVOKE("get_local_llm_models");
+},
+async downloadLocalLlmModel(modelId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("download_local_llm_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async deleteLocalLlmModel(modelId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("delete_local_llm_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async getLocalLlmStatus() : Promise<LocalLlmStatus> {
+    return await TAURI_INVOKE("get_local_llm_status");
+},
+async setLocalLlmModel(modelId: string | null) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_local_llm_model", { modelId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeLocalLlmStylingSetting(styling: LocalLlmStyling) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_local_llm_styling_setting", { styling }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeLocalLlmStructureSetting(structure: LocalLlmStructure) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_local_llm_structure_setting", { structure }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async changeLocalLlmContextSetting(context: LocalLlmContext) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("change_local_llm_context_setting", { context }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -1088,7 +1322,7 @@ transcriptionJob: "transcription-job"
  * object, so a partial store can never fail the whole load (#1619).
  * Field-level defaults below take precedence where present.
  */
-export type AppSettings = { 
+export type AppSettings = { tts_model_id?: string; tts_voice?: Partial<{ [key in string]: string }>; tts_speed?: number; tts_pitch_semitones?: number; tts_output_device?: string | null; tts_read_code_blocks?: boolean; tts_run_on?: Partial<{ [key in string]: RunOn }>; 
 /**
  * Internal settings schema marker for one-time migrations. Fresh installs
  * start at the current version; existing stores missing this key are
@@ -1170,7 +1404,15 @@ language_detection_window_secs?: number;
  * not gated on this — that follows model capability. Migrated from the old
  * `overlay_position` (position `none` → style `None`).
  */
-overlay_style?: OverlayStyle }
+overlay_style?: OverlayStyle; 
+/**
+ * Registry id of the local LLM (provider `local_llm`); `None` until chosen.
+ */
+local_llm_model_id?: string | null; local_llm_styling?: LocalLlmStyling; local_llm_structure?: LocalLlmStructure; local_llm_context?: LocalLlmContext; 
+/**
+ * Inference threads for llama-server.
+ */
+local_llm_threads?: number; history_compare_view?: HistoryCompareView }
 export type AudioDevice = { index: string; name: string; is_default: boolean }
 export type AutoSubmitKey = "enter" | "ctrl_enter" | "cmd_enter"
 export type AutoUnavailableReason = 
@@ -1207,7 +1449,14 @@ export type ChineseScript =
 "traditional_hk"
 export type ClipboardHandling = "dont_modify" | "copy_to_clipboard"
 export type CustomSounds = { start: boolean; stop: boolean }
+export type Device = "cpu" | "gpu" | "npu"
+export type DeviceRating = { supported: boolean; placement: Partial<{ [key in string]: Device }>; first_audio_p95_s: number | null; rtf_1x: number | null; rtf_2x: number | null; load_s_cold: number | null; load_s_cached: number | null; speed_score: number | null; recommended: boolean }
 export type GpuDeviceOption = { id: string; name: string; total_vram_mb: number }
+export type HistoryClearSummary = { entries: number; recordings: number }
+/**
+ * Layout used to compare raw and cleaned history transcripts.
+ */
+export type HistoryCompareView = "diff" | "side_by_side" | "stacked"
 export type HistoryEntry = { id: number; file_name: string; timestamp: number; saved: boolean; title: string; transcription_text: string; post_processed_text: string | null; post_process_prompt: string | null; post_process_requested: boolean; 
 /**
  * The name of the file this entry was transcribed from; `None` for a
@@ -1221,8 +1470,8 @@ language: string | null;
 /**
  * How that language was chosen; `None` before it was recorded.
  */
-language_source: LanguageSource | null }
-export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number }
+language_source: LanguageSource | null; post_process_provider: string | null; post_process_model: string | null }
+export type HistoryUpdatePayload = { action: "added"; entry: HistoryEntry } | { action: "updated"; entry: HistoryEntry } | { action: "deleted"; id: number } | { action: "toggled"; id: number } | { action: "cleared" }
 /**
  * Result of changing keyboard implementation
  */
@@ -1301,9 +1550,35 @@ export type LanguageStatus =
  * Auto can't work here; `language` is used instead.
  */
 { kind: "auto_unavailable"; language: string; reason: AutoUnavailableReason }
+/**
+ * S1 control-line knob: general text or an email layout.
+ */
+export type LocalLlmContext = "general" | "email"
+/**
+ * One registry entry as the UI sees it.
+ */
+export type LocalLlmModelInfo = { id: string; display_name: string; attribution: string; card_url: string; size_bytes: number; prompt_style: PromptStyle; downloaded: boolean }
+/**
+ * State name as sent to the UI.
+ */
+export type LocalLlmStateKind = "unloaded" | "starting" | "ready" | "stopping" | "failed"
+/**
+ * Payload of the `local-llm-state-changed` event and `get_local_llm_status`.
+ */
+export type LocalLlmStatus = { state: LocalLlmStateKind; model_id: string | null; error: string | null }
+/**
+ * S1 control-line knob: prose paragraphs or Markdown lists.
+ */
+export type LocalLlmStructure = "prose" | "lists"
+/**
+ * S1 control-line knob: how formal the cleaned text reads.
+ */
+export type LocalLlmStyling = "casual" | "semi_casual" | "semi_formal" | "formal"
 export type LogLevel = "trace" | "debug" | "info" | "warn" | "error"
+export type ManagerSnapshot = { state: State; preparation: Preparation; ready: WorkerReady | null; fallback_from: Device | null }
 export type ModelInfo = { id: string; name: string; description: string; filename: string; source: ModelSource; size_mb: number; is_downloaded: boolean; is_downloading: boolean; partial_size: number; accuracy_score: number; speed_score: number; supports_translation: boolean; is_recommended: boolean; supported_languages: string[]; supports_language_selection: boolean; is_custom: boolean; supports_streaming: boolean; supports_language_detection: boolean }
 export type ModelLoadStatus = { is_loaded: boolean; current_model: string | null }
+export type ModelRating = { quality: number; devices: Partial<{ [key in Device]: DeviceRating }> }
 /**
  * Where a model comes from and how Handy obtains it — the routing discriminant
  * for downloading and on-disk resolution.
@@ -1374,6 +1649,10 @@ export type PaginatedHistory = { entries: HistoryEntry[]; has_more: boolean }
 export type PasteMethod = "ctrl_v" | "direct" | "none" | "shift_insert" | "ctrl_shift_v" | "external_script"
 export type PermissionAccess = "allowed" | "denied" | "unknown"
 /**
+ * Playback and buffering states exposed to session consumers.
+ */
+export type PlaybackState = "waiting" | "starting" | "buffering" | "playing" | "paused" | "finished" | "error"
+/**
  * Request format a post-processing endpoint speaks. Built-in providers have a
  * fixed format; only the custom provider lets the user change it.
  */
@@ -1387,6 +1666,15 @@ export type PostProcessApiFormat =
  */
 "anthropic"
 export type PostProcessProvider = { id: string; label: string; base_url: string; allow_base_url_edit?: boolean; models_endpoint?: string | null; supports_structured_output?: boolean; api_format?: PostProcessApiFormat }
+export type Preparation = { state: "idle" } | { state: "preparing"; device: Device; completed: number; total: number; graph: string } | { state: "ready"; device: Device } | { state: "failed"; device: Device; error: string }
+/**
+ * How the chat messages for a model are built.
+ */
+export type PromptStyle = 
+/**
+ * S1-mini: fixed card system prompt, control line + transcript as the user turn.
+ */
+"s1_control_line" | "plain_system_prompt"
 /**
  * Recording phase events for windows that follow along (onboarding's Try it).
  */
@@ -1414,6 +1702,7 @@ export type RecordingStateEvent = { phase: RecordingPhase }
  * A retired ONNX model found on disk.
  */
 export type RetiredModel = { id: string; name: string; size_mb: number; replacement_repo: string }
+export type RunOn = "auto" | "cpu" | "gpu" | "npu"
 export type SecretMap = Partial<{ [key in string]: string }>
 export type SecureInputStatus = { 
 /**
@@ -1447,6 +1736,12 @@ uncovered_bindings: string[];
  * warning banner appears and explains why recording refused.
  */
 recorder_blocked: boolean }
+export type Selection = { model_id: string; voice: string; speed: number; pitch: number; output_device: string | null; read_code: boolean }
+/**
+ * Playback progress and errors suitable for frontend events.
+ */
+export type SessionSnapshot = { epoch: number; state: PlaybackState; source_start: number; source_end: number; elapsed_seconds: number; remaining_seconds: number; progress: number; error: string | null; output_fallback: boolean; queued_audio_seconds: number; buffering_pauses: number; head_start_seconds: number | null }
+export type SessionView = { client_revision: number | null; document_id: number; text: string; visible: boolean; snapshot: SessionSnapshot }
 /**
  * How the transcribe shortcut's key events drive a recording.
  */
@@ -1467,6 +1762,7 @@ export type ShortcutActivation =
 "hold_or_toggle"
 export type ShortcutBinding = { id: string; name: string; description: string; default_binding: string; current_binding: string }
 export type SoundTheme = "marimba" | "pop" | "custom"
+export type State = "Unloaded" | "Starting" | "Ready" | "Stopping" | "Failed"
 /**
  * Phase of the streaming overlay card, emitted to drive its UI state.
  */
@@ -1546,9 +1842,11 @@ export type TranscriptionOutcome =
  * Transcribing or pasting failed.
  */
 "failed"
+export type TtsModelInfo = { id: string; display_name: string; license: string; attribution: string; card_url: string; size_bytes: number; voices: string[]; default_voice: string; downloaded: boolean; downloading: boolean; active: boolean; rating: ModelRating; run_on: RunOn; preparation: Preparation; npu_driver_too_old: boolean }
 export type TypingTool = "auto" | "wtype" | "kwtype" | "dotool" | "ydotool" | "xdotool"
 export type VadBackend = "silero" | "earshot"
 export type WindowsMicrophonePermissionStatus = { supported: boolean; overall_access: PermissionAccess; device_access: PermissionAccess; app_access: PermissionAccess; desktop_app_access: PermissionAccess }
+export type WorkerReady = { device: Device; placement: Partial<{ [key in string]: Device }> }
 
 /** tauri-specta globals **/
 

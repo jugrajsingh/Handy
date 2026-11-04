@@ -1,5 +1,5 @@
 use crate::managers::{
-    history::{HistoryEntry, HistoryClearSummary, HistoryManager, PaginatedHistory},
+    history::{HistoryClearSummary, HistoryEntry, HistoryManager, PaginatedHistory},
     transcription_jobs::TranscriptionJobManager,
 };
 use std::path::PathBuf;
