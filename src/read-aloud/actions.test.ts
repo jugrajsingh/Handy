@@ -118,3 +118,37 @@ await empty.stop();
 assert.equal(emptyPlays, 0, "empty play dependency count");
 assert.equal(idleStops, 0, "idle stop dependency count");
 console.log("popup per-state play/stop dependency counts passed");
+
+const { routePopupKey } = await import("./actions");
+const keys: string[] = [];
+const keyActions = {
+  close: () => {
+    keys.push("close");
+  },
+  toggle: () => {
+    keys.push("toggle");
+  },
+};
+for (const [key, ctrlKey] of [
+  [" ", false],
+  ["Enter", false],
+  ["Enter", true],
+  ["Escape", false],
+] as const) {
+  routePopupKey(
+    {
+      key,
+      ctrlKey,
+      defaultPrevented: false,
+      preventDefault: () => {
+        keys.push("prevent");
+      },
+    },
+    keyActions,
+  );
+}
+assert.deepEqual(
+  keys,
+  ["prevent", "toggle", "prevent", "close"],
+  "Textarea Space and Enter stay text; Ctrl+Enter and Escape route",
+);

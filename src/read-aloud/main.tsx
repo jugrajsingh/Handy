@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
 import { commands, type SessionSnapshot, type Result } from "@/bindings";
 import { createPopupAdapter, type PopupEvent } from "./adapter";
 import { routePopupKey } from "./actions";
+import { enterPopupEdit, togglePopupPlayback } from "./presentation";
 import { ReadAloudPopup } from "./ReadAloudPopup";
 import "@/i18n";
 import "@/App.css";
@@ -30,6 +31,9 @@ function unwrap<T>(result: Result<T, string>): T {
 function PopupApp() {
   const { t } = useTranslation();
   const [text, setText] = useState("");
+  const [editing, setEditing] = useState(false);
+  const [modelName, setModelName] = useState<string>();
+  const documentId = useRef<number | null>(null);
   const [snapshot, setSnapshot] = useState(initial);
   const current = useRef({ ...initial, text: "" });
   current.current = { ...snapshot, text };
@@ -64,7 +68,15 @@ function PopupApp() {
     [],
   );
   useEffect(() => {
-    const keydown = (event: KeyboardEvent) => routePopupKey(event, actions);
+    const keydown = (event: KeyboardEvent) =>
+      routePopupKey(event, {
+        close: actions.close,
+        toggle: () =>
+          togglePopupPlayback({
+            toggle: () => void actions.toggle(),
+            setEditing,
+          }),
+      });
     window.addEventListener("keydown", keydown);
     return () => window.removeEventListener("keydown", keydown);
   }, [actions]);
@@ -74,7 +86,17 @@ function PopupApp() {
   useEffect(() => {
     let alive = true;
     const unlisten = listen<PopupEvent>("read-aloud-state", ({ payload }) => {
-      if (alive) actions.event(payload);
+      if (alive) {
+        if (
+          payload.snapshot.epoch >= current.current.epoch &&
+          payload.document_id > (documentId.current ?? -1) &&
+          payload.client_revision === null
+        ) {
+          documentId.current = payload.document_id;
+          setEditing(false);
+        }
+        actions.event(payload);
+      }
     });
     void commands
       .getReadAloudState()
@@ -88,15 +110,46 @@ function PopupApp() {
       void unlisten.then((stop) => stop());
     };
   }, [actions]);
+  useEffect(() => {
+    let alive = true;
+    setModelName(undefined);
+    void Promise.all([
+      commands.getAppSettings().then(unwrap),
+      commands.getTtsModels().then(unwrap),
+    ])
+      .then(([settings, models]) => {
+        if (alive)
+          setModelName(
+            models.find(
+              (model) => model.id === (settings.tts_model_id ?? "pocket-en"),
+            )?.display_name,
+          );
+      })
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [snapshot.epoch]);
   return (
     <ReadAloudPopup
       text={text}
+      modelName={modelName}
+      editing={editing}
+      enterEdit={(value) =>
+        enterPopupEdit(value, {
+          edit: (next) => void actions.edit(next),
+          setEditing,
+        })
+      }
       snapshot={snapshot}
       edit={(value) => {
         void actions.edit(value);
       }}
       toggle={() => {
-        void actions.toggle();
+        togglePopupPlayback({
+          toggle: () => void actions.toggle(),
+          setEditing,
+        });
       }}
       stop={() => {
         void actions.stop();
