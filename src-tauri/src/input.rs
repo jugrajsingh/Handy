@@ -176,7 +176,10 @@ pub fn get_cursor_position(app_handle: &AppHandle) -> Option<(i32, i32)> {
 /// handling the key need the modifier to still be down — the hold insures
 /// against those. Callers that can detect a failed chord (e.g. the
 /// receipt-sequenced paste path) may use a much shorter hold.
-pub fn send_paste_ctrl_v(enigo: &mut Enigo, hold_ms: u64) -> Result<(), String> {
+pub fn send_paste_ctrl_v(
+    enigo: &mut Enigo,
+    hold_ms: u64,
+) -> Result<(), crate::clipboard::PasteError> {
     // Platform-specific key definitions
     #[cfg(target_os = "macos")]
     let (modifier_key, v_key_code) = (Key::Meta, macos::command_v_key());
@@ -188,16 +191,16 @@ pub fn send_paste_ctrl_v(enigo: &mut Enigo, hold_ms: u64) -> Result<(), String> 
     // Press modifier + V
     enigo
         .key(modifier_key, enigo::Direction::Press)
-        .map_err(|e| format!("Failed to press modifier key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to press modifier key", e))?;
     enigo
         .key(v_key_code, enigo::Direction::Click)
-        .map_err(|e| format!("Failed to click V key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to click V key", e))?;
 
     std::thread::sleep(std::time::Duration::from_millis(hold_ms));
 
     enigo
         .key(modifier_key, enigo::Direction::Release)
-        .map_err(|e| format!("Failed to release modifier key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to release modifier key", e))?;
 
     Ok(())
 }
@@ -205,7 +208,10 @@ pub fn send_paste_ctrl_v(enigo: &mut Enigo, hold_ms: u64) -> Result<(), String> 
 /// Sends a Ctrl+Shift+V paste command.
 /// This is commonly used in terminal applications on Linux to paste without formatting.
 /// Note: On Wayland, this may not work - callers should check for Wayland and use alternative methods.
-pub fn send_paste_ctrl_shift_v(enigo: &mut Enigo, hold_ms: u64) -> Result<(), String> {
+pub fn send_paste_ctrl_shift_v(
+    enigo: &mut Enigo,
+    hold_ms: u64,
+) -> Result<(), crate::clipboard::PasteError> {
     // Platform-specific key definitions
     #[cfg(target_os = "macos")]
     let (modifier_key, v_key_code) = (Key::Meta, macos::command_v_key());
@@ -217,22 +223,22 @@ pub fn send_paste_ctrl_shift_v(enigo: &mut Enigo, hold_ms: u64) -> Result<(), St
     // Press Ctrl/Cmd + Shift + V
     enigo
         .key(modifier_key, enigo::Direction::Press)
-        .map_err(|e| format!("Failed to press modifier key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to press modifier key", e))?;
     enigo
         .key(Key::Shift, enigo::Direction::Press)
-        .map_err(|e| format!("Failed to press Shift key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to press Shift key", e))?;
     enigo
         .key(v_key_code, enigo::Direction::Click)
-        .map_err(|e| format!("Failed to click V key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to click V key", e))?;
 
     std::thread::sleep(std::time::Duration::from_millis(hold_ms));
 
     enigo
         .key(Key::Shift, enigo::Direction::Release)
-        .map_err(|e| format!("Failed to release Shift key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to release Shift key", e))?;
     enigo
         .key(modifier_key, enigo::Direction::Release)
-        .map_err(|e| format!("Failed to release modifier key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to release modifier key", e))?;
 
     Ok(())
 }
@@ -240,7 +246,10 @@ pub fn send_paste_ctrl_shift_v(enigo: &mut Enigo, hold_ms: u64) -> Result<(), St
 /// Sends a Shift+Insert paste command (Windows and Linux only).
 /// This is more universal for terminal applications and legacy software.
 /// Note: On Wayland, this may not work - callers should check for Wayland and use alternative methods.
-pub fn send_paste_shift_insert(enigo: &mut Enigo, hold_ms: u64) -> Result<(), String> {
+pub fn send_paste_shift_insert(
+    enigo: &mut Enigo,
+    hold_ms: u64,
+) -> Result<(), crate::clipboard::PasteError> {
     #[cfg(target_os = "windows")]
     let insert_key_code = Key::Other(0x2D); // VK_INSERT
     #[cfg(not(target_os = "windows"))]
@@ -249,26 +258,29 @@ pub fn send_paste_shift_insert(enigo: &mut Enigo, hold_ms: u64) -> Result<(), St
     // Press Shift + Insert
     enigo
         .key(Key::Shift, enigo::Direction::Press)
-        .map_err(|e| format!("Failed to press Shift key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to press Shift key", e))?;
     enigo
         .key(insert_key_code, enigo::Direction::Click)
-        .map_err(|e| format!("Failed to click Insert key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to click Insert key", e))?;
 
     std::thread::sleep(std::time::Duration::from_millis(hold_ms));
 
     enigo
         .key(Key::Shift, enigo::Direction::Release)
-        .map_err(|e| format!("Failed to release Shift key: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to release Shift key", e))?;
 
     Ok(())
 }
 
 /// Pastes text directly using the enigo text method.
 /// This tries to use system input methods if possible, otherwise simulates keystrokes one by one.
-pub fn paste_text_direct(enigo: &mut Enigo, text: &str) -> Result<(), String> {
+pub fn paste_text_direct(
+    enigo: &mut Enigo,
+    text: &str,
+) -> Result<(), crate::clipboard::PasteError> {
     enigo
         .text(text)
-        .map_err(|e| format!("Failed to send text directly: {}", e))?;
+        .map_err(|e| crate::clipboard::PasteError::input("Failed to send text directly", e))?;
 
     Ok(())
 }

@@ -178,11 +178,14 @@ pub(crate) fn send_chord(
         PasteMethod::CtrlV => crate::input::send_paste_ctrl_v(enigo, CHORD_HOLD_MS),
         PasteMethod::CtrlShiftV => crate::input::send_paste_ctrl_shift_v(enigo, CHORD_HOLD_MS),
         PasteMethod::ShiftInsert => crate::input::send_paste_shift_insert(enigo, CHORD_HOLD_MS),
-        other => Err(format!(
-            "Invalid paste method for clipboard paste: {:?}",
-            other
-        )),
+        other => {
+            return Err(format!(
+                "Invalid paste method for clipboard paste: {:?}",
+                other
+            ))
+        }
     }
+    .map_err(|error| error.to_string())
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]

@@ -21,9 +21,344 @@ static PASTE_LOCK: Mutex<()> = Mutex::new(());
 
 const PASTE_TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A paste failure whose display text is safe for both logs and notices.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{}", self.reason())]
+pub struct PasteError(PasteFailure);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PasteFailure {
+    Authored(String),
+    Execute {
+        tool: &'static str,
+        reason: String,
+    },
+    ToolExit {
+        tool: &'static str,
+        code: Option<i32>,
+    },
+    Unknown,
+}
+
+impl PasteError {
+    fn authored(message: impl Into<String>) -> Self {
+        Self(PasteFailure::Authored(message.into()))
+    }
+
+    fn execute(tool: &'static str, error: std::io::Error) -> Self {
+        Self(PasteFailure::Execute {
+            tool,
+            reason: Self::io_reason(error),
+        })
+    }
+
+    fn io_reason(error: std::io::Error) -> String {
+        if let Some(code) = error.raw_os_error() {
+            std::io::Error::from_raw_os_error(code).to_string()
+        } else if matches!(
+            error.to_string().as_str(),
+            "paste probe output exceeded limit" | "nul byte found in provided data"
+        ) {
+            error.to_string()
+        } else {
+            std::io::Error::from(error.kind()).to_string()
+        }
+    }
+
+    fn tool_exit(tool: &'static str, status: std::process::ExitStatus) -> Self {
+        Self(PasteFailure::ToolExit {
+            tool,
+            code: status.code(),
+        })
+    }
+
+    pub(crate) fn input(operation: &'static str, error: enigo::InputError) -> Self {
+        let reason = match error {
+            // Mapping errors can name a character from the transcript.
+            enigo::InputError::Mapping(_) => "error when mapping keycode to keysym".into(),
+            enigo::InputError::Unmapping(_) => "error when unmapping keysym".into(),
+            other => other.to_string(),
+        };
+        Self::authored(format!("{operation}: {reason}"))
+    }
+
+    fn clipboard_write(error: tauri_plugin_clipboard_manager::Error) -> Self {
+        let reason = match error {
+            tauri_plugin_clipboard_manager::Error::Clipboard(message) => match message.as_str() {
+                "The clipboard contents were not available in the requested format or the clipboard is empty."
+                | "The selected clipboard is not supported with the current system configuration."
+                | "The native clipboard is not accessible due to being held by another party."
+                | "The image or the text that was about the be transferred to/from the clipboard could not be converted to the appropriate format."
+                | "Unknown error while interacting with the clipboard: NSPasteboard#writeObjects: returned false"
+                | "Unknown error while interacting with the clipboard: Could not place the specified text to the clipboard"
+                | "Unknown error while interacting with the clipboard: The clipboard handler thread seems to have stopped. Logging messages may reveal the cause. (See the `log` crate.)" => message,
+                _ => "clipboard operation failed".into(),
+            },
+            _ => "clipboard operation failed".into(),
+        };
+        Self::authored(format!("Failed to write to clipboard: {reason}"))
+    }
+
+    fn reason(&self) -> String {
+        let reason = match &self.0 {
+            PasteFailure::Authored(message) => message.clone(),
+            PasteFailure::Execute { tool, reason } => format!("Failed to execute {tool}: {reason}"),
+            PasteFailure::ToolExit { tool, code } => {
+                let label = if *tool == "external script" {
+                    "External script"
+                } else {
+                    tool
+                };
+                match code {
+                    Some(code) => format!("{label} failed (exit code {code})"),
+                    None => format!("{label} failed (terminated without an exit code)"),
+                }
+            }
+            PasteFailure::Unknown => "Paste failed for an unknown reason".into(),
+        };
+        let mut reason: String = reason
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let mut end = reason.len().min(512);
+        while !reason.is_char_boundary(end) {
+            end -= 1;
+        }
+        reason.truncate(end);
+        reason
+    }
+}
+
+impl From<&str> for PasteError {
+    fn from(message: &str) -> Self {
+        match message {
+            "Input request expired"
+            | "Enigo state not initialized"
+            | "Main thread dropped the running input request"
+            | "Main thread input request expired before starting"
+            | "Main thread dropped the input request"
+            | "Invalid paste method for clipboard paste"
+            | "Unsupported paste method"
+            | "External script path is not configured" => Self::authored(message),
+            _ => Self(PasteFailure::Unknown),
+        }
+    }
+}
+
+impl From<String> for PasteError {
+    fn from(message: String) -> Self {
+        Self::from(message.as_str())
+    }
+}
+
 #[cfg(all(test, unix))]
 mod wbfix3 {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn m1_execution_keeps_the_safe_nul_argument_error() {
+        let expected = Command::new("sh")
+            .arg("fixture\0transcript")
+            .output()
+            .unwrap_err()
+            .to_string();
+        let error = paste_via_external_script("fixture\0transcript", "sh").unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("Failed to execute external script: {expected}"),
+            "execution must retain the safe NUL argument reason"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn m1_native_unknown_and_execution_errors_have_safe_reasons() {
+        let error = unavailable_typing_tool(TypingTool::Dotool);
+        assert_eq!(
+            error.to_string(),
+            "Typing tool Dotool is not available on this system",
+            "unavailable tool must identify its cause"
+        );
+        let error = PasteError::input(
+            "Failed to send text directly",
+            enigo::InputError::InvalidInput("text contains a NULL byte"),
+        );
+        assert_eq!(error.to_string(), "Failed to send text directly: you tried to simulate invalid input: (text contains a NULL byte)", "native input must retain the safe reason");
+        let error = PasteError::input(
+            "Failed to send text directly",
+            enigo::InputError::Mapping("fixture transcript /private/path".into()),
+        );
+        assert_eq!(
+            error.to_string(),
+            "Failed to send text directly: error when mapping keycode to keysym",
+            "native mapping must not expose a transcript character"
+        );
+        let error = PasteError::clipboard_write(tauri_plugin_clipboard_manager::Error::Clipboard(
+            "The native clipboard is not accessible due to being held by another party.".into(),
+        ));
+        assert_eq!(error.to_string(), "Failed to write to clipboard: The native clipboard is not accessible due to being held by another party.", "clipboard write must retain its safe cause");
+        for error in [
+            PasteError::from("unknown fixture transcript /private/path".to_owned()),
+            PasteError::clipboard_write(tauri_plugin_clipboard_manager::Error::Clipboard(
+                "unknown fixture transcript /private/path".into(),
+            )),
+            PasteError::execute(
+                "dotool",
+                std::io::Error::other("fixture transcript /private/path"),
+            ),
+        ] {
+            let reason = error.to_string();
+            assert!(
+                !reason.contains("fixture") && !reason.contains("/private"),
+                "unknown error payloads must not reach diagnostics"
+            );
+        }
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            PasteError::tool_exit("ydotool", std::process::ExitStatus::from_raw(libc::SIGTERM))
+                .to_string(),
+            "ydotool failed (terminated without an exit code)",
+            "signalled tool failure must remain diagnosable"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn m1_fake_ydotool_socket_error_on_stdout_is_not_captured() {
+        let script = "printf 'socket fixture failure'; exit 2";
+        let observed = Command::new("sh").args(["-c", script]).output().unwrap();
+        assert_eq!(observed.stdout, b"socket fixture failure");
+        assert!(observed.stderr.is_empty());
+        let output = paste_tool(Command::new("sh").args(["-c", script]), None).unwrap();
+        assert!(
+            output.stdout.is_empty(),
+            "typing helper stdout must remain discarded"
+        );
+        assert!(output.stderr.is_empty());
+        let notice =
+            crate::actions::paste_failure_notice(PasteError::tool_exit("ydotool", output.status));
+        assert_eq!(
+            notice.detail.as_deref(),
+            Some("ydotool failed (exit code 2)"),
+            "stdout-only socket failure must still show the exit status"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn m1_authored_errors_keep_their_reason() {
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let errors = [
+            input_if_current(&cancelled, || Ok(())).unwrap_err(),
+            queued_input::<()>(|_| Ok(()), || Ok(()), Duration::from_millis(10)).unwrap_err(),
+            configured_script_path(None).unwrap_err(),
+            ydotool_key_args(&PasteMethod::None, YdotoolKeySyntax::RawKeycodes).unwrap_err(),
+            tool_available_with(
+                Command::new("sh").args(["-c", "exec sleep 30"]),
+                Duration::from_millis(50),
+            )
+            .unwrap_err(),
+            detect_ydotool_key_syntax_with(
+                Command::new("sh").args(["-c", "exec sleep 30"]),
+                &OnceLock::new(),
+                Duration::from_millis(50),
+            )
+            .unwrap_err(),
+        ];
+        for error in errors {
+            let expected = error.to_string();
+            assert_ne!(
+                expected, "Paste failed for an unknown reason",
+                "authored paste reason must not become unknown"
+            );
+            assert_eq!(
+                crate::actions::paste_failure_notice(error)
+                    .detail
+                    .as_deref(),
+                Some(expected.as_str()),
+                "authored paste reasons must reach the notice"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn m1_wl_copy_and_unset_script_keep_their_cause() {
+        use std::os::unix::process::ExitStatusExt;
+        let error = write_clipboard_via_wl_copy_with("fixture transcript", |_, _| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(17 << 8),
+                stdout: Vec::new(),
+                stderr: b"fixture transcript /private/path".to_vec(),
+            })
+        })
+        .unwrap_err();
+        assert_eq!(
+            crate::actions::paste_failure_notice(error)
+                .detail
+                .as_deref(),
+            Some("wl-copy failed (exit code 17)"),
+            "wl-copy must retain its failure summary and status"
+        );
+        let error = configured_script_path(Some("")).unwrap_err();
+        assert_eq!(
+            crate::actions::paste_failure_notice(error)
+                .detail
+                .as_deref(),
+            Some("External script path is not configured"),
+            "unset script must retain its actual reason"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn m1_tool_failure_keeps_status_and_io_but_no_private_output() {
+        let error = send_key_combo_via_dotool_with(&PasteMethod::CtrlV, |_, _| {
+            paste_tool(Command::new("sh").args(["-c", "printf 'fixture transcript /private/path'; printf 'fixture transcript /private/path' >&2; exit 9"]), None)
+        }).unwrap_err();
+        assert_eq!(
+            crate::actions::paste_failure_notice(error)
+                .detail
+                .as_deref(),
+            Some("dotool failed (exit code 9)"),
+            "tool failure must retain only summary and exit status"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let error = paste_via_external_script(
+            "fixture transcript",
+            dir.path().join("missing-script").to_str().unwrap(),
+        )
+        .unwrap_err();
+        let expected = format!(
+            "Failed to execute external script: {}",
+            std::io::Error::from_raw_os_error(libc::ENOENT)
+        );
+        assert_eq!(
+            crate::actions::paste_failure_notice(error)
+                .detail
+                .as_deref(),
+            Some(expected.as_str()),
+            "execution failure must retain the io reason without the script path"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.path().join("script");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'fixture transcript /private/path' >&2\nexit 11\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error =
+            paste_via_external_script("fixture transcript", script.to_str().unwrap()).unwrap_err();
+        assert_eq!(
+            crate::actions::paste_failure_notice(error)
+                .detail
+                .as_deref(),
+            Some("External script failed (exit code 11)"),
+            "script failure must exclude its path and stderr"
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -46,7 +381,7 @@ mod wbfix3 {
                 assert_eq!(args, ["type", "--clearmodifiers", "--", "fixture text"]);
                 assert_eq!(timeout, typing_timeout("fixture text"));
                 match outcome {
-                    "spawn" => Err(std::io::Error::other("spawn failure")),
+                    "spawn" => Err(std::io::Error::from_raw_os_error(libc::ENOENT)),
                     "killed" => paste_tool_with_timeout(
                         Command::new("sh").args(["-c", "exec sleep 30"]),
                         None,
@@ -84,13 +419,19 @@ mod wbfix3 {
             );
             match outcome {
                 "success" => assert_eq!(result, Ok(())),
-                "nonzero" => assert_eq!(result.unwrap_err(), "xdotool failed: typing failure"),
+                "nonzero" => assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "xdotool failed (exit code 9)"
+                ),
                 "spawn" => assert_eq!(
-                    result.unwrap_err(),
-                    "Failed to execute xdotool: spawn failure"
+                    result.unwrap_err().to_string(),
+                    format!(
+                        "Failed to execute xdotool: {}",
+                        std::io::Error::from_raw_os_error(libc::ENOENT)
+                    )
                 ),
                 _ => assert_eq!(
-                    result.unwrap_err(),
+                    result.unwrap_err().to_string(),
                     format!(
                         "Failed to execute xdotool: {}",
                         std::io::Error::from(std::io::ErrorKind::TimedOut)
@@ -128,7 +469,10 @@ mod wbfix3 {
                     stderr: b"fixture failure".to_vec(),
                 })
             });
-            assert_eq!(result.unwrap_err(), "dotool failed: fixture failure");
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "dotool failed (exit code 9)"
+            );
         }
     }
 
@@ -598,8 +942,8 @@ fn drain_tool_stderr<R: ProbeRead>(
 
 fn input_if_current<T>(
     cancelled: &std::sync::atomic::AtomicBool,
-    input: impl FnOnce() -> Result<T, String>,
-) -> Result<T, String> {
+    input: impl FnOnce() -> Result<T, PasteError>,
+) -> Result<T, PasteError> {
     if cancelled.load(std::sync::atomic::Ordering::Acquire) {
         return Err("Input request expired".into());
     }
@@ -610,22 +954,22 @@ fn input_if_current<T>(
 /// and waits for the result. Runs inline if already on the main thread, so no deadlock.
 fn with_enigo<T: Send + 'static>(
     app_handle: &AppHandle,
-    f: impl FnOnce(&mut Enigo) -> Result<T, String> + Send + 'static,
-) -> Result<T, String> {
+    f: impl FnOnce(&mut Enigo) -> Result<T, PasteError> + Send + 'static,
+) -> Result<T, PasteError> {
     with_enigo_timeout(app_handle, PASTE_TOOL_TIMEOUT, f)
 }
 
 fn with_enigo_timeout<T: Send + 'static>(
     app_handle: &AppHandle,
     timeout: Duration,
-    f: impl FnOnce(&mut Enigo) -> Result<T, String> + Send + 'static,
-) -> Result<T, String> {
+    f: impl FnOnce(&mut Enigo) -> Result<T, PasteError> + Send + 'static,
+) -> Result<T, PasteError> {
     let app = app_handle.clone();
     queued_input(
         |job| {
-            app_handle
-                .run_on_main_thread(job)
-                .map_err(|e| format!("Failed to run input on the main thread: {e}"))
+            app_handle.run_on_main_thread(job).map_err(|e| {
+                PasteError::authored(format!("Failed to run input on the main thread: {e}"))
+            })
         },
         move || {
             let enigo_state = app
@@ -634,17 +978,17 @@ fn with_enigo_timeout<T: Send + 'static>(
             let mut enigo = enigo_state
                 .0
                 .lock()
-                .map_err(|e| format!("Failed to lock Enigo: {e}"))?;
+                .map_err(|e| PasteError::authored(format!("Failed to lock Enigo: {e}")))?;
             f(&mut enigo)
         },
         timeout,
     )
 }
 fn queued_input<T: Send + 'static>(
-    queue: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), String>,
-    input: impl FnOnce() -> Result<T, String> + Send + 'static,
+    queue: impl FnOnce(Box<dyn FnOnce() + Send>) -> Result<(), PasteError>,
+    input: impl FnOnce() -> Result<T, PasteError> + Send + 'static,
     timeout: Duration,
-) -> Result<T, String> {
+) -> Result<T, PasteError> {
     let (tx, rx) = mpsc::sync_channel(1);
     let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let started = std::sync::Arc::new(Mutex::new(false));
@@ -666,8 +1010,9 @@ fn queued_input<T: Send + 'static>(
             if *started {
                 drop(started);
                 log::warn!("Native input is still running; paste admission remains held");
-                rx.recv()
-                    .map_err(|_| "Main thread dropped the running input request".to_string())?
+                rx.recv().map_err(|_| {
+                    PasteError::from("Main thread dropped the running input request")
+                })?
             } else {
                 cancelled.store(true, std::sync::atomic::Ordering::Release);
                 Err("Main thread input request expired before starting".into())
@@ -679,7 +1024,7 @@ fn queued_input<T: Send + 'static>(
     }
 }
 
-fn write_text_to_clipboard(app_handle: &AppHandle, text: &str) -> Result<(), String> {
+fn write_text_to_clipboard(app_handle: &AppHandle, text: &str) -> Result<(), PasteError> {
     #[cfg(target_os = "linux")]
     if is_wayland() && is_wl_copy_available()? {
         info!("Using wl-copy for clipboard write on Wayland");
@@ -689,14 +1034,14 @@ fn write_text_to_clipboard(app_handle: &AppHandle, text: &str) -> Result<(), Str
     app_handle
         .clipboard()
         .write_text(text)
-        .map_err(|e| format!("Failed to write to clipboard: {}", e))
+        .map_err(PasteError::clipboard_write)
 }
 
 fn finish_clipboard_paste(
-    paste_result: Result<(), String>,
+    paste_result: Result<(), PasteError>,
     paste_delay_after_ms: u64,
     restore_clipboard: impl FnOnce(),
-) -> Result<(), String> {
+) -> Result<(), PasteError> {
     std::thread::sleep(Duration::from_millis(paste_delay_after_ms));
     restore_clipboard();
     paste_result
@@ -709,7 +1054,7 @@ fn paste_via_clipboard(
     paste_method: &PasteMethod,
     paste_delay_ms: u64,
     paste_delay_after_ms: u64,
-) -> Result<(), String> {
+) -> Result<(), PasteError> {
     let clipboard = app_handle.clipboard();
     let saved_text = clipboard.read_text().ok().filter(|t| !t.is_empty());
     // Only probe for an image when there is no text to restore. Text is by far the
@@ -728,7 +1073,7 @@ fn paste_via_clipboard(
 
     // Capture key injection errors so the original clipboard is restored before
     // propagating them to the caller.
-    let paste_result = (|| -> Result<(), String> {
+    let paste_result = (|| -> Result<(), PasteError> {
         // Send paste key combo
         #[cfg(target_os = "linux")]
         let key_combo_sent = try_send_key_combo_linux(paste_method)?;
@@ -772,7 +1117,7 @@ fn paste_via_clipboard(
 /// Attempts to send a key combination using Linux-native tools.
 /// Returns `Ok(true)` if a native tool handled it, `Ok(false)` to fall back to enigo.
 #[cfg(target_os = "linux")]
-fn try_send_key_combo_linux(paste_method: &PasteMethod) -> Result<bool, String> {
+fn try_send_key_combo_linux(paste_method: &PasteMethod) -> Result<bool, PasteError> {
     if is_wayland() {
         // Wayland: prefer wtype (but not on KDE or GNOME), then dotool, then ydotool
         // Note: wtype doesn't work on KDE (no zwp_virtual_keyboard_manager_v1 support)
@@ -813,7 +1158,7 @@ fn try_send_key_combo_linux(paste_method: &PasteMethod) -> Result<bool, String> 
 /// Attempts to type text directly using Linux-native tools.
 /// Returns `Ok(true)` if a native tool handled it, `Ok(false)` to fall back to enigo.
 #[cfg(target_os = "linux")]
-fn try_direct_typing_linux(text: &str, preferred_tool: TypingTool) -> Result<bool, String> {
+fn try_direct_typing_linux(text: &str, preferred_tool: TypingTool) -> Result<bool, PasteError> {
     // If user specified a tool, try only that one
     if preferred_tool != TypingTool::Auto {
         return match preferred_tool {
@@ -842,10 +1187,7 @@ fn try_direct_typing_linux(text: &str, preferred_tool: TypingTool) -> Result<boo
                 type_text_via_xdotool(text)?;
                 Ok(true)
             }
-            _ => Err(format!(
-                "Typing tool {:?} is not available on this system",
-                preferred_tool
-            )),
+            _ => Err(unavailable_typing_tool(preferred_tool)),
         };
     }
 
@@ -893,6 +1235,13 @@ fn try_direct_typing_linux(text: &str, preferred_tool: TypingTool) -> Result<boo
     Ok(false)
 }
 
+#[cfg(target_os = "linux")]
+fn unavailable_typing_tool(tool: TypingTool) -> PasteError {
+    PasteError::authored(format!(
+        "Typing tool {tool:?} is not available on this system"
+    ))
+}
+
 /// Returns the list of available typing tools on this system.
 /// Always includes "auto" as the first entry.
 #[cfg(target_os = "linux")]
@@ -917,12 +1266,15 @@ pub fn get_available_typing_tools() -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-fn tool_available_with(command: &mut Command, timeout: Duration) -> Result<bool, String> {
+fn tool_available_with(command: &mut Command, timeout: Duration) -> Result<bool, PasteError> {
     paste_probe_with_timeout(command, timeout)
         .map(|output| output.status.success())
         .or_else(|error| {
             if error.kind() == std::io::ErrorKind::TimedOut {
-                Err(format!("Typing tool availability probe failed: {error}"))
+                Err(PasteError::authored(format!(
+                    "Typing tool availability probe failed: {}",
+                    PasteError::io_reason(error)
+                )))
             } else {
                 Ok(false)
             }
@@ -931,13 +1283,13 @@ fn tool_available_with(command: &mut Command, timeout: Duration) -> Result<bool,
 
 /// Check if wtype is available (Wayland text input tool)
 #[cfg(target_os = "linux")]
-fn is_wtype_available() -> Result<bool, String> {
+fn is_wtype_available() -> Result<bool, PasteError> {
     tool_available_with(Command::new("which").arg("wtype"), PASTE_PROBE_TIMEOUT)
 }
 
 /// Check if dotool is available (another Wayland text input tool)
 #[cfg(target_os = "linux")]
-fn is_dotool_available() -> Result<bool, String> {
+fn is_dotool_available() -> Result<bool, PasteError> {
     tool_available_with(Command::new("which").arg("dotool"), PASTE_PROBE_TIMEOUT)
 }
 
@@ -977,7 +1329,7 @@ fn classify_ydotool_key_syntax(help: &str) -> Option<YdotoolKeySyntax> {
 /// Detects and caches a recognized ydotool key syntax. Unknown or failed probes are not cached,
 /// allowing a transient daemon or PATH problem to recover on a later paste attempt.
 #[cfg(target_os = "linux")]
-fn detect_ydotool_key_syntax() -> Result<YdotoolKeySyntax, String> {
+fn detect_ydotool_key_syntax() -> Result<YdotoolKeySyntax, PasteError> {
     detect_ydotool_key_syntax_with(
         Command::new("ydotool").args(["key", "--help"]),
         &YDOTOOL_KEY_SYNTAX,
@@ -990,7 +1342,7 @@ fn detect_ydotool_key_syntax_with(
     command: &mut Command,
     cache: &OnceLock<YdotoolKeySyntax>,
     timeout: Duration,
-) -> Result<YdotoolKeySyntax, String> {
+) -> Result<YdotoolKeySyntax, PasteError> {
     if let Some(syntax) = cache.get() {
         return Ok(*syntax);
     }
@@ -1022,36 +1374,39 @@ fn detect_ydotool_key_syntax_with(
             log::warn!("Could not query ydotool key syntax: {error}; using raw-keycode syntax");
             Ok(YDOTOOL_UNKNOWN_HELP_FALLBACK)
         }
-        Err(error) => Err(format!("Could not query ydotool key syntax: {error}")),
+        Err(error) => Err(PasteError::authored(format!(
+            "Could not query ydotool key syntax: {}",
+            PasteError::io_reason(error)
+        ))),
     }
 }
 
 /// Check if ydotool is available (uinput-based, works on both Wayland and X11)
 #[cfg(target_os = "linux")]
-fn is_ydotool_available() -> Result<bool, String> {
+fn is_ydotool_available() -> Result<bool, PasteError> {
     tool_available_with(Command::new("which").arg("ydotool"), PASTE_PROBE_TIMEOUT)
 }
 
 #[cfg(target_os = "linux")]
-fn is_xdotool_available() -> Result<bool, String> {
+fn is_xdotool_available() -> Result<bool, PasteError> {
     tool_available_with(Command::new("which").arg("xdotool"), PASTE_PROBE_TIMEOUT)
 }
 
 /// Check if kwtype is available (KDE Wayland virtual keyboard input tool)
 #[cfg(target_os = "linux")]
-fn is_kwtype_available() -> Result<bool, String> {
+fn is_kwtype_available() -> Result<bool, PasteError> {
     tool_available_with(Command::new("which").arg("kwtype"), PASTE_PROBE_TIMEOUT)
 }
 
 /// Check if wl-copy is available (Wayland clipboard tool)
 #[cfg(target_os = "linux")]
-fn is_wl_copy_available() -> Result<bool, String> {
+fn is_wl_copy_available() -> Result<bool, PasteError> {
     tool_available_with(Command::new("which").arg("wl-copy"), PASTE_PROBE_TIMEOUT)
 }
 
 /// Type text directly via wtype on Wayland.
 #[cfg(target_os = "linux")]
-fn type_text_via_wtype(text: &str) -> Result<(), String> {
+fn type_text_via_wtype(text: &str) -> Result<(), PasteError> {
     let output = typing_tool(
         Command::new("wtype")
             .arg("--") // Protect against text starting with -
@@ -1059,11 +1414,10 @@ fn type_text_via_wtype(text: &str) -> Result<(), String> {
         None,
         text,
     )
-    .map_err(|e| format!("Failed to execute wtype: {}", e))?;
+    .map_err(|e| PasteError::execute("wtype", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("wtype failed: {}", stderr));
+        return Err(PasteError::tool_exit("wtype", output.status));
     }
 
     Ok(())
@@ -1071,7 +1425,7 @@ fn type_text_via_wtype(text: &str) -> Result<(), String> {
 
 /// Type text directly via xdotool on X11.
 #[cfg(target_os = "linux")]
-fn type_text_via_xdotool(text: &str) -> Result<(), String> {
+fn type_text_via_xdotool(text: &str) -> Result<(), PasteError> {
     type_text_via_xdotool_with(text, paste_tool_with_timeout)
 }
 
@@ -1083,7 +1437,7 @@ fn type_text_via_xdotool_with(
         Option<Vec<u8>>,
         Duration,
     ) -> std::io::Result<std::process::Output>,
-) -> Result<(), String> {
+) -> Result<(), PasteError> {
     let output = run(
         Command::new("xdotool")
             .arg("type")
@@ -1093,7 +1447,7 @@ fn type_text_via_xdotool_with(
         None,
         typing_timeout(text),
     )
-    .map_err(|e| format!("Failed to execute xdotool: {}", e));
+    .map_err(|e| PasteError::execute("xdotool", e));
 
     // `--clearmodifiers` restores the modifiers that were held when xdotool
     // started. If the user releases one while xdotool is typing, that synthetic
@@ -1136,8 +1490,7 @@ fn type_text_via_xdotool_with(
 
     let output = output?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("xdotool failed: {}", stderr));
+        return Err(PasteError::tool_exit("xdotool", output.status));
     }
 
     Ok(())
@@ -1168,35 +1521,31 @@ fn dotool_type_script(text: &str) -> String {
 
 /// Type text directly via dotool (works on both Wayland and X11 via uinput).
 #[cfg(target_os = "linux")]
-fn type_text_via_dotool(text: &str) -> Result<(), String> {
+fn type_text_via_dotool(text: &str) -> Result<(), PasteError> {
     let output = typing_tool(
         &mut Command::new("dotool"),
         Some(dotool_type_script(text).into_bytes()),
         text,
     )
-    .map_err(|e| format!("Failed to execute dotool: {e}"))?;
+    .map_err(|e| PasteError::execute("dotool", e))?;
     if !output.status.success() {
-        return Err(format!(
-            "dotool failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        return Err(PasteError::tool_exit("dotool", output.status));
     }
     Ok(())
 }
 
 /// Type text directly via ydotool (uinput-based, requires ydotoold daemon).
 #[cfg(target_os = "linux")]
-fn type_text_via_ydotool(text: &str) -> Result<(), String> {
+fn type_text_via_ydotool(text: &str) -> Result<(), PasteError> {
     let output = typing_tool(
         Command::new("ydotool").arg("type").arg("--").arg(text),
         None,
         text,
     )
-    .map_err(|e| format!("Failed to execute ydotool: {}", e))?;
+    .map_err(|e| PasteError::execute("ydotool", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ydotool failed: {}", stderr));
+        return Err(PasteError::tool_exit("ydotool", output.status));
     }
 
     Ok(())
@@ -1204,13 +1553,12 @@ fn type_text_via_ydotool(text: &str) -> Result<(), String> {
 
 /// Type text directly via kwtype (KDE Wayland virtual keyboard, uses KDE Fake Input protocol).
 #[cfg(target_os = "linux")]
-fn type_text_via_kwtype(text: &str) -> Result<(), String> {
+fn type_text_via_kwtype(text: &str) -> Result<(), PasteError> {
     let output = typing_tool(Command::new("kwtype").arg("--").arg(text), None, text)
-        .map_err(|e| format!("Failed to execute kwtype: {}", e))?;
+        .map_err(|e| PasteError::execute("kwtype", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("kwtype failed: {}", stderr));
+        return Err(PasteError::tool_exit("kwtype", output.status));
     }
 
     Ok(())
@@ -1220,9 +1568,17 @@ fn type_text_via_kwtype(text: &str) -> Result<(), String> {
 /// Uses Stdio::null() to avoid blocking on repeated calls — wl-copy forks a
 /// daemon that inherits piped fds, causing read_to_end to hang indefinitely.
 #[cfg(target_os = "linux")]
-fn write_clipboard_via_wl_copy(text: &str) -> Result<(), String> {
+fn write_clipboard_via_wl_copy(text: &str) -> Result<(), PasteError> {
+    write_clipboard_via_wl_copy_with(text, quiet_tool)
+}
+
+#[cfg(target_os = "linux")]
+fn write_clipboard_via_wl_copy_with(
+    text: &str,
+    run: impl FnOnce(&mut Command, Duration) -> std::io::Result<std::process::Output>,
+) -> Result<(), PasteError> {
     use std::process::Stdio;
-    let status = quiet_tool(
+    let status = run(
         Command::new("wl-copy")
             .arg("--")
             .arg(text)
@@ -1231,10 +1587,10 @@ fn write_clipboard_via_wl_copy(text: &str) -> Result<(), String> {
         PASTE_TOOL_TIMEOUT,
     )
     .map(|output| output.status)
-    .map_err(|e| format!("Failed to execute wl-copy: {}", e))?;
+    .map_err(|e| PasteError::execute("wl-copy", e))?;
 
     if !status.success() {
-        return Err("wl-copy failed".into());
+        return Err(PasteError::tool_exit("wl-copy", status));
     }
 
     Ok(())
@@ -1242,7 +1598,7 @@ fn write_clipboard_via_wl_copy(text: &str) -> Result<(), String> {
 
 /// Send a key combination (e.g., Ctrl+V) via wtype on Wayland.
 #[cfg(target_os = "linux")]
-fn send_key_combo_via_wtype(paste_method: &PasteMethod) -> Result<(), String> {
+fn send_key_combo_via_wtype(paste_method: &PasteMethod) -> Result<(), PasteError> {
     let args: Vec<&str> = match paste_method {
         PasteMethod::CtrlV => vec!["-M", "ctrl", "-k", "v", "-m", "ctrl"],
         PasteMethod::ShiftInsert => vec!["-M", "shift", "-k", "Insert", "-m", "shift"],
@@ -1253,11 +1609,10 @@ fn send_key_combo_via_wtype(paste_method: &PasteMethod) -> Result<(), String> {
     };
 
     let output = paste_tool(Command::new("wtype").args(&args), None)
-        .map_err(|e| format!("Failed to execute wtype: {}", e))?;
+        .map_err(|e| PasteError::execute("wtype", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("wtype failed: {}", stderr));
+        return Err(PasteError::tool_exit("wtype", output.status));
     }
 
     Ok(())
@@ -1265,7 +1620,7 @@ fn send_key_combo_via_wtype(paste_method: &PasteMethod) -> Result<(), String> {
 
 /// Send a key combination (e.g., Ctrl+V) via dotool.
 #[cfg(target_os = "linux")]
-fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), String> {
+fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), PasteError> {
     send_key_combo_via_dotool_with(paste_method, paste_tool)
 }
 
@@ -1273,7 +1628,7 @@ fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), String> {
 fn send_key_combo_via_dotool_with(
     paste_method: &PasteMethod,
     run: impl FnOnce(&mut Command, Option<Vec<u8>>) -> std::io::Result<std::process::Output>,
-) -> Result<(), String> {
+) -> Result<(), PasteError> {
     let command = match paste_method {
         PasteMethod::CtrlV => "key ctrl+v\n",
         PasteMethod::ShiftInsert => "key shift+insert\n",
@@ -1284,12 +1639,9 @@ fn send_key_combo_via_dotool_with(
         &mut Command::new("dotool"),
         Some(command.as_bytes().to_vec()),
     )
-    .map_err(|e| format!("Failed to execute dotool: {}", e))?;
+    .map_err(|e| PasteError::execute("dotool", e))?;
     if !output.status.success() {
-        return Err(format!(
-            "dotool failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        return Err(PasteError::tool_exit("dotool", output.status));
     }
 
     Ok(())
@@ -1299,7 +1651,7 @@ fn send_key_combo_via_dotool_with(
 fn ydotool_key_args(
     paste_method: &PasteMethod,
     syntax: YdotoolKeySyntax,
-) -> Result<&'static [&'static str], String> {
+) -> Result<&'static [&'static str], PasteError> {
     let args = match (paste_method, syntax) {
         (PasteMethod::CtrlV, YdotoolKeySyntax::Symbolic) => &["key", "ctrl+v"][..],
         (PasteMethod::CtrlShiftV, YdotoolKeySyntax::Symbolic) => &["key", "ctrl+shift+v"][..],
@@ -1321,16 +1673,15 @@ fn ydotool_key_args(
 
 /// Send a key combination (e.g., Ctrl+V) via ydotool (requires ydotoold daemon).
 #[cfg(target_os = "linux")]
-fn send_key_combo_via_ydotool(paste_method: &PasteMethod) -> Result<(), String> {
+fn send_key_combo_via_ydotool(paste_method: &PasteMethod) -> Result<(), PasteError> {
     let syntax = detect_ydotool_key_syntax()?;
     let args = ydotool_key_args(paste_method, syntax)?;
 
     let output = paste_tool(Command::new("ydotool").args(args), None)
-        .map_err(|e| format!("Failed to execute ydotool: {}", e))?;
+        .map_err(|e| PasteError::execute("ydotool", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("ydotool failed: {}", stderr));
+        return Err(PasteError::tool_exit("ydotool", output.status));
     }
 
     Ok(())
@@ -1338,7 +1689,7 @@ fn send_key_combo_via_ydotool(paste_method: &PasteMethod) -> Result<(), String> 
 
 /// Send a key combination (e.g., Ctrl+V) via xdotool on X11.
 #[cfg(target_os = "linux")]
-fn send_key_combo_via_xdotool(paste_method: &PasteMethod) -> Result<(), String> {
+fn send_key_combo_via_xdotool(paste_method: &PasteMethod) -> Result<(), PasteError> {
     let key_combo = match paste_method {
         PasteMethod::CtrlV => "ctrl+v",
         PasteMethod::CtrlShiftV => "ctrl+shift+v",
@@ -1353,19 +1704,23 @@ fn send_key_combo_via_xdotool(paste_method: &PasteMethod) -> Result<(), String> 
             .arg(key_combo),
         None,
     )
-    .map_err(|e| format!("Failed to execute xdotool: {}", e))?;
+    .map_err(|e| PasteError::execute("xdotool", e))?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("xdotool failed: {}", stderr));
+        return Err(PasteError::tool_exit("xdotool", output.status));
     }
 
     Ok(())
 }
 
+fn configured_script_path(path: Option<&str>) -> Result<&str, PasteError> {
+    path.filter(|p| !p.is_empty())
+        .ok_or_else(|| "External script path is not configured".into())
+}
+
 /// Pastes text by invoking an external script.
 /// The script receives the text to paste as a single argument.
-fn paste_via_external_script(text: &str, script_path: &str) -> Result<(), String> {
+fn paste_via_external_script(text: &str, script_path: &str) -> Result<(), PasteError> {
     info!("Pasting via external script");
 
     // Do not capture the script's stdio. Wayland clipboard helpers such as
@@ -1383,14 +1738,10 @@ fn paste_via_external_script(text: &str, script_path: &str) -> Result<(), String
         typing_timeout(text),
     )
     .map(|output| output.status)
-    .map_err(|e| format!("Failed to execute external script '{}': {}", script_path, e))?;
+    .map_err(|e| PasteError::execute("external script", e))?;
 
     if !status.success() {
-        return Err(format!(
-            "External script '{}' failed with exit code {:?}",
-            script_path,
-            status.code()
-        ));
+        return Err(PasteError::tool_exit("external script", status));
     }
 
     Ok(())
@@ -1401,7 +1752,7 @@ fn paste_direct(
     text: &str,
     app_handle: &AppHandle,
     #[cfg(target_os = "linux")] typing_tool: TypingTool,
-) -> Result<(), String> {
+) -> Result<(), PasteError> {
     #[cfg(target_os = "linux")]
     let handled = try_direct_typing_linux(text, typing_tool);
     #[cfg(not(target_os = "linux"))]
@@ -1417,9 +1768,9 @@ fn paste_direct(
 }
 
 fn paste_with_fallback(
-    handled: Result<bool, String>,
-    native: impl FnOnce() -> Result<(), String>,
-) -> Result<(), String> {
+    handled: Result<bool, PasteError>,
+    native: impl FnOnce() -> Result<(), PasteError>,
+) -> Result<(), PasteError> {
     if handled? {
         Ok(())
     } else {
@@ -1427,43 +1778,46 @@ fn paste_with_fallback(
     }
 }
 
-pub(crate) fn send_return_key(enigo: &mut Enigo, key_type: AutoSubmitKey) -> Result<(), String> {
+pub(crate) fn send_return_key(
+    enigo: &mut Enigo,
+    key_type: AutoSubmitKey,
+) -> Result<(), PasteError> {
     match key_type {
         AutoSubmitKey::Enter => {
             enigo
                 .key(Key::Return, Direction::Press)
-                .map_err(|e| format!("Failed to press Return key: {}", e))?;
+                .map_err(|e| PasteError::input("Failed to press Return key", e))?;
             enigo
                 .key(Key::Return, Direction::Release)
-                .map_err(|e| format!("Failed to release Return key: {}", e))?;
+                .map_err(|e| PasteError::input("Failed to release Return key", e))?;
         }
         AutoSubmitKey::CtrlEnter => {
             enigo
                 .key(Key::Control, Direction::Press)
-                .map_err(|e| format!("Failed to press Control key: {}", e))?;
+                .map_err(|e| PasteError::input("Failed to press Control key", e))?;
             enigo
                 .key(Key::Return, Direction::Press)
-                .map_err(|e| format!("Failed to press Return key: {}", e))?;
+                .map_err(|e| PasteError::input("Failed to press Return key", e))?;
             enigo
                 .key(Key::Return, Direction::Release)
-                .map_err(|e| format!("Failed to release Return key: {}", e))?;
+                .map_err(|e| PasteError::input("Failed to release Return key", e))?;
             enigo
                 .key(Key::Control, Direction::Release)
-                .map_err(|e| format!("Failed to release Control key: {}", e))?;
+                .map_err(|e| PasteError::input("Failed to release Control key", e))?;
         }
         AutoSubmitKey::CmdEnter => {
             enigo
                 .key(Key::Meta, Direction::Press)
-                .map_err(|e| format!("Failed to press Meta/Cmd key: {}", e))?;
+                .map_err(|e| PasteError::input("Failed to press Meta/Cmd key", e))?;
             enigo
                 .key(Key::Return, Direction::Press)
-                .map_err(|e| format!("Failed to press Return key: {}", e))?;
+                .map_err(|e| PasteError::input("Failed to press Return key", e))?;
             enigo
                 .key(Key::Return, Direction::Release)
-                .map_err(|e| format!("Failed to release Return key: {}", e))?;
+                .map_err(|e| PasteError::input("Failed to release Return key", e))?;
             enigo
                 .key(Key::Meta, Direction::Release)
-                .map_err(|e| format!("Failed to release Meta/Cmd key: {}", e))?;
+                .map_err(|e| PasteError::input("Failed to release Meta/Cmd key", e))?;
         }
     }
 
@@ -1474,7 +1828,7 @@ fn should_send_auto_submit(auto_submit: bool, paste_method: PasteMethod) -> bool
     auto_submit && paste_method != PasteMethod::None
 }
 
-fn with_paste_lock<T>(paste: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+fn with_paste_lock<T>(paste: impl FnOnce() -> Result<T, PasteError>) -> Result<T, PasteError> {
     let _paste = PASTE_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     paste()
 }
@@ -1483,16 +1837,16 @@ pub fn paste(
     text: String,
     app_handle: AppHandle,
     completion: handy_tts_core::handoff::PasteCompletion,
-) -> Result<(), String> {
+) -> Result<(), PasteError> {
     with_paste_lock(|| {
         let result = paste_inner(text, app_handle, &completion);
         acknowledge_paste(result, &completion)
     })
 }
 fn acknowledge_paste(
-    result: Result<bool, String>,
+    result: Result<bool, PasteError>,
     completion: &handy_tts_core::handoff::PasteCompletion,
-) -> Result<(), String> {
+) -> Result<(), PasteError> {
     if !matches!(result, Ok(true)) {
         completion.settle_with(|| {});
     }
@@ -1502,7 +1856,7 @@ fn paste_inner(
     text: String,
     app_handle: AppHandle,
     _completion: &handy_tts_core::handoff::PasteCompletion,
-) -> Result<bool, String> {
+) -> Result<bool, PasteError> {
     let settings = get_settings(&app_handle);
     let paste_method = settings.paste_method;
     let paste_delay_ms = settings.paste_delay_ms;
@@ -1562,6 +1916,7 @@ fn paste_inner(
                             completion,
                         },
                     )
+                    .map_err(PasteError::authored)
                 });
                 match reliable_result {
                     Ok(()) => return Ok(true),
@@ -1579,11 +1934,7 @@ fn paste_inner(
             )?
         }
         PasteMethod::ExternalScript => {
-            let script_path = settings
-                .external_script_path
-                .as_ref()
-                .filter(|p| !p.is_empty())
-                .ok_or("External script path is not configured")?;
+            let script_path = configured_script_path(settings.external_script_path.as_deref())?;
             paste_via_external_script(&text, script_path)?;
         }
     }
@@ -2241,7 +2592,7 @@ print('Each key sequence: modifiers separated by plus (+)', file=sys.stderr)
         completion.settle_with(|| native_settled.store(true, std::sync::atomic::Ordering::Release));
         completion.settle_with(|| panic!("native settlement runs exactly once"));
         assert!(referee.lock().unwrap().popup_open);
-        for result in [Ok(false), Err("synchronous failure".to_string())] {
+        for result in [Ok(false), Err("Input request expired".into())] {
             let acknowledged = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let done = acknowledged.clone();
             let completion = PasteCompletion::new(move || {
@@ -2371,11 +2722,11 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
     #[test]
     fn clipboard_is_restored_before_key_injection_error_is_returned() {
         let restored = Cell::new(false);
-        let result = finish_clipboard_paste(Err("input failed".into()), 0, || {
+        let result = finish_clipboard_paste(Err("Input request expired".into()), 0, || {
             restored.set(true);
         });
 
-        assert_eq!(result.unwrap_err(), "input failed");
+        assert_eq!(result.unwrap_err().to_string(), "Input request expired");
         assert!(restored.get());
     }
 

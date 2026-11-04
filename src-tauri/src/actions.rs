@@ -31,30 +31,10 @@ use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager};
 use tauri_specta::Event;
 
-fn paste_failure_notice(error: String) -> Notice {
-    // Only fixed ASCII summaries enter notices; tool output can contain transcript fragments.
-    let detail = [
-        ("Failed to execute wtype:", "Failed to execute wtype"),
-        ("wtype failed:", "wtype failed"),
-        ("Failed to execute xdotool:", "Failed to execute xdotool"),
-        ("xdotool failed:", "xdotool failed"),
-        ("Failed to execute dotool:", "Failed to execute dotool"),
-        ("dotool failed:", "dotool failed"),
-        ("Failed to execute ydotool:", "Failed to execute ydotool"),
-        ("ydotool failed:", "ydotool failed"),
-        ("Failed to execute kwtype:", "Failed to execute kwtype"),
-        ("kwtype failed:", "kwtype failed"),
-        ("Failed to execute wl-copy:", "Failed to execute wl-copy"),
-        ("wl-copy failed:", "wl-copy failed"),
-        (
-            "Failed to execute external script",
-            "Failed to execute external script",
-        ),
-        ("External script ", "External script failed"),
-    ]
-    .into_iter()
-    .find_map(|(prefix, summary)| error.starts_with(prefix).then(|| summary.to_owned()));
-    Notice::new(NoticeCode::PasteFailed, NoticeSource::Dictation).with_detail(detail)
+pub(crate) fn paste_failure_notice(error: crate::clipboard::PasteError) -> Notice {
+    let reason = error.to_string();
+    error!("Failed to paste transcription: {reason}");
+    Notice::new(NoticeCode::PasteFailed, NoticeSource::Dictation).with_detail(reason)
 }
 
 /// How a dictation ended.
@@ -1114,13 +1094,10 @@ impl ShortcutAction for TranscribeAction {
                                                 });
                                                 (TranscriptionOutcome::Typed, notice)
                                             }
-                                            Err(error) => {
-                                                error!("Failed to paste transcription");
-                                                (
-                                                    TranscriptionOutcome::Failed,
-                                                    Some(paste_failure_notice(error)),
-                                                )
-                                            }
+                                            Err(error) => (
+                                                TranscriptionOutcome::Failed,
+                                                Some(paste_failure_notice(error)),
+                                            ),
                                         };
                                         match (owns_ui(), notice) {
                                             (true, Some(notice)) => {
@@ -1303,6 +1280,48 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
 #[cfg(test)]
 mod tests {
     #[test]
+    fn m1_paste_failure_logs_the_same_safe_reason_as_the_notice() {
+        if std::env::var_os("HANDY_TEST_PASTE_REASON_LOG").is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "actions::tests::m1_paste_failure_logs_the_same_safe_reason_as_the_notice",
+                    "--nocapture",
+                ])
+                .env("HANDY_TEST_PASTE_REASON_LOG", "1")
+                .status()
+                .unwrap();
+            assert!(
+                status.success(),
+                "paste failure log and notice must share the safe reason"
+            );
+            return;
+        }
+        struct Logs(std::sync::Mutex<Vec<String>>);
+        impl log::Log for Logs {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, record: &log::Record<'_>) {
+                self.0.lock().unwrap().push(record.args().to_string());
+            }
+            fn flush(&self) {}
+        }
+        static LOGS: Logs = Logs(std::sync::Mutex::new(Vec::new()));
+        log::set_logger(&LOGS).unwrap();
+        log::set_max_level(log::LevelFilter::Trace);
+        let notice = super::paste_failure_notice("Unsupported paste method".into());
+        assert_eq!(
+            LOGS.0.lock().unwrap().as_slice(),
+            &[format!(
+                "Failed to paste transcription: {}",
+                notice.detail.unwrap_or_default()
+            )],
+            "paste failure log and notice must share the safe reason"
+        );
+    }
+
+    #[test]
     fn followup_paste_notice_never_contains_tool_output() {
         for error in [
             format!(
@@ -1313,7 +1332,7 @@ mod tests {
             "External script '/private/fixture' failed: fixture transcript".into(),
             "unrecognized failure: fixture transcript".into(),
         ] {
-            let notice = super::paste_failure_notice(error);
+            let notice = super::paste_failure_notice(error.into());
             assert_eq!(notice.code, crate::notices::NoticeCode::PasteFailed);
             if let Some(detail) = notice.detail {
                 assert!(
@@ -1326,11 +1345,36 @@ mod tests {
                 );
             }
         }
+        let error = crate::clipboard::PasteError::input(
+            "Failed to send text directly",
+            enigo::InputError::Simulate(Box::leak(
+                format!("{}\nsecond line", "語".repeat(300)).into_boxed_str(),
+            )),
+        );
+        let detail = super::paste_failure_notice(error).detail.unwrap();
+        assert!(
+            detail.len() <= 512 && !detail.chars().any(char::is_control),
+            "paste notice detail must be one short line"
+        );
+        assert!(
+            detail.len() >= 510,
+            "safe reason must be capped on a UTF-8 boundary"
+        );
+        let detail = super::paste_failure_notice(crate::clipboard::PasteError::input(
+            "Failed to send text directly",
+            enigo::InputError::Simulate("first\nsecond\rthird\0fourth"),
+        ))
+        .detail
+        .unwrap();
+        assert!(
+            !detail.chars().any(char::is_control),
+            "paste notice detail must be one short line"
+        );
         assert_eq!(
             super::paste_failure_notice("xdotool failed: fixture transcript".into())
                 .detail
                 .as_deref(),
-            Some("xdotool failed")
+            Some("Paste failed for an unknown reason")
         );
     }
 

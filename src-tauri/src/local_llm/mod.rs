@@ -29,7 +29,7 @@ pub const STATE_EVENT: &str = "local-llm-state-changed";
 /// Every way local post-processing can fail. Each one falls back to the raw transcript.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LocalLlmError {
-    #[error("llama-server binary not found at {0}")]
+    #[error("binary not found: {0}")]
     BinaryMissing(String),
     #[error("model file missing: {0}")]
     ModelMissing(String),
@@ -156,6 +156,14 @@ pub fn warm_up_for_recording(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn m1_missing_binary_message_uses_a_label_not_a_location() {
+        assert_eq!(
+            super::LocalLlmError::BinaryMissing("llama-server".into()).to_string(),
+            "binary not found: llama-server",
+            "missing binary must use the filename label"
+        );
+    }
     use super::manager::tests::harness;
     use super::*;
 
