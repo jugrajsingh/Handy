@@ -3,20 +3,35 @@
     "settings": "设置...",
     "checkUpdates": "检查更新...",
     "copyLastTranscript": "复制最新转录",
-    "unloadModel": "卸载模型",
+    "unloadModel": "卸载转录模型",
+    "cleanup": "后处理模型",
+    "cleanupReady": "就绪",
+    "cleanupNotLoaded": "未加载",
+    "cleanupLoading": "加载中",
+    "cleanupError": "错误",
+    "noCleanupModel": "无后处理模型",
+    "unloadPostProcessingModel": "卸载后处理模型",
     "model": "模型",
+    "transcriptionModel": "转录模型",
     "quit": "退出",
     "cancel": "取消",
     "secureInputWarning": "⚠ 快捷键被 Secure Input 阻止",
     "language": "语言",
     "autoLanguage": "自动",
-    "otherLanguages": "其他语言"
+    "otherLanguages": "其他语言",
+    "ttsModel": "文本转语音模型",
+    "ttsUnload": "卸载文本转语音模型",
+    "ttsStarting": "启动中",
+    "ttsReady": "已加载",
+    "ttsStopping": "停止中",
+    "ttsFailed": "失败",
+    "ttsUnloaded": "已卸载"
   },
   "sidebar": {
     "general": "通用",
-    "models": "模型",
+    "models": "转录模型",
     "advanced": "高级",
-    "postProcessing": "后处理",
+    "postProcessing": "后处理模型",
     "history": "历史记录",
     "debug": "调试",
     "about": "关于"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "已添加{{languages}}。"
   },
   "modelSelector": {
+    "status": "模型状态:{{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "自定义",
     "streaming": "流式",
     "active": "活跃",
@@ -336,10 +353,14 @@
         "none": "未配置快捷键",
         "notFound": "未找到快捷键",
         "pressKeys": "请按键...",
+        "unassigned": "未分配",
         "bindings": {
           "transcribe": {
             "name": "转录快捷键",
             "description": "用于录制和转录语音的键盘快捷键。"
+          },
+          "transcribe_raw": {
+            "name": "原始文本快捷键"
           },
           "cancel": {
             "name": "取消快捷键",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "后处理快捷键",
             "description": "可选：一个专用快捷键，始终对您的转录应用 AI 后处理。"
+          },
+          "read_aloud": {
+            "name": "朗读快捷键",
+            "description": "打开弹窗并朗读已复制的文本。"
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "快捷键"
+      "provider": {
+        "title": "提供商"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "取消",
         "selectToEdit": "选择上方的提示词以查看和编辑其详细信息。",
         "createFirst": "点击上方的「创建新提示词」来创建您的第一个后处理提示词。"
+      },
+      "localLlm": {
+        "noCleanupModel": "无后处理模型",
+        "s1Description": "使用风格、结构和场景控制。",
+        "plainDescription": "使用你所选的 Handy 提示词。",
+        "groupTitle": "本地模型",
+        "size": "{{size}} MiB",
+        "downloaded": "已下载",
+        "use": "使用",
+        "download": "下载",
+        "downloading": "下载中 {{percent}}%",
+        "delete": "删除",
+        "status": {
+          "title": "状态",
+          "description": "模型在后处理听写开始时加载,并在模型卸载超时后卸载。",
+          "notLoaded": "未加载",
+          "loading": "加载中",
+          "ready": "就绪",
+          "error": "错误:{{reason}}"
+        },
+        "styling": {
+          "title": "风格",
+          "description": "后处理文本的正式程度。",
+          "options": {
+            "casual": "随意",
+            "semi_casual": "半随意",
+            "semi_formal": "半正式",
+            "formal": "正式"
+          }
+        },
+        "structure": {
+          "title": "结构",
+          "description": "段落文本或 Markdown 列表。",
+          "options": {
+            "prose": "段落",
+            "lists": "列表"
+          }
+        },
+        "context": {
+          "title": "场景",
+          "description": "通用文本或电子邮件格式。",
+          "options": {
+            "general": "通用",
+            "email": "电子邮件"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0，另加一项条款：该模型必须始终称为 \"Superwhisper\" 的 \"S1-mini\"，且大小写须完全一致。"
+        },
+        "promptRequired": "请在“提示词”分组中选择一个非空的 Handy 提示词。在此之前,将跳过后处理并使用原始转录文本。",
+        "promptHidden": "此模型使用自带的固定提示词以及上方的风格、结构和场景设置,因此提示词编辑器已隐藏。"
       }
     },
     "history": {
       "title": "历史记录",
+      "cleaned": "已后处理",
+      "cleanedWith": "已使用 {{model}} 后处理",
+      "raw": "原始",
+      "copyRaw": "复制原始文本",
+      "copyPostProcessed": "复制后处理文本",
+      "compare": {
+        "title": "对比视图",
+        "diff": "差异",
+        "side_by_side": "并排",
+        "stacked": "堆叠"
+      },
+      "clearHistory": "清除历史记录",
+      "clearConfirmation": "要移除 {{count}} 条未加星标的历史记录和 {{recordings}} 个录音吗?已加星标的记录及其录音将被保留。",
       "openFolder": "打开录音文件夹",
       "loading": "加载历史记录中...",
       "empty": "还没有转录记录。开始录制以建立您的历史记录！",
@@ -991,5 +1080,141 @@
     "learnMore": "如何解决",
     "recorderBlocked": "当前无法录制快捷键——macOS 的 Secure Input 正在阻止按键事件。请先解决 Secure Input 警告。",
     "dismiss": "关闭"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "质量",
+      "speed": "速度",
+      "recommended": "推荐",
+      "tooltip": "首次出声 {{firstAudio}} 秒,比实时快 {{faster}} 倍,加载用时 {{load}} 秒"
+    },
+    "devices": {
+      "auto": "自动",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "朗读前请先下载此模型。",
+      "audio": "无法打开输出设备。",
+      "text": "无法处理此文本。",
+      "clock": "播放计时失败。",
+      "worker": "文本转语音工作进程已停止。",
+      "unavailable": "文本转语音不可用。",
+      "notReady": "文本转语音仍在启动中。",
+      "generic": "文本转语音失败。",
+      "memory": "至少需要 1 GiB 的可用内存。",
+      "gatedToken": "Pocket 语音需要 Hugging Face 令牌,并需接受语音条款。",
+      "model": "请选择一个可用的文本转语音模型。",
+      "device": "此设备不可用。",
+      "npuDriverTooOld": "NPU 驱动版本过旧。请更新驱动或选择其他设备。",
+      "selection": "无法应用所选内容。",
+      "busy": "已有文本转语音操作正在运行。",
+      "cancelled": "朗读已取消。",
+      "clipboard": "无法读取剪贴板文本。",
+      "deviceNotSupported": "此模型不支持所选设备。",
+      "deviceUnavailable": "所选设备不可用。",
+      "download": "模型下载失败。",
+      "driverDiscovery": "无法检测 NPU 驱动。",
+      "failed": "工作进程连续失败三次。请选择模型以重试。",
+      "integrity": "模型文件未通过完整性检查。",
+      "invalidControls": "请选择 0.5x 至 2.0x 的速度,以及 -6 至 +6 半音的音高。",
+      "invalidRatings": "模型评分缺失或无效。",
+      "invalidVoice": "请为所选模型选择一种语音。",
+      "outputUnavailable": "输出设备不可用。",
+      "path": "文本转语音存储目录不可用。",
+      "prepareFailed": "所选设备无法准备此模型。",
+      "protocol": "文本转语音工作进程返回了无效的响应。",
+      "registry": "文本转语音模型注册表无效。",
+      "settings": "无法保存文本转语音设置。",
+      "start": "无法启动文本转语音工作进程。",
+      "starting": "文本转语音工作进程正在启动。",
+      "tokenRejected": "Hugging Face 令牌被拒绝。请检查是否有权访问 Pocket 语音条款。",
+      "tokenRequired": "下载语音前,请设置 Hugging Face 令牌并接受 Pocket 语音条款。",
+      "unknownModel": "所选的文本转语音模型未知。",
+      "window": "无法打开朗读窗口。",
+      "accessDenied": "访问模型文件被拒绝。",
+      "localIo": "无法读取或写入模型文件。",
+      "downloading": "此模型已在下载中。"
+    },
+    "runOn": "运行设备",
+    "preparing": "正在为 {{device}} 准备:{{graph}}",
+    "buffering": "缓冲中",
+    "title": "朗读",
+    "textLabel": "待朗读文本",
+    "placeholder": "粘贴要朗读的文本",
+    "play": "播放",
+    "pause": "暂停",
+    "stop": "停止",
+    "close": "关闭",
+    "progress": "进度",
+    "time": "已用 {{elapsed}} 秒,剩余 {{remaining}} 秒",
+    "openModels": "文本转语音模型",
+    "outputFallback": "使用默认输出设备",
+    "states": {
+      "waiting": "等待中",
+      "starting": "启动中",
+      "buffering": "缓冲中",
+      "playing": "播放中",
+      "paused": "已暂停",
+      "finished": "已完成",
+      "error": "错误"
+    },
+    "modelsTitle": "文本转语音模型",
+    "modelsSubtitle": "选择语音模型。速度在本机上测得。",
+    "downloaded": "已下载",
+    "availableToDownload": "可下载",
+    "recommended": "推荐",
+    "downloading": "下载中",
+    "needsToken": "需要 Hugging Face 令牌",
+    "tokenSet": "令牌已设置",
+    "active": "使用中",
+    "use": "使用",
+    "download": "下载",
+    "delete": "删除",
+    "cancel": "取消",
+    "token": "Hugging Face 令牌",
+    "tokenHelp": "仅在接受 Hugging Face 上的语音条款后下载 Pocket 受限语音时需要。令牌仅保存在内存中,Handy 重启时会被清除。",
+    "clearToken": "清除令牌",
+    "showToken": "显示令牌",
+    "hideToken": "隐藏令牌",
+    "saveToken": "设置令牌",
+    "model": "模型",
+    "voice": "语音",
+    "preview": "试听语音",
+    "speed": "速度:{{value}}x",
+    "pitch": "音高:{{value}} 半音",
+    "output": "输出设备",
+    "sameAsHandy": "与 Handy 相同",
+    "readCode": "朗读代码块",
+    "pocketAttribution": "Pocket TTS 语音采用 CC-BY-4.0 许可。请遵守模型卡上各语音的署名和授权条款。",
+    "supertonicRestrictions": "Supertonic 3 采用 OpenRAIL-M。请查阅模型卡上的使用限制。",
+    "kokoroAttribution": "Kokoro 模型权重采用 Apache-2.0 许可。",
+    "status": {
+      "failed": "失败",
+      "ready": "就绪",
+      "starting": "启动中",
+      "stopping": "停止中",
+      "unloaded": "已卸载"
+    },
+    "previewSentence": "清晰朗读,一次一句。",
+    "description": {
+      "pocket-en": "富有表现力的英语语音,听感评分最高。",
+      "supertonic-3": "快速的英语合成,支持 CPU、GPU 和 NPU 运行。",
+      "kokoro-82m-int8": "来自 INT8 模型的小巧英语语音。"
+    },
+    "voiceCount": "{{count}} 种语音",
+    "downloadProgress": "模型下载进度",
+    "settingsTitle": "文本转语音",
+    "speedLabel": "速度",
+    "pitchLabel": "音高",
+    "help": {
+      "model": "选择已下载的文本转语音模型。",
+      "voice": "为此模型选择语音并试听。",
+      "speed": "调整文本朗读的速度。",
+      "pitch": "以半音为单位调整语音音高。",
+      "output": "选择朗读音频的播放位置。",
+      "readCode": "朗读时包含围栏代码块。"
+    }
   }
 }

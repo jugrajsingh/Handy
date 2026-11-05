@@ -3,20 +3,35 @@
     "settings": "Instellingen...",
     "checkUpdates": "Controleren op updates...",
     "copyLastTranscript": "Laatste transcriptie kopiëren",
-    "unloadModel": "Model ontladen",
+    "unloadModel": "Transcriptiemodel ontladen",
+    "cleanup": "Naverwerkingsmodel",
+    "cleanupReady": "gereed",
+    "cleanupNotLoaded": "niet geladen",
+    "cleanupLoading": "laden",
+    "cleanupError": "fout",
+    "noCleanupModel": "Geen naverwerkingsmodel",
+    "unloadPostProcessingModel": "Naverwerkingsmodel ontladen",
     "model": "Model",
+    "transcriptionModel": "Transcriptiemodel",
     "quit": "Afsluiten",
     "cancel": "Annuleren",
     "secureInputWarning": "⚠ Sneltoetsen geblokkeerd door Secure Input",
     "language": "Taal",
     "autoLanguage": "Automatisch",
-    "otherLanguages": "Andere talen"
+    "otherLanguages": "Andere talen",
+    "ttsModel": "Tekst-naar-spraakmodel",
+    "ttsUnload": "Tekst-naar-spraakmodel ontladen",
+    "ttsStarting": "Starten",
+    "ttsReady": "Geladen",
+    "ttsStopping": "Stoppen",
+    "ttsFailed": "Mislukt",
+    "ttsUnloaded": "Ontladen"
   },
   "sidebar": {
     "general": "Algemeen",
-    "models": "Modellen",
+    "models": "Transcriptiemodellen",
     "advanced": "Geavanceerd",
-    "postProcessing": "Naverwerking",
+    "postProcessing": "Naverwerkingsmodellen",
     "history": "Geschiedenis",
     "debug": "Probleemoplossing",
     "about": "Over Handy"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} zijn al toegevoegd."
   },
   "modelSelector": {
+    "status": "Modelstatus: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Aangepast",
     "streaming": "Streaming",
     "active": "Actief",
@@ -336,10 +353,14 @@
         "none": "Geen sneltoetsen geconfigureerd",
         "notFound": "Sneltoets niet gevonden",
         "pressKeys": "Druk op toetsen...",
+        "unassigned": "Niet toegewezen",
         "bindings": {
           "transcribe": {
             "name": "Sneltoets voor dicteren",
             "description": "De sneltoets om je stem op te nemen en te transcriberen."
+          },
+          "transcribe_raw": {
+            "name": "Sneltoets voor ruwe tekst"
           },
           "cancel": {
             "name": "Sneltoets voor annuleren",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "Sneltoets voor naverwerking",
             "description": "Optioneel: Een specifieke sneltoets die altijd AI-naverwerking toepast op je transcriptie."
+          },
+          "read_aloud": {
+            "name": "Sneltoets voor voorlezen",
+            "description": "Opent het pop-upvenster en leest gekopieerde tekst voor."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Sneltoets"
+      "provider": {
+        "title": "Aanbieder"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Annuleren",
         "selectToEdit": "Selecteer hierboven een prompt om de details te bekijken en te bewerken.",
         "createFirst": "Klik hierboven op 'Nieuwe prompt maken' om je eerste naverwerkingsprompt aan te maken."
+      },
+      "localLlm": {
+        "noCleanupModel": "Geen naverwerkingsmodel",
+        "s1Description": "Gebruikt de instellingen voor stijl, structuur en context.",
+        "plainDescription": "Gebruikt je geselecteerde Handy-prompt.",
+        "groupTitle": "Lokaal model",
+        "size": "{{size}} MiB",
+        "downloaded": "Gedownload",
+        "use": "Gebruiken",
+        "download": "Downloaden",
+        "downloading": "Downloaden {{percent}}%",
+        "delete": "Verwijderen",
+        "status": {
+          "title": "Status",
+          "description": "Het model wordt geladen wanneer een dictaat met naverwerking begint en na de time-out voor het ontladen van modellen weer ontladen.",
+          "notLoaded": "Niet geladen",
+          "loading": "Laden",
+          "ready": "Gereed",
+          "error": "Fout: {{reason}}"
+        },
+        "styling": {
+          "title": "Stijl",
+          "description": "Hoe formeel de naverwerkte tekst klinkt.",
+          "options": {
+            "casual": "Informeel",
+            "semi_casual": "Halfinformeel",
+            "semi_formal": "Halfformeel",
+            "formal": "Formeel"
+          }
+        },
+        "structure": {
+          "title": "Structuur",
+          "description": "Alinea's met lopende tekst of Markdown-lijsten.",
+          "options": {
+            "prose": "Lopende tekst",
+            "lists": "Lijsten"
+          }
+        },
+        "context": {
+          "title": "Context",
+          "description": "Algemene tekst of een e-mailopmaak.",
+          "options": {
+            "general": "Algemeen",
+            "email": "E-mail"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 met één extra voorwaarde: het model moet altijd \"S1-mini\" van \"Superwhisper\" heten, met precies deze hoofdletters en kleine letters."
+        },
+        "promptRequired": "Selecteer in de groep Prompts een niet-lege Handy-prompt. Tot die tijd wordt naverwerking overgeslagen en wordt de ruwe transcriptie gebruikt.",
+        "promptHidden": "Dit model gebruikt zijn eigen vaste prompt en de instellingen voor stijl, structuur en context hierboven, dus de prompt-editor is verborgen."
       }
     },
     "history": {
       "title": "Geschiedenis",
+      "cleaned": "Naverwerkt",
+      "cleanedWith": "Naverwerkt met {{model}}",
+      "raw": "Ruw",
+      "copyRaw": "Ruwe tekst kopiëren",
+      "copyPostProcessed": "Naverwerkte tekst kopiëren",
+      "compare": {
+        "title": "Vergelijkingsweergave",
+        "diff": "Verschillen",
+        "side_by_side": "Naast elkaar",
+        "stacked": "Onder elkaar"
+      },
+      "clearHistory": "Geschiedenis wissen",
+      "clearConfirmation": "{{count}} niet-gemarkeerde geschiedenisitems en {{recordings}} opnamen verwijderen? Gemarkeerde items en hun opnamen blijven bewaard.",
       "openFolder": "Opnamemap openen",
       "loading": "Geschiedenis laden...",
       "empty": "Nog geen transcripties. Start met opnemen om je geschiedenis op te bouwen!",
@@ -991,5 +1080,141 @@
     "learnMore": "Hoe je dit oplost",
     "recorderBlocked": "Sneltoetsen kunnen nu niet worden opgenomen — Secure Input van macOS blokkeert toetsgebeurtenissen. Los eerst de Secure Input-waarschuwing op.",
     "dismiss": "Sluiten"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Kwaliteit",
+      "speed": "Snelheid",
+      "recommended": "Aanbevolen",
+      "tooltip": "Eerste audio na {{firstAudio}} s, {{faster}}x sneller dan realtime, laadt in {{load}} s"
+    },
+    "devices": {
+      "auto": "Automatisch",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Download dit model voordat je gaat voorlezen.",
+      "audio": "Het uitvoerapparaat kon niet worden geopend.",
+      "text": "Deze tekst kon niet worden voorbereid.",
+      "clock": "De timing van het afspelen is mislukt.",
+      "worker": "De tekst-naar-spraakworker is gestopt.",
+      "unavailable": "Tekst-naar-spraak is niet beschikbaar.",
+      "notReady": "Tekst-naar-spraak is nog bezig met starten.",
+      "generic": "Tekst-naar-spraak is mislukt.",
+      "memory": "Minstens 1 GiB beschikbaar geheugen is vereist.",
+      "gatedToken": "Pocket-stemmen vereisen een Hugging Face-token en geaccepteerde stemvoorwaarden.",
+      "model": "Kies een beschikbaar tekst-naar-spraakmodel.",
+      "device": "Dit apparaat is niet beschikbaar.",
+      "npuDriverTooOld": "NPU-stuurprogramma te oud. Werk het bij of kies een ander apparaat.",
+      "selection": "De selectie kon niet worden toegepast.",
+      "busy": "Er loopt al een tekst-naar-spraakbewerking.",
+      "cancelled": "Voorlezen is geannuleerd.",
+      "clipboard": "De tekst op het klembord kon niet worden gelezen.",
+      "deviceNotSupported": "Dit model ondersteunt het geselecteerde apparaat niet.",
+      "deviceUnavailable": "Het geselecteerde apparaat is niet beschikbaar.",
+      "download": "Het downloaden van het model is mislukt.",
+      "driverDiscovery": "Het NPU-stuurprogramma kon niet worden gedetecteerd.",
+      "failed": "De worker is drie keer mislukt. Selecteer een model om het opnieuw te proberen.",
+      "integrity": "Een modelbestand heeft de integriteitscontrole niet doorstaan.",
+      "invalidControls": "Kies een snelheid van 0.5x tot 2.0x en een toonhoogte van -6 tot +6 halve tonen.",
+      "invalidRatings": "De modelbeoordelingen ontbreken of zijn ongeldig.",
+      "invalidVoice": "Kies een stem voor het geselecteerde model.",
+      "outputUnavailable": "Het uitvoerapparaat is niet beschikbaar.",
+      "path": "De opslagmap voor tekst-naar-spraak is niet beschikbaar.",
+      "prepareFailed": "Het geselecteerde apparaat kon dit model niet voorbereiden.",
+      "protocol": "De tekst-naar-spraakworker gaf een ongeldig antwoord.",
+      "registry": "Het register van tekst-naar-spraakmodellen is ongeldig.",
+      "settings": "De tekst-naar-spraakinstellingen konden niet worden opgeslagen.",
+      "start": "De tekst-naar-spraakworker kon niet starten.",
+      "starting": "De tekst-naar-spraakworker wordt gestart.",
+      "tokenRejected": "Het Hugging Face-token is geweigerd. Controleer de toegang tot de Pocket-stemvoorwaarden.",
+      "tokenRequired": "Stel een Hugging Face-token in en accepteer de Pocket-stemvoorwaarden voordat je stemmen downloadt.",
+      "unknownModel": "Het geselecteerde tekst-naar-spraakmodel is onbekend.",
+      "window": "Het venster voor voorlezen kon niet worden geopend.",
+      "accessDenied": "Toegang tot de modelbestanden is geweigerd.",
+      "localIo": "De modelbestanden konden niet worden gelezen of geschreven.",
+      "downloading": "Dit model wordt al gedownload."
+    },
+    "runOn": "Uitvoeren op",
+    "preparing": "Voorbereiden voor {{device}}: {{graph}}",
+    "buffering": "Bufferen",
+    "title": "Voorlezen",
+    "textLabel": "Voor te lezen tekst",
+    "placeholder": "Plak tekst om voor te lezen",
+    "play": "Afspelen",
+    "pause": "Pauzeren",
+    "stop": "Stoppen",
+    "close": "Sluiten",
+    "progress": "Voortgang",
+    "time": "{{elapsed}} s verstreken, {{remaining}} s resterend",
+    "openModels": "Tekst-naar-spraakmodellen",
+    "outputFallback": "Het standaarduitvoerapparaat wordt gebruikt",
+    "states": {
+      "waiting": "Wachten",
+      "starting": "Starten",
+      "buffering": "Bufferen",
+      "playing": "Afspelen",
+      "paused": "Gepauzeerd",
+      "finished": "Voltooid",
+      "error": "Fout"
+    },
+    "modelsTitle": "Tekst-naar-spraakmodellen",
+    "modelsSubtitle": "Kies een stemmodel. Snelheden worden op deze computer gemeten.",
+    "downloaded": "Gedownload",
+    "availableToDownload": "Beschikbaar om te downloaden",
+    "recommended": "Aanbevolen",
+    "downloading": "Downloaden",
+    "needsToken": "Heeft een Hugging Face-token nodig",
+    "tokenSet": "Token ingesteld",
+    "active": "Actief",
+    "use": "Gebruiken",
+    "download": "Downloaden",
+    "delete": "Verwijderen",
+    "cancel": "Annuleren",
+    "token": "Hugging Face-token",
+    "tokenHelp": "Alleen nodig voor afgeschermde Pocket-stemmen nadat je de stemvoorwaarden op Hugging Face hebt geaccepteerd. Het token blijft in het geheugen en wordt gewist wanneer Handy opnieuw start.",
+    "clearToken": "Token wissen",
+    "showToken": "Token tonen",
+    "hideToken": "Token verbergen",
+    "saveToken": "Token instellen",
+    "model": "Model",
+    "voice": "Stem",
+    "preview": "Stem beluisteren",
+    "speed": "Snelheid: {{value}}x",
+    "pitch": "Toonhoogte: {{value}} halve tonen",
+    "output": "Uitvoerapparaat",
+    "sameAsHandy": "Hetzelfde als Handy",
+    "readCode": "Codeblokken voorlezen",
+    "pocketAttribution": "Pocket TTS-stemmen vallen onder de licentie CC-BY-4.0. Volg de naamsvermelding en toestemmingsvoorwaarden van elke stem op de modelkaart.",
+    "supertonicRestrictions": "Supertonic 3 gebruikt OpenRAIL-M. Bekijk de gebruiksbeperkingen op de modelkaart.",
+    "kokoroAttribution": "De modelgewichten van Kokoro vallen onder de Apache-2.0-licentie.",
+    "status": {
+      "failed": "Mislukt",
+      "ready": "Gereed",
+      "starting": "Starten",
+      "stopping": "Stoppen",
+      "unloaded": "Ontladen"
+    },
+    "previewSentence": "Duidelijk voorgelezen, één zinsdeel tegelijk.",
+    "description": {
+      "pocket-en": "Expressieve Engelse stemmen met de hoogste luisterscore.",
+      "supertonic-3": "Snelle Engelse spraaksynthese met uitvoering op CPU, GPU en NPU.",
+      "kokoro-82m-int8": "Compacte Engelse stemmen uit een INT8-model."
+    },
+    "voiceCount": "{{count}} stemmen",
+    "downloadProgress": "Voortgang van modeldownload",
+    "settingsTitle": "Tekst-naar-spraak",
+    "speedLabel": "Snelheid",
+    "pitchLabel": "Toonhoogte",
+    "help": {
+      "model": "Kies een gedownload tekst-naar-spraakmodel.",
+      "voice": "Kies een stem voor dit model en beluister die.",
+      "speed": "Pas aan hoe snel de tekst wordt voorgelezen.",
+      "pitch": "Pas de toonhoogte van de stem aan in halve tonen.",
+      "output": "Kies waar de audio van het voorlezen wordt afgespeeld.",
+      "readCode": "Neem omheinde codeblokken mee bij het voorlezen."
+    }
   }
 }

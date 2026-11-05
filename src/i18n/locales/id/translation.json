@@ -3,20 +3,35 @@
     "settings": "Pengaturan...",
     "checkUpdates": "Periksa Pembaruan...",
     "copyLastTranscript": "Salin Transkripsi Terakhir",
-    "unloadModel": "Keluarkan Model dari Memori",
+    "unloadModel": "Keluarkan model transkripsi dari memori",
+    "cleanup": "Model pascaproses",
+    "cleanupReady": "siap",
+    "cleanupNotLoaded": "belum dimuat",
+    "cleanupLoading": "memuat",
+    "cleanupError": "kesalahan",
+    "noCleanupModel": "Tidak ada model pascaproses",
+    "unloadPostProcessingModel": "Keluarkan model pascaproses dari memori",
     "model": "Model",
+    "transcriptionModel": "Model transkripsi",
     "quit": "Keluar",
     "cancel": "Batal",
     "secureInputWarning": "⚠ Pintasan diblokir oleh Secure Input",
     "language": "Bahasa",
     "autoLanguage": "Otomatis",
-    "otherLanguages": "Bahasa Lain"
+    "otherLanguages": "Bahasa Lain",
+    "ttsModel": "Model teks ke ucapan",
+    "ttsUnload": "Keluarkan model teks ke ucapan dari memori",
+    "ttsStarting": "Memulai",
+    "ttsReady": "Dimuat",
+    "ttsStopping": "Menghentikan",
+    "ttsFailed": "Gagal",
+    "ttsUnloaded": "Dikeluarkan dari memori"
   },
   "sidebar": {
     "general": "Umum",
-    "models": "Model",
+    "models": "Model Transkripsi",
     "advanced": "Lanjutan",
-    "postProcessing": "Pascaproses",
+    "postProcessing": "Model Pascaproses",
     "history": "Riwayat",
     "debug": "Debug",
     "about": "Tentang"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} sudah ditambahkan."
   },
   "modelSelector": {
+    "status": "Status model: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Kustom",
     "streaming": "Streaming",
     "active": "Aktif",
@@ -336,10 +353,14 @@
         "none": "Belum ada pintasan yang diatur",
         "notFound": "Pintasan tidak ditemukan",
         "pressKeys": "Tekan tombol...",
+        "unassigned": "Belum diatur",
         "bindings": {
           "transcribe": {
             "name": "Pintasan Transkripsi",
             "description": "Pintasan keyboard untuk merekam dan mentranskripsikan suara Anda."
+          },
+          "transcribe_raw": {
+            "name": "Pintasan Mentah"
           },
           "cancel": {
             "name": "Pintasan Batal",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "Pintasan Pascaproses",
             "description": "Opsional: pintasan khusus yang selalu menerapkan pascaproses AI pada transkripsi Anda."
+          },
+          "read_aloud": {
+            "name": "Pintasan baca nyaring",
+            "description": "Buka popup dan bacakan teks yang disalin dengan suara."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Pintasan"
+      "provider": {
+        "title": "Penyedia"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Batal",
         "selectToEdit": "Pilih prompt di atas untuk melihat dan mengedit detailnya.",
         "createFirst": "Klik 'Buat Prompt Baru' di atas untuk membuat prompt pascaproses pertama Anda."
+      },
+      "localLlm": {
+        "noCleanupModel": "Tidak ada model pascaproses",
+        "s1Description": "Menggunakan kontrol gaya, struktur, dan konteks.",
+        "plainDescription": "Menggunakan prompt Handy yang Anda pilih.",
+        "groupTitle": "Model lokal",
+        "size": "{{size}} MiB",
+        "downloaded": "Terunduh",
+        "use": "Gunakan",
+        "download": "Unduh",
+        "downloading": "Mengunduh {{percent}}%",
+        "delete": "Hapus",
+        "status": {
+          "title": "Status",
+          "description": "Model dimuat saat dikte dengan pascaproses dimulai dan dikeluarkan dari memori setelah batas waktu pengeluaran model.",
+          "notLoaded": "Belum dimuat",
+          "loading": "Memuat",
+          "ready": "Siap",
+          "error": "Kesalahan: {{reason}}"
+        },
+        "styling": {
+          "title": "Gaya",
+          "description": "Seberapa formal teks hasil pascaproses.",
+          "options": {
+            "casual": "Santai",
+            "semi_casual": "Semi-santai",
+            "semi_formal": "Semi-formal",
+            "formal": "Formal"
+          }
+        },
+        "structure": {
+          "title": "Struktur",
+          "description": "Paragraf prosa atau daftar Markdown.",
+          "options": {
+            "prose": "Prosa",
+            "lists": "Daftar"
+          }
+        },
+        "context": {
+          "title": "Konteks",
+          "description": "Teks umum atau tata letak email.",
+          "options": {
+            "general": "Umum",
+            "email": "Email"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 dengan satu ketentuan tambahan: model harus selalu disebut \"S1-mini\" dari \"Superwhisper\", dengan huruf besar dan kecil persis seperti itu."
+        },
+        "promptRequired": "Pilih prompt Handy yang tidak kosong di grup Prompt. Sampai itu dilakukan, pascaproses dilewati dan transkrip mentah digunakan.",
+        "promptHidden": "Model ini memakai prompt tetapnya sendiri dan pengaturan Gaya, Struktur, dan Konteks di atas, sehingga editor prompt disembunyikan."
       }
     },
     "history": {
       "title": "Riwayat",
+      "cleaned": "Dipascaproses",
+      "cleanedWith": "Dipascaproses dengan {{model}}",
+      "raw": "Mentah",
+      "copyRaw": "Salin teks mentah",
+      "copyPostProcessed": "Salin teks hasil pascaproses",
+      "compare": {
+        "title": "Tampilan perbandingan",
+        "diff": "Perbedaan",
+        "side_by_side": "Berdampingan",
+        "stacked": "Bertumpuk"
+      },
+      "clearHistory": "Hapus Riwayat",
+      "clearConfirmation": "Hapus {{count}} entri riwayat tanpa bintang dan {{recordings}} rekaman? Entri berbintang beserta rekamannya akan dipertahankan.",
       "openFolder": "Buka Folder Rekaman",
       "loading": "Memuat riwayat...",
       "empty": "Belum ada transkripsi. Mulai merekam untuk mengisi riwayat Anda!",
@@ -991,5 +1080,141 @@
     "learnMore": "Cara memperbaiki",
     "recorderBlocked": "Pintasan tidak dapat direkam saat ini — macOS Secure Input memblokir peristiwa tombol. Selesaikan peringatan Secure Input terlebih dahulu.",
     "dismiss": "Tutup"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Kualitas",
+      "speed": "Kecepatan",
+      "recommended": "Disarankan",
+      "tooltip": "Audio pertama {{firstAudio}} dtk, {{faster}}x lebih cepat dari waktu nyata, dimuat dalam {{load}} dtk"
+    },
+    "devices": {
+      "auto": "Otomatis",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Unduh model ini sebelum membaca.",
+      "audio": "Perangkat keluaran tidak dapat dibuka.",
+      "text": "Teks ini tidak dapat disiapkan.",
+      "clock": "Pengaturan waktu pemutaran gagal.",
+      "worker": "Proses teks ke ucapan berhenti.",
+      "unavailable": "Teks ke ucapan tidak tersedia.",
+      "notReady": "Teks ke ucapan masih dimulai.",
+      "generic": "Teks ke ucapan gagal.",
+      "memory": "Diperlukan memori tersedia minimal 1 GiB.",
+      "gatedToken": "Suara Pocket memerlukan token Hugging Face dan persetujuan ketentuan suara.",
+      "model": "Pilih model teks ke ucapan yang tersedia.",
+      "device": "Perangkat ini tidak tersedia.",
+      "npuDriverTooOld": "Driver NPU terlalu lama. Perbarui atau pilih perangkat lain.",
+      "selection": "Pilihan tidak dapat diterapkan.",
+      "busy": "Operasi teks ke ucapan sedang berjalan.",
+      "cancelled": "Pembacaan dibatalkan.",
+      "clipboard": "Teks papan klip tidak dapat dibaca.",
+      "deviceNotSupported": "Model ini tidak mendukung perangkat yang dipilih.",
+      "deviceUnavailable": "Perangkat yang dipilih tidak tersedia.",
+      "download": "Pengunduhan model gagal.",
+      "driverDiscovery": "Driver NPU tidak dapat dideteksi.",
+      "failed": "Proses gagal tiga kali. Pilih model untuk mencoba lagi.",
+      "integrity": "Sebuah file model gagal dalam pemeriksaan integritas.",
+      "invalidControls": "Pilih kecepatan dari 0.5x hingga 2.0x dan nada dari -6 hingga +6 semiton.",
+      "invalidRatings": "Peringkat model hilang atau tidak valid.",
+      "invalidVoice": "Pilih suara untuk model yang dipilih.",
+      "outputUnavailable": "Perangkat keluaran tidak tersedia.",
+      "path": "Direktori penyimpanan teks ke ucapan tidak tersedia.",
+      "prepareFailed": "Perangkat yang dipilih tidak dapat menyiapkan model ini.",
+      "protocol": "Proses teks ke ucapan mengembalikan respons yang tidak valid.",
+      "registry": "Registri model teks ke ucapan tidak valid.",
+      "settings": "Pengaturan teks ke ucapan tidak dapat disimpan.",
+      "start": "Proses teks ke ucapan tidak dapat dimulai.",
+      "starting": "Proses teks ke ucapan sedang dimulai.",
+      "tokenRejected": "Token Hugging Face ditolak. Periksa akses ke ketentuan suara Pocket.",
+      "tokenRequired": "Atur token Hugging Face dan setujui ketentuan suara Pocket sebelum mengunduh suara.",
+      "unknownModel": "Model teks ke ucapan yang dipilih tidak dikenal.",
+      "window": "Jendela baca nyaring tidak dapat dibuka.",
+      "accessDenied": "Akses ke file model ditolak.",
+      "localIo": "File model tidak dapat dibaca atau ditulis.",
+      "downloading": "Model ini sedang diunduh."
+    },
+    "runOn": "Jalankan di",
+    "preparing": "Menyiapkan untuk {{device}}: {{graph}}",
+    "buffering": "Buffering",
+    "title": "Baca nyaring",
+    "textLabel": "Teks yang dibaca",
+    "placeholder": "Tempel teks untuk dibaca",
+    "play": "Putar",
+    "pause": "Jeda",
+    "stop": "Berhenti",
+    "close": "Tutup",
+    "progress": "Kemajuan",
+    "time": "{{elapsed}} dtk berlalu, {{remaining}} dtk tersisa",
+    "openModels": "Model Teks ke Ucapan",
+    "outputFallback": "Menggunakan perangkat keluaran bawaan",
+    "states": {
+      "waiting": "Menunggu",
+      "starting": "Memulai",
+      "buffering": "Buffering",
+      "playing": "Memutar",
+      "paused": "Dijeda",
+      "finished": "Selesai",
+      "error": "Kesalahan"
+    },
+    "modelsTitle": "Model Teks ke Ucapan",
+    "modelsSubtitle": "Pilih model suara. Kecepatan diukur di mesin ini.",
+    "downloaded": "Terunduh",
+    "availableToDownload": "Tersedia untuk diunduh",
+    "recommended": "Disarankan",
+    "downloading": "Mengunduh",
+    "needsToken": "Memerlukan token Hugging Face",
+    "tokenSet": "Token diatur",
+    "active": "Aktif",
+    "use": "Gunakan",
+    "download": "Unduh",
+    "delete": "Hapus",
+    "cancel": "Batal",
+    "token": "Token Hugging Face",
+    "tokenHelp": "Hanya diperlukan untuk suara Pocket terbatas setelah menyetujui ketentuan suara di Hugging Face. Token disimpan di memori dan dihapus saat Handy dimulai ulang.",
+    "clearToken": "Hapus token",
+    "showToken": "Tampilkan token",
+    "hideToken": "Sembunyikan token",
+    "saveToken": "Atur token",
+    "model": "Model",
+    "voice": "Suara",
+    "preview": "Pratinjau suara",
+    "speed": "Kecepatan: {{value}}x",
+    "pitch": "Nada: {{value}} semiton",
+    "output": "Perangkat keluaran",
+    "sameAsHandy": "Sama seperti Handy",
+    "readCode": "Baca blok kode",
+    "pocketAttribution": "Suara Pocket TTS dilisensikan di bawah CC-BY-4.0. Ikuti atribusi dan ketentuan persetujuan setiap suara pada kartu model.",
+    "supertonicRestrictions": "Supertonic 3 menggunakan OpenRAIL-M. Tinjau batasan penggunaannya pada kartu model.",
+    "kokoroAttribution": "Bobot model Kokoro menggunakan lisensi Apache-2.0.",
+    "status": {
+      "failed": "Gagal",
+      "ready": "Siap",
+      "starting": "Memulai",
+      "stopping": "Menghentikan",
+      "unloaded": "Dikeluarkan dari memori"
+    },
+    "previewSentence": "Membaca dengan jelas, satu frasa demi satu frasa.",
+    "description": {
+      "pocket-en": "Suara bahasa Inggris ekspresif dengan skor mendengarkan tertinggi.",
+      "supertonic-3": "Sintesis bahasa Inggris cepat dengan eksekusi CPU, GPU, dan NPU.",
+      "kokoro-82m-int8": "Suara bahasa Inggris ringkas dari model INT8."
+    },
+    "voiceCount": "{{count}} suara",
+    "downloadProgress": "Kemajuan pengunduhan model",
+    "settingsTitle": "Teks ke ucapan",
+    "speedLabel": "Kecepatan",
+    "pitchLabel": "Nada",
+    "help": {
+      "model": "Pilih model teks ke ucapan yang sudah diunduh.",
+      "voice": "Pilih suara untuk model ini dan pratinjau.",
+      "speed": "Atur seberapa cepat teks dibaca.",
+      "pitch": "Atur nada suara dalam semiton.",
+      "output": "Pilih tempat audio baca nyaring diputar.",
+      "readCode": "Sertakan blok kode berpagar saat membaca."
+    }
   }
 }

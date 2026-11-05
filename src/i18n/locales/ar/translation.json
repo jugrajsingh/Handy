@@ -3,20 +3,35 @@
     "settings": "الإعدادات...",
     "checkUpdates": "التحقق من وجود تحديثات...",
     "copyLastTranscript": "نسخ آخر نص تم تفريغه",
-    "unloadModel": "تفريغ النموذج",
+    "unloadModel": "إلغاء تحميل نموذج التفريغ",
+    "cleanup": "نموذج المعالجة اللاحقة",
+    "cleanupReady": "جاهز",
+    "cleanupNotLoaded": "غير محمّل",
+    "cleanupLoading": "جارٍ التحميل",
+    "cleanupError": "خطأ",
+    "noCleanupModel": "لا يوجد نموذج معالجة لاحقة",
+    "unloadPostProcessingModel": "إلغاء تحميل نموذج المعالجة اللاحقة",
     "model": "النموذج",
+    "transcriptionModel": "نموذج التفريغ",
     "quit": "إنهاء",
     "cancel": "إلغاء",
     "secureInputWarning": "⚠ الاختصارات محجوبة بواسطة Secure Input",
     "language": "اللغة",
     "autoLanguage": "تلقائي",
-    "otherLanguages": "لغات أخرى"
+    "otherLanguages": "لغات أخرى",
+    "ttsModel": "نموذج تحويل النص إلى كلام",
+    "ttsUnload": "إلغاء تحميل نموذج تحويل النص إلى كلام",
+    "ttsStarting": "جارٍ البدء",
+    "ttsReady": "محمّل",
+    "ttsStopping": "جارٍ الإيقاف",
+    "ttsFailed": "فشل",
+    "ttsUnloaded": "غير محمّل"
   },
   "sidebar": {
     "general": "عام",
-    "models": "النماذج",
+    "models": "نماذج التفريغ",
     "advanced": "متقدم",
-    "postProcessing": "معالجة لاحقة",
+    "postProcessing": "نماذج المعالجة اللاحقة",
     "history": "السجل",
     "debug": "تصحيح الأخطاء",
     "about": "حول"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} مُضافة بالفعل."
   },
   "modelSelector": {
+    "status": "حالة النموذج: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "مخصص",
     "streaming": "البث",
     "active": "نشط",
@@ -336,18 +353,26 @@
         "none": "لا توجد اختصارات مجهزة",
         "notFound": "الاختصار غير موجود",
         "pressKeys": "اضغط على المفاتيح...",
+        "unassigned": "غير معيّن",
         "bindings": {
           "transcribe": {
             "name": "اختصار التفريغ الصوتي",
             "description": ".اختصار لوحة المفاتيح لتسجيل وتفريغ صوتك"
+          },
+          "transcribe_raw": {
+            "name": "اختصار النص الخام"
           },
           "cancel": {
             "name": "اختصار الإلغاء",
             "description": ".اختصار لوحة المفاتيح لإلغاء التسجيل الحالي"
           },
           "transcribe_with_post_process": {
-            "name": "مفتاح المعالجة اللاحقة",
+            "name": "اختصار المعالجة اللاحقة",
             "description": "اختياري: مفتاح اختصار مخصص يطبق دائماً المعالجة اللاحقة بالذكاء الاصطناعي على التفريغ الصوتي."
+          },
+          "read_aloud": {
+            "name": "اختصار القراءة بصوت عالٍ",
+            "description": "افتح النافذة واقرأ النص المنسوخ بصوت عالٍ."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "مفتاح الاختصار"
+      "provider": {
+        "title": "المزوّد"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "إلغاء",
         "selectToEdit": ".اختر مطالبة أعلاه لعرض وتعديل تفاصيلها",
         "createFirst": ".انقر على 'إنشاء مطالبة جديدة' أعلاه لإنشاء أول مطالبة معالجة لاحقة لك"
+      },
+      "localLlm": {
+        "noCleanupModel": "لا يوجد نموذج معالجة لاحقة",
+        "s1Description": "يستخدم عناصر التحكم في الأسلوب والبنية والسياق.",
+        "plainDescription": "يستخدم مطالبة Handy التي اخترتها.",
+        "groupTitle": "النموذج المحلي",
+        "size": "{{size}} MiB",
+        "downloaded": "تم التنزيل",
+        "use": "استخدام",
+        "download": "تنزيل",
+        "downloading": "جاري التنزيل {{percent}}%",
+        "delete": "حذف",
+        "status": {
+          "title": "الحالة",
+          "description": "يُحمَّل النموذج عند بدء إملاء مع معالجة لاحقة، ويُلغى تحميله بعد انتهاء مهلة إلغاء تحميل النموذج.",
+          "notLoaded": "غير محمّل",
+          "loading": "جارٍ التحميل",
+          "ready": "جاهز",
+          "error": "خطأ: {{reason}}"
+        },
+        "styling": {
+          "title": "الأسلوب",
+          "description": "مدى رسمية النص بعد المعالجة اللاحقة.",
+          "options": {
+            "casual": "غير رسمي",
+            "semi_casual": "شبه غير رسمي",
+            "semi_formal": "شبه رسمي",
+            "formal": "رسمي"
+          }
+        },
+        "structure": {
+          "title": "البنية",
+          "description": "فقرات نثرية أو قوائم Markdown.",
+          "options": {
+            "prose": "نثر",
+            "lists": "قوائم"
+          }
+        },
+        "context": {
+          "title": "السياق",
+          "description": "نص عام أو تنسيق بريد إلكتروني.",
+          "options": {
+            "general": "عام",
+            "email": "بريد إلكتروني"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 مع شرط إضافي واحد: يجب أن يُسمّى النموذج دائمًا \"S1-mini\" من \"Superwhisper\"، بهذه الأحرف الكبيرة والصغيرة تمامًا."
+        },
+        "promptRequired": "اختر مطالبة Handy غير فارغة في مجموعة المطالبات. إلى حين ذلك تُتخطى المعالجة اللاحقة ويُستخدم التفريغ الخام.",
+        "promptHidden": "يستخدم هذا النموذج مطالبته الثابتة الخاصة وإعدادات الأسلوب والبنية والسياق أعلاه، لذا فإن محرر المطالبة مخفي."
       }
     },
     "history": {
       "title": "السجل",
+      "cleaned": "بعد المعالجة اللاحقة",
+      "cleanedWith": "عولج لاحقًا باستخدام {{model}}",
+      "raw": "خام",
+      "copyRaw": "نسخ النص الخام",
+      "copyPostProcessed": "نسخ النص المعالج",
+      "compare": {
+        "title": "عرض المقارنة",
+        "diff": "الفروق",
+        "side_by_side": "جنبًا إلى جنب",
+        "stacked": "متراصّ"
+      },
+      "clearHistory": "مسح السجل",
+      "clearConfirmation": "إزالة {{count}} من إدخالات السجل غير المميّزة بنجمة و{{recordings}} من التسجيلات؟ ستبقى الإدخالات المميّزة بنجمة وتسجيلاتها.",
       "openFolder": "فتح مجلد التسجيلات",
       "loading": "جاري تحميل السجل...",
       "empty": "!لا يوجد تفريغ صوتي بعد. ابدأ التسجيل لبناء سجلك",
@@ -991,5 +1080,141 @@
     "learnMore": "كيفية الإصلاح",
     "recorderBlocked": "لا يمكن تسجيل الاختصارات الآن — يحجب Secure Input في macOS أحداث المفاتيح. عالج تحذير Secure Input أولاً.",
     "dismiss": "تجاهل"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "الجودة",
+      "speed": "السرعة",
+      "recommended": "موصى به",
+      "tooltip": "أول صوت خلال {{firstAudio}} ث، أسرع {{faster}} مرة من الزمن الفعلي، يُحمَّل خلال {{load}} ث"
+    },
+    "devices": {
+      "auto": "تلقائي",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "نزّل هذا النموذج قبل القراءة.",
+      "audio": "تعذّر فتح جهاز الإخراج.",
+      "text": "تعذّر تجهيز هذا النص.",
+      "clock": "فشل توقيت التشغيل.",
+      "worker": "توقفت عملية تحويل النص إلى كلام.",
+      "unavailable": "تحويل النص إلى كلام غير متاح.",
+      "notReady": "ما زال تحويل النص إلى كلام قيد البدء.",
+      "generic": "فشل تحويل النص إلى كلام.",
+      "memory": "يلزم توفر 1 GiB على الأقل من الذاكرة.",
+      "gatedToken": "تتطلب أصوات Pocket رمز Hugging Face وقبول شروط الأصوات.",
+      "model": "اختر نموذجًا متاحًا لتحويل النص إلى كلام.",
+      "device": "هذا الجهاز غير متاح.",
+      "npuDriverTooOld": "برنامج تشغيل NPU قديم جدًا. حدّثه أو اختر جهازًا آخر.",
+      "selection": "تعذّر تطبيق التحديد.",
+      "busy": "عملية لتحويل النص إلى كلام قيد التشغيل بالفعل.",
+      "cancelled": "أُلغيت القراءة.",
+      "clipboard": "تعذّرت قراءة نص الحافظة.",
+      "deviceNotSupported": "هذا النموذج لا يدعم الجهاز المحدد.",
+      "deviceUnavailable": "الجهاز المحدد غير متاح.",
+      "download": "فشل تنزيل النموذج.",
+      "driverDiscovery": "تعذّر اكتشاف برنامج تشغيل NPU.",
+      "failed": "فشلت العملية ثلاث مرات. اختر نموذجًا لإعادة المحاولة.",
+      "integrity": "فشل ملف نموذج في فحص السلامة.",
+      "invalidControls": "اختر سرعة من 0.5x إلى 2.0x ودرجة صوت من -6 إلى +6 أنصاف نغمات.",
+      "invalidRatings": "تقييمات النموذج مفقودة أو غير صالحة.",
+      "invalidVoice": "اختر صوتًا للنموذج المحدد.",
+      "outputUnavailable": "جهاز الإخراج غير متاح.",
+      "path": "مجلد تخزين تحويل النص إلى كلام غير متاح.",
+      "prepareFailed": "تعذّر على الجهاز المحدد تجهيز هذا النموذج.",
+      "protocol": "أعادت عملية تحويل النص إلى كلام استجابة غير صالحة.",
+      "registry": "سجل نماذج تحويل النص إلى كلام غير صالح.",
+      "settings": "تعذّر حفظ إعدادات تحويل النص إلى كلام.",
+      "start": "تعذّر بدء عملية تحويل النص إلى كلام.",
+      "starting": "عملية تحويل النص إلى كلام قيد البدء.",
+      "tokenRejected": "رُفض رمز Hugging Face. تحقق من الوصول إلى شروط أصوات Pocket.",
+      "tokenRequired": "عيّن رمز Hugging Face واقبل شروط أصوات Pocket قبل تنزيل الأصوات.",
+      "unknownModel": "نموذج تحويل النص إلى كلام المحدد غير معروف.",
+      "window": "تعذّر فتح نافذة القراءة بصوت عالٍ.",
+      "accessDenied": "رُفض الوصول إلى ملفات النموذج.",
+      "localIo": "تعذّرت قراءة ملفات النموذج أو الكتابة إليها.",
+      "downloading": "هذا النموذج قيد التنزيل بالفعل."
+    },
+    "runOn": "التشغيل على",
+    "preparing": "جارٍ التجهيز لـ {{device}}: {{graph}}",
+    "buffering": "جارٍ التخزين المؤقت",
+    "title": "القراءة بصوت عالٍ",
+    "textLabel": "النص المراد قراءته",
+    "placeholder": "الصق النص المراد قراءته",
+    "play": "تشغيل",
+    "pause": "إيقاف مؤقت",
+    "stop": "إيقاف",
+    "close": "إغلاق",
+    "progress": "التقدم",
+    "time": "مرّت {{elapsed}} ث، تبقّت {{remaining}} ث",
+    "openModels": "نماذج تحويل النص إلى كلام",
+    "outputFallback": "يُستخدم جهاز الإخراج الافتراضي",
+    "states": {
+      "waiting": "في الانتظار",
+      "starting": "جارٍ البدء",
+      "buffering": "جارٍ التخزين المؤقت",
+      "playing": "قيد التشغيل",
+      "paused": "متوقف مؤقتًا",
+      "finished": "انتهى",
+      "error": "خطأ"
+    },
+    "modelsTitle": "نماذج تحويل النص إلى كلام",
+    "modelsSubtitle": "اختر نموذج صوت. تُقاس السرعات على هذا الجهاز.",
+    "downloaded": "تم التنزيل",
+    "availableToDownload": "متاح للتنزيل",
+    "recommended": "موصى به",
+    "downloading": "جاري التنزيل",
+    "needsToken": "يتطلب رمز Hugging Face",
+    "tokenSet": "تم تعيين الرمز",
+    "active": "نشط",
+    "use": "استخدام",
+    "download": "تنزيل",
+    "delete": "حذف",
+    "cancel": "إلغاء",
+    "token": "رمز Hugging Face",
+    "tokenHelp": "مطلوب فقط لأصوات Pocket المقيّدة بعد قبول شروط الأصوات على Hugging Face. يبقى الرمز في الذاكرة ويُمسح عند إعادة تشغيل Handy.",
+    "clearToken": "مسح الرمز",
+    "showToken": "إظهار الرمز",
+    "hideToken": "إخفاء الرمز",
+    "saveToken": "تعيين الرمز",
+    "model": "النموذج",
+    "voice": "الصوت",
+    "preview": "معاينة الصوت",
+    "speed": "السرعة: {{value}}x",
+    "pitch": "درجة الصوت: {{value}} أنصاف نغمات",
+    "output": "جهاز الإخراج",
+    "sameAsHandy": "مثل Handy",
+    "readCode": "قراءة كتل الشيفرة",
+    "pocketAttribution": "أصوات Pocket TTS مرخّصة بموجب CC-BY-4.0. اتبع شروط الإسناد والموافقة لكل صوت في بطاقة النموذج.",
+    "supertonicRestrictions": "يستخدم Supertonic 3 ترخيص OpenRAIL-M. راجع قيود الاستخدام في بطاقة النموذج.",
+    "kokoroAttribution": "أوزان نموذج Kokoro مرخّصة بموجب Apache-2.0.",
+    "status": {
+      "failed": "فشل",
+      "ready": "جاهز",
+      "starting": "جارٍ البدء",
+      "stopping": "جارٍ الإيقاف",
+      "unloaded": "غير محمّل"
+    },
+    "previewSentence": "قراءة واضحة، عبارة تلو الأخرى.",
+    "description": {
+      "pocket-en": "أصوات إنجليزية معبّرة بأعلى تقييم استماع.",
+      "supertonic-3": "توليف إنجليزي سريع مع تنفيذ على CPU وGPU وNPU.",
+      "kokoro-82m-int8": "أصوات إنجليزية مدمجة من نموذج INT8."
+    },
+    "voiceCount": "الأصوات: {{count}}",
+    "downloadProgress": "تقدم تنزيل النموذج",
+    "settingsTitle": "تحويل النص إلى كلام",
+    "speedLabel": "السرعة",
+    "pitchLabel": "درجة الصوت",
+    "help": {
+      "model": "اختر نموذجًا منزّلًا لتحويل النص إلى كلام.",
+      "voice": "اختر صوتًا لهذا النموذج وعاينه.",
+      "speed": "اضبط سرعة قراءة النص.",
+      "pitch": "اضبط درجة الصوت بأنصاف النغمات.",
+      "output": "اختر مكان تشغيل صوت القراءة.",
+      "readCode": "تضمين كتل الشيفرة المسوّرة عند القراءة."
+    }
   }
 }

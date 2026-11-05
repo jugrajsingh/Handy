@@ -3,20 +3,35 @@
     "settings": "Ustawienia...",
     "checkUpdates": "Sprawdź aktualizacje...",
     "copyLastTranscript": "Kopiuj ostatnią transkrypcję",
-    "unloadModel": "Zwolnij model",
+    "unloadModel": "Zwolnij model transkrypcji",
+    "cleanup": "Model postprocesu",
+    "cleanupReady": "gotowy",
+    "cleanupNotLoaded": "niezaładowany",
+    "cleanupLoading": "ładowanie",
+    "cleanupError": "błąd",
+    "noCleanupModel": "Brak modelu postprocesu",
+    "unloadPostProcessingModel": "Zwolnij model postprocesu",
     "model": "Model",
+    "transcriptionModel": "Model transkrypcji",
     "quit": "Zamknij",
     "cancel": "Anuluj",
     "secureInputWarning": "⚠ Skróty zablokowane przez Secure Input",
     "language": "Język",
     "autoLanguage": "Automatycznie",
-    "otherLanguages": "Inne języki"
+    "otherLanguages": "Inne języki",
+    "ttsModel": "Model zamiany tekstu na mowę",
+    "ttsUnload": "Zwolnij model zamiany tekstu na mowę",
+    "ttsStarting": "Uruchamianie",
+    "ttsReady": "Załadowany",
+    "ttsStopping": "Zatrzymywanie",
+    "ttsFailed": "Niepowodzenie",
+    "ttsUnloaded": "Zwolniony"
   },
   "sidebar": {
     "general": "Ogólne",
-    "models": "Modele",
+    "models": "Modele transkrypcji",
     "advanced": "Zaawansowane",
-    "postProcessing": "Postproces",
+    "postProcessing": "Modele postprocesu",
     "history": "Historia",
     "debug": "Debugowanie",
     "about": "O programie"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}}: już dodano."
   },
   "modelSelector": {
+    "status": "Stan modelu: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Własny",
     "streaming": "Streaming",
     "active": "Aktywny",
@@ -336,18 +353,26 @@
         "none": "Brak skonfigurowanych skrótów",
         "notFound": "Nie znaleziono skrótu",
         "pressKeys": "Naciśnij klawisze...",
+        "unassigned": "Nieprzypisany",
         "bindings": {
           "transcribe": {
             "name": "Skrót transkrypcji",
             "description": "Skrót klawiaturowy do nagrywania i transkrypcji głosu."
+          },
+          "transcribe_raw": {
+            "name": "Skrót surowej transkrypcji"
           },
           "cancel": {
             "name": "Skrót anulowania",
             "description": "Skrót klawiaturowy do anulowania bieżącego nagrywania."
           },
           "transcribe_with_post_process": {
-            "name": "Skrót postprocessingu",
+            "name": "Skrót postprocesu",
             "description": "Opcjonalnie: Dedykowany skrót klawiszowy, który zawsze stosuje postprocessing AI do transkrypcji."
+          },
+          "read_aloud": {
+            "name": "Skrót czytania na głos",
+            "description": "Otwiera okno i czyta skopiowany tekst na głos."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Skrót klawiszowy"
+      "provider": {
+        "title": "Dostawca"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Anuluj",
         "selectToEdit": "Wybierz prompt powyżej, aby zobaczyć i edytować jego szczegóły.",
         "createFirst": "Kliknij 'Utwórz nowy prompt' powyżej, aby utworzyć pierwszy prompt postprocessingu."
+      },
+      "localLlm": {
+        "noCleanupModel": "Brak modelu postprocesu",
+        "s1Description": "Używa ustawień stylu, struktury i kontekstu.",
+        "plainDescription": "Używa wybranego promptu Handy.",
+        "groupTitle": "Model lokalny",
+        "size": "{{size}} MiB",
+        "downloaded": "Pobrano",
+        "use": "Użyj",
+        "download": "Pobierz",
+        "downloading": "Pobieranie {{percent}}%",
+        "delete": "Usuń",
+        "status": {
+          "title": "Stan",
+          "description": "Model ładuje się po rozpoczęciu dyktowania z postprocesem i jest zwalniany po upływie limitu czasu zwolnienia modelu.",
+          "notLoaded": "Niezaładowany",
+          "loading": "Ładowanie",
+          "ready": "Gotowy",
+          "error": "Błąd: {{reason}}"
+        },
+        "styling": {
+          "title": "Styl",
+          "description": "Jak formalnie brzmi tekst po postprocesie.",
+          "options": {
+            "casual": "Swobodny",
+            "semi_casual": "Półswobodny",
+            "semi_formal": "Półformalny",
+            "formal": "Formalny"
+          }
+        },
+        "structure": {
+          "title": "Struktura",
+          "description": "Akapity tekstu ciągłego lub listy w Markdown.",
+          "options": {
+            "prose": "Tekst ciągły",
+            "lists": "Listy"
+          }
+        },
+        "context": {
+          "title": "Kontekst",
+          "description": "Tekst ogólny lub układ wiadomości e-mail.",
+          "options": {
+            "general": "Ogólny",
+            "email": "E-mail"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 z jednym dodatkowym warunkiem: model musi być zawsze nazywany \"S1-mini\" od \"Superwhisper\", dokładnie z taką pisownią wielkich i małych liter."
+        },
+        "promptRequired": "Wybierz niepusty prompt Handy w grupie Prompty. Do tego czasu postproces jest pomijany i używana jest surowa transkrypcja.",
+        "promptHidden": "Ten model używa własnego stałego promptu oraz powyższych ustawień Styl, Struktura i Kontekst, dlatego edytor promptów jest ukryty."
       }
     },
     "history": {
       "title": "Historia",
+      "cleaned": "Po postprocesie",
+      "cleanedWith": "Przetworzono modelem {{model}}",
+      "raw": "Surowy",
+      "copyRaw": "Kopiuj surowy tekst",
+      "copyPostProcessed": "Kopiuj tekst po postprocesie",
+      "compare": {
+        "title": "Widok porównania",
+        "diff": "Różnice",
+        "side_by_side": "Obok siebie",
+        "stacked": "Jeden pod drugim"
+      },
+      "clearHistory": "Wyczyść historię",
+      "clearConfirmation": "Usunąć wpisy historii bez gwiazdki (liczba: {{count}}) i nagrania (liczba: {{recordings}})? Wpisy z gwiazdką i ich nagrania zostaną zachowane.",
       "openFolder": "Otwórz folder nagrań",
       "loading": "Wczytywanie historii...",
       "empty": "Brak transkrypcji. Rozpocznij nagrywanie, aby zbudować historię!",
@@ -991,5 +1080,141 @@
     "learnMore": "Jak to naprawić",
     "recorderBlocked": "Nie można teraz nagrać skrótu — Secure Input w macOS blokuje zdarzenia klawiszy. Najpierw rozwiąż ostrzeżenie o Secure Input.",
     "dismiss": "Odrzuć"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Jakość",
+      "speed": "Szybkość",
+      "recommended": "Zalecany",
+      "tooltip": "Pierwszy dźwięk po {{firstAudio}} s, {{faster}}x szybciej niż w czasie rzeczywistym, ładowanie w {{load}} s"
+    },
+    "devices": {
+      "auto": "Automatycznie",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Pobierz ten model przed czytaniem.",
+      "audio": "Nie można otworzyć urządzenia wyjściowego.",
+      "text": "Nie można przygotować tego tekstu.",
+      "clock": "Synchronizacja odtwarzania nie powiodła się.",
+      "worker": "Proces roboczy zamiany tekstu na mowę został zatrzymany.",
+      "unavailable": "Zamiana tekstu na mowę jest niedostępna.",
+      "notReady": "Zamiana tekstu na mowę nadal się uruchamia.",
+      "generic": "Zamiana tekstu na mowę nie powiodła się.",
+      "memory": "Wymagany jest co najmniej 1 GiB dostępnej pamięci.",
+      "gatedToken": "Głosy Pocket wymagają tokenu Hugging Face i zaakceptowanych warunków głosów.",
+      "model": "Wybierz dostępny model zamiany tekstu na mowę.",
+      "device": "To urządzenie jest niedostępne.",
+      "npuDriverTooOld": "Sterownik NPU jest zbyt stary. Zaktualizuj go lub wybierz inne urządzenie.",
+      "selection": "Nie można zastosować wyboru.",
+      "busy": "Operacja zamiany tekstu na mowę jest już uruchomiona.",
+      "cancelled": "Czytanie zostało anulowane.",
+      "clipboard": "Nie można odczytać tekstu ze schowka.",
+      "deviceNotSupported": "Ten model nie obsługuje wybranego urządzenia.",
+      "deviceUnavailable": "Wybrane urządzenie jest niedostępne.",
+      "download": "Pobieranie modelu nie powiodło się.",
+      "driverDiscovery": "Nie można wykryć sterownika NPU.",
+      "failed": "Proces roboczy zawiódł trzykrotnie. Wybierz model, aby spróbować ponownie.",
+      "integrity": "Plik modelu nie przeszedł kontroli integralności.",
+      "invalidControls": "Wybierz szybkość od 0.5x do 2.0x i wysokość tonu od -6 do +6 półtonów.",
+      "invalidRatings": "Oceny modeli są niedostępne lub nieprawidłowe.",
+      "invalidVoice": "Wybierz głos dla wybranego modelu.",
+      "outputUnavailable": "Urządzenie wyjściowe jest niedostępne.",
+      "path": "Katalog przechowywania zamiany tekstu na mowę jest niedostępny.",
+      "prepareFailed": "Wybrane urządzenie nie mogło przygotować tego modelu.",
+      "protocol": "Proces roboczy zamiany tekstu na mowę zwrócił nieprawidłową odpowiedź.",
+      "registry": "Rejestr modeli zamiany tekstu na mowę jest nieprawidłowy.",
+      "settings": "Nie można zapisać ustawień zamiany tekstu na mowę.",
+      "start": "Nie można uruchomić procesu roboczego zamiany tekstu na mowę.",
+      "starting": "Proces roboczy zamiany tekstu na mowę się uruchamia.",
+      "tokenRejected": "Token Hugging Face został odrzucony. Sprawdź dostęp do warunków głosów Pocket.",
+      "tokenRequired": "Przed pobraniem głosów ustaw token Hugging Face i zaakceptuj warunki głosów Pocket.",
+      "unknownModel": "Wybrany model zamiany tekstu na mowę jest nieznany.",
+      "window": "Nie można otworzyć okna czytania na głos.",
+      "accessDenied": "Odmowa dostępu do plików modelu.",
+      "localIo": "Nie można odczytać ani zapisać plików modelu.",
+      "downloading": "Ten model jest już pobierany."
+    },
+    "runOn": "Uruchom na",
+    "preparing": "Przygotowanie dla {{device}}: {{graph}}",
+    "buffering": "Buforowanie",
+    "title": "Czytanie na głos",
+    "textLabel": "Tekst do przeczytania",
+    "placeholder": "Wklej tekst do przeczytania",
+    "play": "Odtwórz",
+    "pause": "Wstrzymaj",
+    "stop": "Zatrzymaj",
+    "close": "Zamknij",
+    "progress": "Postęp",
+    "time": "Upłynęło {{elapsed}} s, pozostało {{remaining}} s",
+    "openModels": "Modele zamiany tekstu na mowę",
+    "outputFallback": "Używane jest domyślne urządzenie wyjściowe",
+    "states": {
+      "waiting": "Oczekiwanie",
+      "starting": "Uruchamianie",
+      "buffering": "Buforowanie",
+      "playing": "Odtwarzanie",
+      "paused": "Wstrzymano",
+      "finished": "Zakończono",
+      "error": "Błąd"
+    },
+    "modelsTitle": "Modele zamiany tekstu na mowę",
+    "modelsSubtitle": "Wybierz model głosu. Szybkość jest mierzona na tym komputerze.",
+    "downloaded": "Pobrane",
+    "availableToDownload": "Dostępne do pobrania",
+    "recommended": "Zalecany",
+    "downloading": "Pobieranie",
+    "needsToken": "Wymaga tokenu Hugging Face",
+    "tokenSet": "Token ustawiony",
+    "active": "Aktywny",
+    "use": "Użyj",
+    "download": "Pobierz",
+    "delete": "Usuń",
+    "cancel": "Anuluj",
+    "token": "Token Hugging Face",
+    "tokenHelp": "Potrzebny tylko dla zablokowanych głosów Pocket po zaakceptowaniu warunków głosów na Hugging Face. Token pozostaje w pamięci i jest usuwany po ponownym uruchomieniu Handy.",
+    "clearToken": "Wyczyść token",
+    "showToken": "Pokaż token",
+    "hideToken": "Ukryj token",
+    "saveToken": "Ustaw token",
+    "model": "Model",
+    "voice": "Głos",
+    "preview": "Posłuchaj próbki głosu",
+    "speed": "Szybkość: {{value}}x",
+    "pitch": "Wysokość tonu: {{value}} półtonów",
+    "output": "Urządzenie wyjściowe",
+    "sameAsHandy": "Takie samo jak w Handy",
+    "readCode": "Czytaj bloki kodu",
+    "pocketAttribution": "Głosy Pocket TTS są licencjonowane na zasadach CC-BY-4.0. Przestrzegaj warunków uznania autorstwa i zgody dla każdego głosu podanych na karcie modelu.",
+    "supertonicRestrictions": "Supertonic 3 używa licencji OpenRAIL-M. Zapoznaj się z ograniczeniami użycia na karcie modelu.",
+    "kokoroAttribution": "Wagi modelu Kokoro są objęte licencją Apache-2.0.",
+    "status": {
+      "failed": "Niepowodzenie",
+      "ready": "Gotowy",
+      "starting": "Uruchamianie",
+      "stopping": "Zatrzymywanie",
+      "unloaded": "Zwolniony"
+    },
+    "previewSentence": "Czytam wyraźnie, jedna fraza po drugiej.",
+    "description": {
+      "pocket-en": "Ekspresyjne angielskie głosy z najwyższą oceną odsłuchową.",
+      "supertonic-3": "Szybka angielska synteza z obsługą CPU, GPU i NPU.",
+      "kokoro-82m-int8": "Kompaktowe angielskie głosy z modelu INT8."
+    },
+    "voiceCount": "Liczba głosów: {{count}}",
+    "downloadProgress": "Postęp pobierania modelu",
+    "settingsTitle": "Zamiana tekstu na mowę",
+    "speedLabel": "Szybkość",
+    "pitchLabel": "Wysokość tonu",
+    "help": {
+      "model": "Wybierz pobrany model zamiany tekstu na mowę.",
+      "voice": "Wybierz głos dla tego modelu i posłuchaj próbki.",
+      "speed": "Dostosuj szybkość czytania tekstu.",
+      "pitch": "Dostosuj wysokość głosu w półtonach.",
+      "output": "Wybierz, gdzie odtwarzany jest dźwięk czytania na głos.",
+      "readCode": "Uwzględniaj bloki kodu w ogrodzeniu podczas czytania."
+    }
   }
 }

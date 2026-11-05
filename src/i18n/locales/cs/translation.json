@@ -3,20 +3,35 @@
     "settings": "Nastavení...",
     "checkUpdates": "Zkontrolovat aktualizace...",
     "copyLastTranscript": "Zkopírovat poslední přepis",
-    "unloadModel": "Uvolnit model",
+    "unloadModel": "Uvolnit model přepisu",
+    "cleanup": "Model následného zpracování",
+    "cleanupReady": "připraven",
+    "cleanupNotLoaded": "nenačten",
+    "cleanupLoading": "načítá se",
+    "cleanupError": "chyba",
+    "noCleanupModel": "Žádný model následného zpracování",
+    "unloadPostProcessingModel": "Uvolnit model následného zpracování",
     "model": "Model",
+    "transcriptionModel": "Model přepisu",
     "quit": "Ukončit",
     "cancel": "Zrušit",
     "secureInputWarning": "⚠ Zkratky blokuje Secure Input",
     "language": "Jazyk",
     "autoLanguage": "Automaticky",
-    "otherLanguages": "Další jazyky"
+    "otherLanguages": "Další jazyky",
+    "ttsModel": "Model převodu textu na řeč",
+    "ttsUnload": "Uvolnit model převodu textu na řeč",
+    "ttsStarting": "Spouští se",
+    "ttsReady": "Načten",
+    "ttsStopping": "Zastavuje se",
+    "ttsFailed": "Selhalo",
+    "ttsUnloaded": "Uvolněn"
   },
   "sidebar": {
     "general": "Obecné",
-    "models": "Modely",
+    "models": "Modely přepisu",
     "advanced": "Pokročilé",
-    "postProcessing": "Následné zpracování",
+    "postProcessing": "Modely následného zpracování",
     "history": "Historie",
     "debug": "Ladění",
     "about": "O aplikaci"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} jsou již přidány."
   },
   "modelSelector": {
+    "status": "Stav modelu: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Vlastní",
     "streaming": "Streaming",
     "active": "Aktivní",
@@ -336,18 +353,26 @@
         "none": "Žádné zkratky nejsou nastavené",
         "notFound": "Zkratka nenalezena",
         "pressKeys": "Stiskněte klávesy...",
+        "unassigned": "Nepřiřazeno",
         "bindings": {
           "transcribe": {
             "name": "Zkratka přepisu",
             "description": "Klávesová zkratka pro nahrávání a přepis vašeho hlasu."
+          },
+          "transcribe_raw": {
+            "name": "Zkratka pro nezpracovaný přepis"
           },
           "cancel": {
             "name": "Zkratka zrušení",
             "description": "Klávesová zkratka pro zrušení aktuálního nahrávání."
           },
           "transcribe_with_post_process": {
-            "name": "Klávesa pro následné zpracování",
+            "name": "Zkratka následného zpracování",
             "description": "Volitelné: Vyhrazená klávesová zkratka, která vždy použije AI následné zpracování na váš přepis."
+          },
+          "read_aloud": {
+            "name": "Zkratka pro čtení nahlas",
+            "description": "Otevře okno a přečte zkopírovaný text nahlas."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Klávesová zkratka"
+      "provider": {
+        "title": "Poskytovatel"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Zrušit",
         "selectToEdit": "Vyberte výše prompt, abyste zobrazili a upravili jeho podrobnosti.",
         "createFirst": "Klikněte nahoře na 'Vytvořit nový prompt' a vytvořte svůj první prompt pro následné zpracování."
+      },
+      "localLlm": {
+        "noCleanupModel": "Žádný model následného zpracování",
+        "s1Description": "Používá ovládání stylu, struktury a kontextu.",
+        "plainDescription": "Používá vybraný prompt Handy.",
+        "groupTitle": "Místní model",
+        "size": "{{size}} MiB",
+        "downloaded": "Staženo",
+        "use": "Použít",
+        "download": "Stáhnout",
+        "downloading": "Stahování {{percent}}%",
+        "delete": "Smazat",
+        "status": {
+          "title": "Stav",
+          "description": "Model se načte při spuštění diktování s následným zpracováním a uvolní se po uplynutí časového limitu uvolnění modelu.",
+          "notLoaded": "Nenačten",
+          "loading": "Načítá se",
+          "ready": "Připraven",
+          "error": "Chyba: {{reason}}"
+        },
+        "styling": {
+          "title": "Styl",
+          "description": "Jak formálně text po zpracování působí.",
+          "options": {
+            "casual": "Neformální",
+            "semi_casual": "Spíše neformální",
+            "semi_formal": "Spíše formální",
+            "formal": "Formální"
+          }
+        },
+        "structure": {
+          "title": "Struktura",
+          "description": "Odstavce souvislého textu nebo seznamy v Markdownu.",
+          "options": {
+            "prose": "Souvislý text",
+            "lists": "Seznamy"
+          }
+        },
+        "context": {
+          "title": "Kontext",
+          "description": "Obecný text nebo rozvržení e-mailu.",
+          "options": {
+            "general": "Obecný",
+            "email": "E-mail"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 s jednou podmínkou navíc: model musí být vždy uváděn jako \"S1-mini\" od \"Superwhisper\", přesně s tímto psaním velkých a malých písmen."
+        },
+        "promptRequired": "Ve skupině Prompty vyberte neprázdný prompt Handy. Do té doby se následné zpracování přeskakuje a použije se nezpracovaný přepis.",
+        "promptHidden": "Tento model používá vlastní pevný prompt a výše uvedená nastavení Styl, Struktura a Kontext, proto je editor promptů skrytý."
       }
     },
     "history": {
       "title": "Historie",
+      "cleaned": "Po následném zpracování",
+      "cleanedWith": "Zpracováno modelem {{model}}",
+      "raw": "Nezpracované",
+      "copyRaw": "Kopírovat nezpracovaný text",
+      "copyPostProcessed": "Kopírovat zpracovaný text",
+      "compare": {
+        "title": "Zobrazení porovnání",
+        "diff": "Rozdíly",
+        "side_by_side": "Vedle sebe",
+        "stacked": "Pod sebou"
+      },
+      "clearHistory": "Vymazat historii",
+      "clearConfirmation": "Odebrat nehvězdičkované záznamy historie (počet: {{count}}) a nahrávky (počet: {{recordings}})? Záznamy s hvězdičkou a jejich nahrávky zůstanou zachovány.",
       "openFolder": "Otevřít složku nahrávek",
       "loading": "Načítám historii...",
       "empty": "Zatím žádné přepisy. Začněte nahrávat a vytvořte si historii!",
@@ -991,5 +1080,141 @@
     "learnMore": "Jak to vyřešit",
     "recorderBlocked": "Zkratky teď nelze nahrát — Secure Input v macOS blokuje události kláves. Nejprve vyřešte upozornění na Secure Input.",
     "dismiss": "Zavřít"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Kvalita",
+      "speed": "Rychlost",
+      "recommended": "Doporučeno",
+      "tooltip": "První zvuk za {{firstAudio}} s, {{faster}}x rychleji než v reálném čase, načtení za {{load}} s"
+    },
+    "devices": {
+      "auto": "Automaticky",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Před čtením tento model stáhněte.",
+      "audio": "Výstupní zařízení se nepodařilo otevřít.",
+      "text": "Tento text se nepodařilo připravit.",
+      "clock": "Časování přehrávání selhalo.",
+      "worker": "Pracovní proces převodu textu na řeč se zastavil.",
+      "unavailable": "Převod textu na řeč není dostupný.",
+      "notReady": "Převod textu na řeč se stále spouští.",
+      "generic": "Převod textu na řeč selhal.",
+      "memory": "Je vyžadována alespoň 1 GiB volné paměti.",
+      "gatedToken": "Hlasy Pocket vyžadují token Hugging Face a přijaté podmínky hlasů.",
+      "model": "Vyberte dostupný model převodu textu na řeč.",
+      "device": "Toto zařízení není dostupné.",
+      "npuDriverTooOld": "Ovladač NPU je příliš starý. Aktualizujte jej nebo vyberte jiné zařízení.",
+      "selection": "Výběr se nepodařilo použít.",
+      "busy": "Operace převodu textu na řeč už běží.",
+      "cancelled": "Čtení bylo zrušeno.",
+      "clipboard": "Text ze schránky se nepodařilo přečíst.",
+      "deviceNotSupported": "Tento model vybrané zařízení nepodporuje.",
+      "deviceUnavailable": "Vybrané zařízení není dostupné.",
+      "download": "Stažení modelu selhalo.",
+      "driverDiscovery": "Ovladač NPU se nepodařilo zjistit.",
+      "failed": "Pracovní proces třikrát selhal. Pro opakování vyberte model.",
+      "integrity": "Soubor modelu neprošel kontrolou integrity.",
+      "invalidControls": "Vyberte rychlost od 0.5x do 2.0x a výšku tónu od -6 do +6 půltónů.",
+      "invalidRatings": "Hodnocení modelů chybí nebo je neplatné.",
+      "invalidVoice": "Vyberte hlas pro vybraný model.",
+      "outputUnavailable": "Výstupní zařízení není dostupné.",
+      "path": "Adresář úložiště převodu textu na řeč není dostupný.",
+      "prepareFailed": "Vybrané zařízení nedokázalo tento model připravit.",
+      "protocol": "Pracovní proces převodu textu na řeč vrátil neplatnou odpověď.",
+      "registry": "Registr modelů převodu textu na řeč je neplatný.",
+      "settings": "Nastavení převodu textu na řeč se nepodařilo uložit.",
+      "start": "Pracovní proces převodu textu na řeč se nepodařilo spustit.",
+      "starting": "Pracovní proces převodu textu na řeč se spouští.",
+      "tokenRejected": "Token Hugging Face byl odmítnut. Zkontrolujte přístup k podmínkám hlasů Pocket.",
+      "tokenRequired": "Před stažením hlasů nastavte token Hugging Face a přijměte podmínky hlasů Pocket.",
+      "unknownModel": "Vybraný model převodu textu na řeč není znám.",
+      "window": "Okno čtení nahlas se nepodařilo otevřít.",
+      "accessDenied": "Přístup k souborům modelu byl odepřen.",
+      "localIo": "Soubory modelu se nepodařilo přečíst nebo zapsat.",
+      "downloading": "Tento model se již stahuje."
+    },
+    "runOn": "Spustit na",
+    "preparing": "Příprava pro {{device}}: {{graph}}",
+    "buffering": "Ukládání do vyrovnávací paměti",
+    "title": "Čtení nahlas",
+    "textLabel": "Text ke čtení",
+    "placeholder": "Vložte text ke čtení",
+    "play": "Přehrát",
+    "pause": "Pozastavit",
+    "stop": "Zastavit",
+    "close": "Zavřít",
+    "progress": "Průběh",
+    "time": "Uplynulo {{elapsed}} s, zbývá {{remaining}} s",
+    "openModels": "Modely převodu textu na řeč",
+    "outputFallback": "Používá se výchozí výstupní zařízení",
+    "states": {
+      "waiting": "Čeká se",
+      "starting": "Spouští se",
+      "buffering": "Ukládání do vyrovnávací paměti",
+      "playing": "Přehrává se",
+      "paused": "Pozastaveno",
+      "finished": "Dokončeno",
+      "error": "Chyba"
+    },
+    "modelsTitle": "Modely převodu textu na řeč",
+    "modelsSubtitle": "Vyberte hlasový model. Rychlosti jsou měřeny na tomto počítači.",
+    "downloaded": "Staženo",
+    "availableToDownload": "K dispozici ke stažení",
+    "recommended": "Doporučeno",
+    "downloading": "Stahování",
+    "needsToken": "Vyžaduje token Hugging Face",
+    "tokenSet": "Token nastaven",
+    "active": "Aktivní",
+    "use": "Použít",
+    "download": "Stáhnout",
+    "delete": "Smazat",
+    "cancel": "Zrušit",
+    "token": "Token Hugging Face",
+    "tokenHelp": "Potřeba pouze pro uzamčené hlasy Pocket po přijetí podmínek hlasů na Hugging Face. Token zůstává v paměti a po restartu Handy se vymaže.",
+    "clearToken": "Vymazat token",
+    "showToken": "Zobrazit token",
+    "hideToken": "Skrýt token",
+    "saveToken": "Nastavit token",
+    "model": "Model",
+    "voice": "Hlas",
+    "preview": "Poslechnout ukázku hlasu",
+    "speed": "Rychlost: {{value}}x",
+    "pitch": "Výška tónu: {{value}} půltónů",
+    "output": "Výstupní zařízení",
+    "sameAsHandy": "Stejné jako Handy",
+    "readCode": "Číst bloky kódu",
+    "pocketAttribution": "Hlasy Pocket TTS jsou licencovány pod CC-BY-4.0. Dodržujte podmínky uvedení autorství a souhlasu u každého hlasu na stránce modelu.",
+    "supertonicRestrictions": "Supertonic 3 používá licenci OpenRAIL-M. Seznamte se s omezeními použití na stránce modelu.",
+    "kokoroAttribution": "Váhy modelu Kokoro používají licenci Apache-2.0.",
+    "status": {
+      "failed": "Selhalo",
+      "ready": "Připraven",
+      "starting": "Spouští se",
+      "stopping": "Zastavuje se",
+      "unloaded": "Uvolněn"
+    },
+    "previewSentence": "Čtu zřetelně, jednu frázi po druhé.",
+    "description": {
+      "pocket-en": "Výrazné anglické hlasy s nejvyšším hodnocením poslechu.",
+      "supertonic-3": "Rychlá anglická syntéza s během na CPU, GPU a NPU.",
+      "kokoro-82m-int8": "Kompaktní anglické hlasy z modelu INT8."
+    },
+    "voiceCount": "Počet hlasů: {{count}}",
+    "downloadProgress": "Průběh stahování modelu",
+    "settingsTitle": "Převod textu na řeč",
+    "speedLabel": "Rychlost",
+    "pitchLabel": "Výška tónu",
+    "help": {
+      "model": "Vyberte stažený model převodu textu na řeč.",
+      "voice": "Vyberte hlas pro tento model a poslechněte si ukázku.",
+      "speed": "Upravte, jak rychle se text čte.",
+      "pitch": "Upravte výšku hlasu v půltónech.",
+      "output": "Vyberte, kde se přehrává zvuk čtení nahlas.",
+      "readCode": "Při čtení zahrnout bloky kódu v ohraničení."
+    }
   }
 }

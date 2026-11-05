@@ -3,20 +3,35 @@
     "settings": "Inställningar...",
     "checkUpdates": "Sök efter uppdateringar...",
     "copyLastTranscript": "Kopiera senaste transkriptionen",
-    "unloadModel": "Avlasta modell",
+    "unloadModel": "Avlasta transkriptionsmodell",
+    "cleanup": "Efterbearbetningsmodell",
+    "cleanupReady": "redo",
+    "cleanupNotLoaded": "inte laddad",
+    "cleanupLoading": "laddar",
+    "cleanupError": "fel",
+    "noCleanupModel": "Ingen efterbearbetningsmodell",
+    "unloadPostProcessingModel": "Avlasta efterbearbetningsmodell",
     "model": "Modell",
+    "transcriptionModel": "Transkriptionsmodell",
     "quit": "Avsluta",
     "cancel": "Avbryt",
     "secureInputWarning": "⚠ Kortkommandon blockeras av Secure Input",
     "language": "Språk",
     "autoLanguage": "Automatiskt",
-    "otherLanguages": "Andra språk"
+    "otherLanguages": "Andra språk",
+    "ttsModel": "Text-till-tal-modell",
+    "ttsUnload": "Avlasta text-till-tal-modell",
+    "ttsStarting": "Startar",
+    "ttsReady": "Laddad",
+    "ttsStopping": "Stoppar",
+    "ttsFailed": "Misslyckades",
+    "ttsUnloaded": "Avlastad"
   },
   "sidebar": {
     "general": "Allmänt",
-    "models": "Modeller",
+    "models": "Transkriptionsmodeller",
     "advanced": "Avancerat",
-    "postProcessing": "Efterbearbetning",
+    "postProcessing": "Efterbearbetningsmodeller",
     "history": "Historik",
     "debug": "Felsökning",
     "about": "Om"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} är redan tillagda."
   },
   "modelSelector": {
+    "status": "Modellstatus: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Anpassad",
     "streaming": "Streaming",
     "active": "Aktiv",
@@ -336,18 +353,26 @@
         "none": "Inga kortkommandon konfigurerade",
         "notFound": "Kortkommando hittades inte",
         "pressKeys": "Tryck på tangenter...",
+        "unassigned": "Ej tilldelad",
         "bindings": {
           "transcribe": {
             "name": "Kortkommando för transkribering",
             "description": "Kortkommandot för att spela in och transkribera din röst."
+          },
+          "transcribe_raw": {
+            "name": "Kortkommando för rå transkription"
           },
           "cancel": {
             "name": "Kortkommando för att avbryta",
             "description": "Kortkommandot för att avbryta den aktuella inspelningen."
           },
           "transcribe_with_post_process": {
-            "name": "Snabbkommando för efterbearbetning",
+            "name": "Kortkommando för efterbearbetning",
             "description": "Valfritt: En dedikerad snabbknapp som alltid tillämpar AI-efterbearbetning på din transkription."
+          },
+          "read_aloud": {
+            "name": "Kortkommando för uppläsning",
+            "description": "Öppnar fönstret och läser upp kopierad text."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Snabbkommando"
+      "provider": {
+        "title": "Leverantör"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Avbryt",
         "selectToEdit": "Välj en prompt ovan för att visa och redigera dess detaljer.",
         "createFirst": "Klicka på 'Skapa ny prompt' ovan för att skapa din första prompt för efterbearbetning."
+      },
+      "localLlm": {
+        "noCleanupModel": "Ingen efterbearbetningsmodell",
+        "s1Description": "Använder kontroller för stil, struktur och sammanhang.",
+        "plainDescription": "Använder din valda Handy-prompt.",
+        "groupTitle": "Lokal modell",
+        "size": "{{size}} MiB",
+        "downloaded": "Nedladdad",
+        "use": "Använd",
+        "download": "Ladda ner",
+        "downloading": "Laddar ner {{percent}}%",
+        "delete": "Ta bort",
+        "status": {
+          "title": "Status",
+          "description": "Modellen laddas när ett diktamen med efterbearbetning startar och avlastas efter tidsgränsen för modellavlastning.",
+          "notLoaded": "Inte laddad",
+          "loading": "Laddar",
+          "ready": "Redo",
+          "error": "Fel: {{reason}}"
+        },
+        "styling": {
+          "title": "Stil",
+          "description": "Hur formell den efterbearbetade texten låter.",
+          "options": {
+            "casual": "Ledig",
+            "semi_casual": "Halvledig",
+            "semi_formal": "Halvformell",
+            "formal": "Formell"
+          }
+        },
+        "structure": {
+          "title": "Struktur",
+          "description": "Löpande stycken eller Markdown-listor.",
+          "options": {
+            "prose": "Löpande text",
+            "lists": "Listor"
+          }
+        },
+        "context": {
+          "title": "Sammanhang",
+          "description": "Allmän text eller e-postlayout.",
+          "options": {
+            "general": "Allmänt",
+            "email": "E-post"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 med ett extra villkor: modellen måste alltid kallas \"S1-mini\" från \"Superwhisper\", med exakt den användningen av versaler och gemener."
+        },
+        "promptRequired": "Välj en icke-tom Handy-prompt i gruppen Prompter. Tills dess hoppas efterbearbetningen över och den råa transkriptionen används.",
+        "promptHidden": "Den här modellen använder sin egen fasta prompt och inställningarna Stil, Struktur och Sammanhang ovan, så promptredigeraren är dold."
       }
     },
     "history": {
       "title": "Historik",
+      "cleaned": "Efterbearbetad",
+      "cleanedWith": "Efterbearbetad med {{model}}",
+      "raw": "Rå",
+      "copyRaw": "Kopiera rå text",
+      "copyPostProcessed": "Kopiera efterbearbetad text",
+      "compare": {
+        "title": "Jämförelsevy",
+        "diff": "Skillnader",
+        "side_by_side": "Sida vid sida",
+        "stacked": "Staplade"
+      },
+      "clearHistory": "Rensa historik",
+      "clearConfirmation": "Ta bort {{count}} historikposter utan stjärna och {{recordings}} inspelningar? Poster med stjärna och deras inspelningar behålls.",
       "openFolder": "Öppna mapp för inspelningar",
       "loading": "Laddar historik...",
       "empty": "Inga transkriptioner ännu. Börja spela in för att bygga upp din historik!",
@@ -991,5 +1080,141 @@
     "learnMore": "Så här löser du det",
     "recorderBlocked": "Det går inte att spela in kortkommandon just nu — macOS Secure Input blockerar tangenthändelser. Lös varningen om Secure Input först.",
     "dismiss": "Avfärda"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Kvalitet",
+      "speed": "Hastighet",
+      "recommended": "Rekommenderad",
+      "tooltip": "Första ljudet efter {{firstAudio}} s, {{faster}}x snabbare än realtid, laddas på {{load}} s"
+    },
+    "devices": {
+      "auto": "Auto",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Ladda ner den här modellen innan uppläsning.",
+      "audio": "Utenheten kunde inte öppnas.",
+      "text": "Texten kunde inte förberedas.",
+      "clock": "Uppspelningens timing misslyckades.",
+      "worker": "Arbetsprocessen för text-till-tal stoppades.",
+      "unavailable": "Text-till-tal är inte tillgängligt.",
+      "notReady": "Text-till-tal startar fortfarande.",
+      "generic": "Text-till-tal misslyckades.",
+      "memory": "Minst 1 GiB tillgängligt minne krävs.",
+      "gatedToken": "Pocket-röster kräver en Hugging Face-token och godkända villkor för rösterna.",
+      "model": "Välj en tillgänglig text-till-tal-modell.",
+      "device": "Den här enheten är inte tillgänglig.",
+      "npuDriverTooOld": "NPU-drivrutinen är för gammal. Uppdatera den eller välj en annan enhet.",
+      "selection": "Valet kunde inte tillämpas.",
+      "busy": "En text-till-tal-åtgärd pågår redan.",
+      "cancelled": "Uppläsningen avbröts.",
+      "clipboard": "Texten i urklipp kunde inte läsas.",
+      "deviceNotSupported": "Den här modellen stöder inte den valda enheten.",
+      "deviceUnavailable": "Den valda enheten är inte tillgänglig.",
+      "download": "Modellnedladdningen misslyckades.",
+      "driverDiscovery": "NPU-drivrutinen kunde inte upptäckas.",
+      "failed": "Arbetsprocessen misslyckades tre gånger. Välj en modell för att försöka igen.",
+      "integrity": "En modellfil misslyckades i integritetskontrollen.",
+      "invalidControls": "Välj en hastighet från 0.5x till 2.0x och en tonhöjd från -6 till +6 halvtoner.",
+      "invalidRatings": "Modellbetygen saknas eller är ogiltiga.",
+      "invalidVoice": "Välj en röst för den valda modellen.",
+      "outputUnavailable": "Utenheten är inte tillgänglig.",
+      "path": "Lagringskatalogen för text-till-tal är inte tillgänglig.",
+      "prepareFailed": "Den valda enheten kunde inte förbereda den här modellen.",
+      "protocol": "Arbetsprocessen för text-till-tal returnerade ett ogiltigt svar.",
+      "registry": "Registret över text-till-tal-modeller är ogiltigt.",
+      "settings": "Inställningarna för text-till-tal kunde inte sparas.",
+      "start": "Arbetsprocessen för text-till-tal kunde inte startas.",
+      "starting": "Arbetsprocessen för text-till-tal startar.",
+      "tokenRejected": "Hugging Face-token avvisades. Kontrollera åtkomsten till villkoren för Pocket-rösterna.",
+      "tokenRequired": "Ange en Hugging Face-token och godkänn villkoren för Pocket-rösterna innan du laddar ner röster.",
+      "unknownModel": "Den valda text-till-tal-modellen är okänd.",
+      "window": "Uppläsningsfönstret kunde inte öppnas.",
+      "accessDenied": "Åtkomst till modellfilerna nekades.",
+      "localIo": "Modellfilerna kunde inte läsas eller skrivas.",
+      "downloading": "Den här modellen laddas redan ner."
+    },
+    "runOn": "Kör på",
+    "preparing": "Förbereder för {{device}}: {{graph}}",
+    "buffering": "Buffrar",
+    "title": "Uppläsning",
+    "textLabel": "Text att läsa upp",
+    "placeholder": "Klistra in text att läsa upp",
+    "play": "Spela upp",
+    "pause": "Pausa",
+    "stop": "Stoppa",
+    "close": "Stäng",
+    "progress": "Förlopp",
+    "time": "{{elapsed}} s förflutet, {{remaining}} s kvar",
+    "openModels": "Text-till-tal-modeller",
+    "outputFallback": "Använder standardutenheten",
+    "states": {
+      "waiting": "Väntar",
+      "starting": "Startar",
+      "buffering": "Buffrar",
+      "playing": "Spelar",
+      "paused": "Pausad",
+      "finished": "Klar",
+      "error": "Fel"
+    },
+    "modelsTitle": "Text-till-tal-modeller",
+    "modelsSubtitle": "Välj en röstmodell. Hastigheter mäts på den här datorn.",
+    "downloaded": "Nedladdade",
+    "availableToDownload": "Tillgängliga för nedladdning",
+    "recommended": "Rekommenderad",
+    "downloading": "Laddar ner",
+    "needsToken": "Kräver en Hugging Face-token",
+    "tokenSet": "Token angiven",
+    "active": "Aktiv",
+    "use": "Använd",
+    "download": "Ladda ner",
+    "delete": "Ta bort",
+    "cancel": "Avbryt",
+    "token": "Hugging Face-token",
+    "tokenHelp": "Behövs bara för låsta Pocket-röster efter att du godkänt villkoren för rösterna på Hugging Face. Token finns kvar i minnet och rensas när Handy startas om.",
+    "clearToken": "Rensa token",
+    "showToken": "Visa token",
+    "hideToken": "Dölj token",
+    "saveToken": "Ange token",
+    "model": "Modell",
+    "voice": "Röst",
+    "preview": "Förhandslyssna på rösten",
+    "speed": "Hastighet: {{value}}x",
+    "pitch": "Tonhöjd: {{value}} halvtoner",
+    "output": "Utenhet",
+    "sameAsHandy": "Samma som Handy",
+    "readCode": "Läs upp kodblock",
+    "pocketAttribution": "Pocket TTS-röster är licensierade under CC-BY-4.0. Följ varje rösts villkor för attribution och samtycke på modellkortet.",
+    "supertonicRestrictions": "Supertonic 3 använder OpenRAIL-M. Läs igenom användningsbegränsningarna på modellkortet.",
+    "kokoroAttribution": "Kokoro-modellens vikter använder licensen Apache-2.0.",
+    "status": {
+      "failed": "Misslyckades",
+      "ready": "Redo",
+      "starting": "Startar",
+      "stopping": "Stoppar",
+      "unloaded": "Avlastad"
+    },
+    "previewSentence": "Läser tydligt, en fras i taget.",
+    "description": {
+      "pocket-en": "Uttrycksfulla engelska röster med högsta lyssningsbetyg.",
+      "supertonic-3": "Snabb engelsk syntes med körning på CPU, GPU och NPU.",
+      "kokoro-82m-int8": "Kompakta engelska röster från en INT8-modell."
+    },
+    "voiceCount": "{{count}} röster",
+    "downloadProgress": "Förlopp för modellnedladdning",
+    "settingsTitle": "Text-till-tal",
+    "speedLabel": "Hastighet",
+    "pitchLabel": "Tonhöjd",
+    "help": {
+      "model": "Välj en nedladdad text-till-tal-modell.",
+      "voice": "Välj en röst för den här modellen och förhandslyssna på den.",
+      "speed": "Justera hur snabbt texten läses upp.",
+      "pitch": "Justera röstens tonhöjd i halvtoner.",
+      "output": "Välj var uppläsningsljudet spelas upp.",
+      "readCode": "Ta med inhägnade kodblock vid uppläsning."
+    }
   }
 }

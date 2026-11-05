@@ -3,20 +3,35 @@
     "settings": "Ayarlar...",
     "checkUpdates": "Güncellemeleri Kontrol Et...",
     "copyLastTranscript": "Son Transkripti Kopyala",
-    "unloadModel": "Modeli Boşalt",
+    "unloadModel": "Transkripsiyon modelini kaldır",
+    "cleanup": "Son işlem modeli",
+    "cleanupReady": "hazır",
+    "cleanupNotLoaded": "yüklenmedi",
+    "cleanupLoading": "yükleniyor",
+    "cleanupError": "hata",
+    "noCleanupModel": "Son işlem modeli yok",
+    "unloadPostProcessingModel": "Son işlem modelini kaldır",
     "model": "Model",
+    "transcriptionModel": "Transkripsiyon modeli",
     "quit": "Çıkış",
     "cancel": "İptal",
     "secureInputWarning": "⚠ Kısayollar Secure Input tarafından engelleniyor",
     "language": "Dil",
     "autoLanguage": "Otomatik",
-    "otherLanguages": "Diğer Diller"
+    "otherLanguages": "Diğer Diller",
+    "ttsModel": "Metin okuma modeli",
+    "ttsUnload": "Metin okuma modelini kaldır",
+    "ttsStarting": "Başlatılıyor",
+    "ttsReady": "Yüklendi",
+    "ttsStopping": "Durduruluyor",
+    "ttsFailed": "Başarısız",
+    "ttsUnloaded": "Kaldırıldı"
   },
   "sidebar": {
     "general": "Genel",
-    "models": "Modeller",
+    "models": "Transkripsiyon Modelleri",
     "advanced": "Gelişmiş",
-    "postProcessing": "Son İşlem",
+    "postProcessing": "Son İşlem Modelleri",
     "history": "Geçmiş",
     "debug": "Hata Ayıklama",
     "about": "Hakkında"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} zaten ekli."
   },
   "modelSelector": {
+    "status": "Model durumu: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Özel",
     "streaming": "Akış",
     "active": "Aktif",
@@ -336,10 +353,14 @@
         "none": "Kısayol yapılandırılmadı",
         "notFound": "Kısayol bulunamadı",
         "pressKeys": "Tuşlara basın...",
+        "unassigned": "Atanmadı",
         "bindings": {
           "transcribe": {
             "name": "Transkripsiyon Kısayolu",
             "description": "Sesinizi kaydetmek ve metne dönüştürmek için klavye kısayolu."
+          },
+          "transcribe_raw": {
+            "name": "Ham Metin Kısayolu"
           },
           "cancel": {
             "name": "İptal Kısayolu",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "Son İşlem Kısayolu",
             "description": "İsteğe bağlı: Transkripsiyonunuza her zaman yapay zekâ ile son işlem uygulayan özel bir kısayol tuşu."
+          },
+          "read_aloud": {
+            "name": "Sesli okuma kısayolu",
+            "description": "Açılır pencereyi açar ve kopyalanan metni sesli okur."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Kısayol Tuşu"
+      "provider": {
+        "title": "Sağlayıcı"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "İptal",
         "selectToEdit": "Ayrıntılarını görüntülemek ve düzenlemek için yukarıdan bir prompt seçin.",
         "createFirst": "İlk son işlem promptunuzu oluşturmak için yukarıdaki “Yeni Prompt Oluştur” seçeneğine tıklayın."
+      },
+      "localLlm": {
+        "noCleanupModel": "Son işlem modeli yok",
+        "s1Description": "Stil, yapı ve bağlam denetimlerini kullanır.",
+        "plainDescription": "Seçtiğiniz Handy promptunu kullanır.",
+        "groupTitle": "Yerel model",
+        "size": "{{size}} MiB",
+        "downloaded": "İndirildi",
+        "use": "Kullan",
+        "download": "İndir",
+        "downloading": "%{{percent}} indiriliyor",
+        "delete": "Sil",
+        "status": {
+          "title": "Durum",
+          "description": "Model, son işlemli bir dikte başladığında yüklenir ve model kaldırma zaman aşımından sonra kaldırılır.",
+          "notLoaded": "Yüklenmedi",
+          "loading": "Yükleniyor",
+          "ready": "Hazır",
+          "error": "Hata: {{reason}}"
+        },
+        "styling": {
+          "title": "Stil",
+          "description": "Son işlemden geçen metnin ne kadar resmi okunacağı.",
+          "options": {
+            "casual": "Gündelik",
+            "semi_casual": "Yarı gündelik",
+            "semi_formal": "Yarı resmi",
+            "formal": "Resmi"
+          }
+        },
+        "structure": {
+          "title": "Yapı",
+          "description": "Düzyazı paragrafları veya Markdown listeleri.",
+          "options": {
+            "prose": "Düzyazı",
+            "lists": "Listeler"
+          }
+        },
+        "context": {
+          "title": "Bağlam",
+          "description": "Genel metin veya e-posta düzeni.",
+          "options": {
+            "general": "Genel",
+            "email": "E-posta"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 ve ek bir koşul: model her zaman \"Superwhisper\" tarafından \"S1-mini\" olarak, büyük ve küçük harfler tam olarak bu şekilde yazılarak anılmalıdır."
+        },
+        "promptRequired": "Prompt grubunda boş olmayan bir Handy promptu seçin. Seçilene kadar son işlem atlanır ve ham transkript kullanılır.",
+        "promptHidden": "Bu model kendi sabit promptunu ve yukarıdaki Stil, Yapı ve Bağlam ayarlarını kullandığından prompt düzenleyici gizlidir."
       }
     },
     "history": {
       "title": "Geçmiş",
+      "cleaned": "Son işlemli",
+      "cleanedWith": "{{model}} ile son işlem yapıldı",
+      "raw": "Ham",
+      "copyRaw": "Ham metni kopyala",
+      "copyPostProcessed": "Son işlemli metni kopyala",
+      "compare": {
+        "title": "Karşılaştırma görünümü",
+        "diff": "Fark",
+        "side_by_side": "Yan yana",
+        "stacked": "Üst üste"
+      },
+      "clearHistory": "Geçmişi Temizle",
+      "clearConfirmation": "{{count}} yıldızsız geçmiş kaydı ve {{recordings}} kayıt kaldırılsın mı? Yıldızlı kayıtlar ve ses kayıtları korunur.",
       "openFolder": "Kayıtlar Klasörünü Aç",
       "loading": "Geçmiş yükleniyor...",
       "empty": "Henüz transkripsiyon yok. Geçmişinizi oluşturmak için kayda başlayın!",
@@ -991,5 +1080,141 @@
     "learnMore": "Bu nasıl düzeltilir",
     "recorderBlocked": "Şu anda kısayol kaydedilemiyor — macOS Secure Input tuş olaylarını engelliyor. Önce Secure Input uyarısını giderin.",
     "dismiss": "Kapat"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Kalite",
+      "speed": "Hız",
+      "recommended": "Önerilen",
+      "tooltip": "İlk ses {{firstAudio}} sn, gerçek zamandan {{faster}} kat hızlı, {{load}} sn'de yüklenir"
+    },
+    "devices": {
+      "auto": "Otomatik",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Okumadan önce bu modeli indirin.",
+      "audio": "Çıkış cihazı açılamadı.",
+      "text": "Bu metin hazırlanamadı.",
+      "clock": "Oynatma zamanlaması başarısız oldu.",
+      "worker": "Metin okuma işçisi durdu.",
+      "unavailable": "Metin okuma kullanılamıyor.",
+      "notReady": "Metin okuma hâlâ başlatılıyor.",
+      "generic": "Metin okuma başarısız oldu.",
+      "memory": "En az 1 GiB kullanılabilir bellek gerekir.",
+      "gatedToken": "Pocket sesleri için bir Hugging Face belirteci ve kabul edilmiş ses koşulları gerekir.",
+      "model": "Kullanılabilir bir metin okuma modeli seçin.",
+      "device": "Bu cihaz kullanılamıyor.",
+      "npuDriverTooOld": "NPU sürücüsü çok eski. Güncelleyin veya başka bir cihaz seçin.",
+      "selection": "Seçim uygulanamadı.",
+      "busy": "Bir metin okuma işlemi zaten çalışıyor.",
+      "cancelled": "Okuma iptal edildi.",
+      "clipboard": "Pano metni okunamadı.",
+      "deviceNotSupported": "Bu model seçilen cihazı desteklemiyor.",
+      "deviceUnavailable": "Seçilen cihaz kullanılamıyor.",
+      "download": "Model indirilemedi.",
+      "driverDiscovery": "NPU sürücüsü algılanamadı.",
+      "failed": "İşçi üç kez başarısız oldu. Yeniden denemek için bir model seçin.",
+      "integrity": "Bir model dosyası bütünlük denetimini geçemedi.",
+      "invalidControls": "0.5x ile 2.0x arasında bir hız ve -6 ile +6 yarım ton arasında bir perde seçin.",
+      "invalidRatings": "Model puanları eksik veya geçersiz.",
+      "invalidVoice": "Seçilen model için bir ses seçin.",
+      "outputUnavailable": "Çıkış cihazı kullanılamıyor.",
+      "path": "Metin okuma depolama dizini kullanılamıyor.",
+      "prepareFailed": "Seçilen cihaz bu modeli hazırlayamadı.",
+      "protocol": "Metin okuma işçisi geçersiz bir yanıt döndürdü.",
+      "registry": "Metin okuma modeli kayıt defteri geçersiz.",
+      "settings": "Metin okuma ayarları kaydedilemedi.",
+      "start": "Metin okuma işçisi başlatılamadı.",
+      "starting": "Metin okuma işçisi başlatılıyor.",
+      "tokenRejected": "Hugging Face belirteci reddedildi. Pocket ses koşullarına erişimi denetleyin.",
+      "tokenRequired": "Sesleri indirmeden önce bir Hugging Face belirteci ayarlayın ve Pocket ses koşullarını kabul edin.",
+      "unknownModel": "Seçilen metin okuma modeli bilinmiyor.",
+      "window": "Sesli okuma penceresi açılamadı.",
+      "accessDenied": "Model dosyalarına erişim reddedildi.",
+      "localIo": "Model dosyaları okunamadı veya yazılamadı.",
+      "downloading": "Bu model zaten indiriliyor."
+    },
+    "runOn": "Çalıştırılacak cihaz",
+    "preparing": "{{device}} için hazırlanıyor: {{graph}}",
+    "buffering": "Arabelleğe alınıyor",
+    "title": "Sesli okuma",
+    "textLabel": "Okunacak metin",
+    "placeholder": "Okunacak metni yapıştırın",
+    "play": "Oynat",
+    "pause": "Duraklat",
+    "stop": "Durdur",
+    "close": "Kapat",
+    "progress": "İlerleme",
+    "time": "{{elapsed}} sn geçti, {{remaining}} sn kaldı",
+    "openModels": "Metin Okuma Modelleri",
+    "outputFallback": "Varsayılan çıkış cihazı kullanılıyor",
+    "states": {
+      "waiting": "Bekleniyor",
+      "starting": "Başlatılıyor",
+      "buffering": "Arabelleğe alınıyor",
+      "playing": "Oynatılıyor",
+      "paused": "Duraklatıldı",
+      "finished": "Bitti",
+      "error": "Hata"
+    },
+    "modelsTitle": "Metin Okuma Modelleri",
+    "modelsSubtitle": "Bir ses modeli seçin. Hızlar bu makinede ölçülür.",
+    "downloaded": "İndirildi",
+    "availableToDownload": "İndirilebilir",
+    "recommended": "Önerilen",
+    "downloading": "İndiriliyor",
+    "needsToken": "Hugging Face belirteci gerekir",
+    "tokenSet": "Belirteç ayarlandı",
+    "active": "Etkin",
+    "use": "Kullan",
+    "download": "İndir",
+    "delete": "Sil",
+    "cancel": "İptal",
+    "token": "Hugging Face belirteci",
+    "tokenHelp": "Yalnızca Hugging Face'te ses koşulları kabul edildikten sonra Pocket'in kısıtlı sesleri için gerekir. Belirteç bellekte tutulur ve Handy yeniden başladığında silinir.",
+    "clearToken": "Belirteci temizle",
+    "showToken": "Belirteci göster",
+    "hideToken": "Belirteci gizle",
+    "saveToken": "Belirteci ayarla",
+    "model": "Model",
+    "voice": "Ses",
+    "preview": "Sesi dinle",
+    "speed": "Hız: {{value}}x",
+    "pitch": "Perde: {{value}} yarım ton",
+    "output": "Çıkış cihazı",
+    "sameAsHandy": "Handy ile aynı",
+    "readCode": "Kod bloklarını oku",
+    "pocketAttribution": "Pocket TTS sesleri CC-BY-4.0 ile lisanslanmıştır. Model kartındaki her sesin atıf ve onay koşullarına uyun.",
+    "supertonicRestrictions": "Supertonic 3 OpenRAIL-M kullanır. Model kartındaki kullanım kısıtlamalarını inceleyin.",
+    "kokoroAttribution": "Kokoro model ağırlıkları Apache-2.0 lisansını kullanır.",
+    "status": {
+      "failed": "Başarısız",
+      "ready": "Hazır",
+      "starting": "Başlatılıyor",
+      "stopping": "Durduruluyor",
+      "unloaded": "Kaldırıldı"
+    },
+    "previewSentence": "Net okuma, her seferinde bir ifade.",
+    "description": {
+      "pocket-en": "En yüksek dinleme puanına sahip etkileyici İngilizce sesler.",
+      "supertonic-3": "CPU, GPU ve NPU ile çalışan hızlı İngilizce sentez.",
+      "kokoro-82m-int8": "INT8 modelinden kompakt İngilizce sesler."
+    },
+    "voiceCount": "{{count}} ses",
+    "downloadProgress": "Model indirme ilerlemesi",
+    "settingsTitle": "Metin okuma",
+    "speedLabel": "Hız",
+    "pitchLabel": "Perde",
+    "help": {
+      "model": "İndirilmiş bir metin okuma modeli seçin.",
+      "voice": "Bu model için bir ses seçin ve dinleyin.",
+      "speed": "Metnin ne kadar hızlı okunacağını ayarlayın.",
+      "pitch": "Ses perdesini yarım ton cinsinden ayarlayın.",
+      "output": "Sesli okuma sesinin nerede çalınacağını seçin.",
+      "readCode": "Okurken çitli kod bloklarını dahil et."
+    }
   }
 }

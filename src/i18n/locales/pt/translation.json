@@ -3,20 +3,35 @@
     "settings": "Configurações...",
     "checkUpdates": "Verificar Atualizações...",
     "copyLastTranscript": "Copiar última transcrição",
-    "unloadModel": "Descarregar modelo",
+    "unloadModel": "Descarregar modelo de transcrição",
+    "cleanup": "Modelo de pós-processamento",
+    "cleanupReady": "pronto",
+    "cleanupNotLoaded": "não carregado",
+    "cleanupLoading": "carregando",
+    "cleanupError": "erro",
+    "noCleanupModel": "Nenhum modelo de pós-processamento",
+    "unloadPostProcessingModel": "Descarregar modelo de pós-processamento",
     "model": "Modelo",
+    "transcriptionModel": "Modelo de transcrição",
     "quit": "Sair",
     "cancel": "Cancelar",
     "secureInputWarning": "⚠ Atalhos bloqueados pelo Secure Input",
     "language": "Idioma",
     "autoLanguage": "Automático",
-    "otherLanguages": "Outros idiomas"
+    "otherLanguages": "Outros idiomas",
+    "ttsModel": "Modelo de conversão de texto em fala",
+    "ttsUnload": "Descarregar modelo de conversão de texto em fala",
+    "ttsStarting": "Iniciando",
+    "ttsReady": "Carregado",
+    "ttsStopping": "Parando",
+    "ttsFailed": "Falhou",
+    "ttsUnloaded": "Descarregado"
   },
   "sidebar": {
     "general": "Geral",
-    "models": "Modelos",
+    "models": "Modelos de transcrição",
     "advanced": "Avançado",
-    "postProcessing": "Pós-Processamento",
+    "postProcessing": "Modelos de pós-processamento",
     "history": "Histórico",
     "debug": "Depuração",
     "about": "Sobre"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} já foram adicionados."
   },
   "modelSelector": {
+    "status": "Status do modelo: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Personalizado",
     "streaming": "Streaming",
     "active": "Ativo",
@@ -336,18 +353,26 @@
         "none": "Nenhum atalho configurado",
         "notFound": "Atalho não encontrado",
         "pressKeys": "Pressione as teclas...",
+        "unassigned": "Não atribuído",
         "bindings": {
           "transcribe": {
             "name": "Atalho de Transcrição",
             "description": "O atalho de teclado para gravar e transcrever sua voz."
+          },
+          "transcribe_raw": {
+            "name": "Atalho Bruto"
           },
           "cancel": {
             "name": "Atalho de Cancelar",
             "description": "O atalho de teclado para cancelar a gravação atual."
           },
           "transcribe_with_post_process": {
-            "name": "Tecla de Pós-Processamento",
+            "name": "Atalho de Pós-Processamento",
             "description": "Opcional: Uma tecla de atalho dedicada que sempre aplica pós-processamento com IA à sua transcrição."
+          },
+          "read_aloud": {
+            "name": "Atalho de leitura em voz alta",
+            "description": "Abre o popup e lê em voz alta o texto copiado."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Tecla de atalho"
+      "provider": {
+        "title": "Provedor"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Cancelar",
         "selectToEdit": "Selecione um prompt acima para visualizar e editar seus detalhes.",
         "createFirst": "Clique em 'Criar Novo Prompt' acima para criar seu primeiro prompt de pós-processamento."
+      },
+      "localLlm": {
+        "noCleanupModel": "Nenhum modelo de pós-processamento",
+        "s1Description": "Usa os controles de estilo, estrutura e contexto.",
+        "plainDescription": "Usa o prompt do Handy selecionado.",
+        "groupTitle": "Modelo local",
+        "size": "{{size}} MiB",
+        "downloaded": "Baixado",
+        "use": "Usar",
+        "download": "Baixar",
+        "downloading": "Baixando {{percent}}%",
+        "delete": "Excluir",
+        "status": {
+          "title": "Status",
+          "description": "O modelo é carregado quando um ditado com pós-processamento começa e descarregado após o tempo limite de descarregamento do modelo.",
+          "notLoaded": "Não carregado",
+          "loading": "Carregando",
+          "ready": "Pronto",
+          "error": "Erro: {{reason}}"
+        },
+        "styling": {
+          "title": "Estilo",
+          "description": "Quão formal é o texto pós-processado.",
+          "options": {
+            "casual": "Informal",
+            "semi_casual": "Semi-informal",
+            "semi_formal": "Semiformal",
+            "formal": "Formal"
+          }
+        },
+        "structure": {
+          "title": "Estrutura",
+          "description": "Parágrafos em prosa ou listas em Markdown.",
+          "options": {
+            "prose": "Prosa",
+            "lists": "Listas"
+          }
+        },
+        "context": {
+          "title": "Contexto",
+          "description": "Texto geral ou formato de e-mail.",
+          "options": {
+            "general": "Geral",
+            "email": "E-mail"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 com uma condição adicional: o modelo deve ser sempre chamado \"S1-mini\" da \"Superwhisper\", exatamente com estas maiúsculas e minúsculas."
+        },
+        "promptRequired": "Selecione um prompt do Handy não vazio no grupo Prompts. Até lá, o pós-processamento é ignorado e a transcrição bruta é usada.",
+        "promptHidden": "Este modelo usa seu próprio prompt fixo e as configurações de Estilo, Estrutura e Contexto acima, por isso o editor de prompt está oculto."
       }
     },
     "history": {
       "title": "Histórico",
+      "cleaned": "Pós-processado",
+      "cleanedWith": "Pós-processado com {{model}}",
+      "raw": "Bruto",
+      "copyRaw": "Copiar texto bruto",
+      "copyPostProcessed": "Copiar texto pós-processado",
+      "compare": {
+        "title": "Visualização de comparação",
+        "diff": "Diferenças",
+        "side_by_side": "Lado a lado",
+        "stacked": "Empilhado"
+      },
+      "clearHistory": "Limpar histórico",
+      "clearConfirmation": "Remover {{count}} entradas do histórico sem estrela e {{recordings}} gravações? As entradas com estrela e suas gravações serão mantidas.",
       "openFolder": "Abrir Pasta de Gravações",
       "loading": "Carregando histórico...",
       "empty": "Nenhuma transcrição ainda. Comece a gravar para construir seu histórico!",
@@ -991,5 +1080,141 @@
     "learnMore": "Como resolver isso",
     "recorderBlocked": "Não é possível gravar atalhos agora — o Secure Input do macOS está bloqueando os eventos de tecla. Resolva primeiro o aviso do Secure Input.",
     "dismiss": "Dispensar"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Qualidade",
+      "speed": "Velocidade",
+      "recommended": "Recomendado",
+      "tooltip": "Primeiro áudio {{firstAudio}} s, {{faster}}x mais rápido que o tempo real, carrega em {{load}} s"
+    },
+    "devices": {
+      "auto": "Automático",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Baixe este modelo antes de ler.",
+      "audio": "Não foi possível abrir o dispositivo de saída.",
+      "text": "Não foi possível preparar este texto.",
+      "clock": "A sincronização da reprodução falhou.",
+      "worker": "O processo de conversão de texto em fala foi interrompido.",
+      "unavailable": "A conversão de texto em fala não está disponível.",
+      "notReady": "A conversão de texto em fala ainda está iniciando.",
+      "generic": "A conversão de texto em fala falhou.",
+      "memory": "É necessário pelo menos 1 GiB de memória disponível.",
+      "gatedToken": "As vozes Pocket exigem um token do Hugging Face e a aceitação dos termos das vozes.",
+      "model": "Escolha um modelo de conversão de texto em fala disponível.",
+      "device": "Este dispositivo não está disponível.",
+      "npuDriverTooOld": "Driver da NPU desatualizado. Atualize-o ou escolha outro dispositivo.",
+      "selection": "Não foi possível aplicar a seleção.",
+      "busy": "Uma operação de conversão de texto em fala já está em andamento.",
+      "cancelled": "A leitura foi cancelada.",
+      "clipboard": "Não foi possível ler o texto da área de transferência.",
+      "deviceNotSupported": "Este modelo não oferece suporte ao dispositivo selecionado.",
+      "deviceUnavailable": "O dispositivo selecionado não está disponível.",
+      "download": "O download do modelo falhou.",
+      "driverDiscovery": "Não foi possível detectar o driver da NPU.",
+      "failed": "O processo falhou três vezes. Selecione um modelo para tentar novamente.",
+      "integrity": "Um arquivo do modelo falhou na verificação de integridade.",
+      "invalidControls": "Escolha uma velocidade de 0.5x a 2.0x e um tom de -6 a +6 semitons.",
+      "invalidRatings": "As avaliações do modelo estão ausentes ou inválidas.",
+      "invalidVoice": "Escolha uma voz para o modelo selecionado.",
+      "outputUnavailable": "O dispositivo de saída não está disponível.",
+      "path": "O diretório de armazenamento da conversão de texto em fala não está disponível.",
+      "prepareFailed": "O dispositivo selecionado não conseguiu preparar este modelo.",
+      "protocol": "O processo de conversão de texto em fala retornou uma resposta inválida.",
+      "registry": "O registro de modelos de conversão de texto em fala é inválido.",
+      "settings": "Não foi possível salvar as configurações de conversão de texto em fala.",
+      "start": "Não foi possível iniciar o processo de conversão de texto em fala.",
+      "starting": "O processo de conversão de texto em fala está iniciando.",
+      "tokenRejected": "O token do Hugging Face foi rejeitado. Verifique o acesso aos termos das vozes Pocket.",
+      "tokenRequired": "Defina um token do Hugging Face e aceite os termos das vozes Pocket antes de baixar vozes.",
+      "unknownModel": "O modelo de conversão de texto em fala selecionado é desconhecido.",
+      "window": "Não foi possível abrir a janela de leitura em voz alta.",
+      "accessDenied": "O acesso aos arquivos do modelo foi negado.",
+      "localIo": "Não foi possível ler ou gravar os arquivos do modelo.",
+      "downloading": "Este modelo já está sendo baixado."
+    },
+    "runOn": "Executar em",
+    "preparing": "Preparando para {{device}}: {{graph}}",
+    "buffering": "Carregando em buffer",
+    "title": "Leitura em voz alta",
+    "textLabel": "Texto a ler",
+    "placeholder": "Cole o texto a ser lido",
+    "play": "Reproduzir",
+    "pause": "Pausar",
+    "stop": "Parar",
+    "close": "Fechar",
+    "progress": "Progresso",
+    "time": "{{elapsed}} s decorridos, {{remaining}} s restantes",
+    "openModels": "Modelos de conversão de texto em fala",
+    "outputFallback": "Usando o dispositivo de saída padrão",
+    "states": {
+      "waiting": "Aguardando",
+      "starting": "Iniciando",
+      "buffering": "Carregando em buffer",
+      "playing": "Reproduzindo",
+      "paused": "Pausado",
+      "finished": "Concluído",
+      "error": "Erro"
+    },
+    "modelsTitle": "Modelos de conversão de texto em fala",
+    "modelsSubtitle": "Escolha um modelo de voz. As velocidades são medidas nesta máquina.",
+    "downloaded": "Baixado",
+    "availableToDownload": "Disponível para download",
+    "recommended": "Recomendado",
+    "downloading": "Baixando",
+    "needsToken": "Requer um token do Hugging Face",
+    "tokenSet": "Token definido",
+    "active": "Ativo",
+    "use": "Usar",
+    "download": "Baixar",
+    "delete": "Excluir",
+    "cancel": "Cancelar",
+    "token": "Token do Hugging Face",
+    "tokenHelp": "Necessário apenas para as vozes Pocket restritas, depois de aceitar os termos das vozes no Hugging Face. O token fica na memória e é apagado quando o Handy reinicia.",
+    "clearToken": "Limpar token",
+    "showToken": "Mostrar token",
+    "hideToken": "Ocultar token",
+    "saveToken": "Definir token",
+    "model": "Modelo",
+    "voice": "Voz",
+    "preview": "Pré-visualizar voz",
+    "speed": "Velocidade: {{value}}x",
+    "pitch": "Tom: {{value}} semitons",
+    "output": "Dispositivo de saída",
+    "sameAsHandy": "Igual ao Handy",
+    "readCode": "Ler blocos de código",
+    "pocketAttribution": "As vozes do Pocket TTS são licenciadas sob CC-BY-4.0. Siga a atribuição e os termos de consentimento de cada voz no cartão do modelo.",
+    "supertonicRestrictions": "O Supertonic 3 usa OpenRAIL-M. Consulte as restrições de uso no cartão do modelo.",
+    "kokoroAttribution": "Os pesos do modelo Kokoro usam a licença Apache-2.0.",
+    "status": {
+      "failed": "Falhou",
+      "ready": "Pronto",
+      "starting": "Iniciando",
+      "stopping": "Parando",
+      "unloaded": "Descarregado"
+    },
+    "previewSentence": "Leitura clara, uma frase de cada vez.",
+    "description": {
+      "pocket-en": "Vozes expressivas em inglês com a maior pontuação de audição.",
+      "supertonic-3": "Síntese rápida em inglês com execução em CPU, GPU e NPU.",
+      "kokoro-82m-int8": "Vozes compactas em inglês de um modelo INT8."
+    },
+    "voiceCount": "{{count}} vozes",
+    "downloadProgress": "Progresso do download do modelo",
+    "settingsTitle": "Conversão de texto em fala",
+    "speedLabel": "Velocidade",
+    "pitchLabel": "Tom",
+    "help": {
+      "model": "Escolha um modelo de conversão de texto em fala baixado.",
+      "voice": "Escolha uma voz para este modelo e ouça a pré-visualização.",
+      "speed": "Ajuste a velocidade de leitura do texto.",
+      "pitch": "Ajuste o tom da voz em semitons.",
+      "output": "Escolha onde o áudio da leitura em voz alta é reproduzido.",
+      "readCode": "Inclui blocos de código delimitados na leitura."
+    }
   }
 }

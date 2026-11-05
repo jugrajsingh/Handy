@@ -3,20 +3,35 @@
     "settings": "Configuració...",
     "checkUpdates": "Comprova si hi ha actualitzacions...",
     "copyLastTranscript": "Copia l'última transcripció",
-    "unloadModel": "Allibera el model de la memòria",
+    "unloadModel": "Allibera el model de transcripció de la memòria",
+    "cleanup": "Model de postprocessament",
+    "cleanupReady": "a punt",
+    "cleanupNotLoaded": "no carregat",
+    "cleanupLoading": "s'està carregant",
+    "cleanupError": "error",
+    "noCleanupModel": "Cap model de postprocessament",
+    "unloadPostProcessingModel": "Allibera el model de postprocessament de la memòria",
     "model": "Model",
+    "transcriptionModel": "Model de transcripció",
     "quit": "Surt",
     "cancel": "Cancel·la",
     "secureInputWarning": "⚠ Dreceres blocades per l'entrada segura",
     "language": "Llengua",
     "autoLanguage": "Automàtica",
-    "otherLanguages": "Altres llengües"
+    "otherLanguages": "Altres llengües",
+    "ttsModel": "Model de text a veu",
+    "ttsUnload": "Allibera el model de text a veu de la memòria",
+    "ttsStarting": "S'està iniciant",
+    "ttsReady": "Carregat",
+    "ttsStopping": "S'està aturant",
+    "ttsFailed": "Ha fallat",
+    "ttsUnloaded": "Alliberat"
   },
   "sidebar": {
     "general": "General",
-    "models": "Models",
+    "models": "Models de transcripció",
     "advanced": "Avançat",
-    "postProcessing": "Postprocessament",
+    "postProcessing": "Models de postprocessament",
     "history": "Historial",
     "debug": "Depuració",
     "about": "Quant a"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} ja estan afegides."
   },
   "modelSelector": {
+    "status": "Estat del model: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Personalitzat",
     "streaming": "En temps real",
     "active": "Actiu",
@@ -336,10 +353,14 @@
         "none": "No hi ha cap drecera configurada",
         "notFound": "No s'ha trobat la drecera",
         "pressKeys": "Premeu les tecles...",
+        "unassigned": "Sense assignar",
         "bindings": {
           "transcribe": {
             "name": "Drecera de transcripció",
             "description": "La drecera de teclat per enregistrar i transcriure la vostra veu."
+          },
+          "transcribe_raw": {
+            "name": "Drecera del text en brut"
           },
           "cancel": {
             "name": "Drecera de cancel·lació",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "Drecera de postprocessament",
             "description": "Opcional: una drecera específica que sempre aplica postprocessament amb IA a la transcripció."
+          },
+          "read_aloud": {
+            "name": "Drecera de lectura en veu alta",
+            "description": "Obre la finestra emergent i llegeix en veu alta el text copiat."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Drecera de teclat"
+      "provider": {
+        "title": "Proveïdor"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Cancel·leu",
         "selectToEdit": "Seleccioneu una indicació more amunt per veure'n i editar-ne els detalls.",
         "createFirst": "Feu clic a «Creeu una indicació nova» més amunt per crear la primera indicació de postprocessament."
+      },
+      "localLlm": {
+        "noCleanupModel": "Cap model de postprocessament",
+        "s1Description": "Utilitza els controls d'estil, estructura i context.",
+        "plainDescription": "Utilitza la indicació del Handy seleccionada.",
+        "groupTitle": "Model local",
+        "size": "{{size}} MiB",
+        "downloaded": "Baixat",
+        "use": "Utilitza",
+        "download": "Baixa",
+        "downloading": "S'està baixant {{percent}}%",
+        "delete": "Suprimeix",
+        "status": {
+          "title": "Estat",
+          "description": "El model es carrega quan comença un dictat amb postprocessament i s'allibera de la memòria passat el temps d'espera d'alliberament del model.",
+          "notLoaded": "No carregat",
+          "loading": "S'està carregant",
+          "ready": "A punt",
+          "error": "Error: {{reason}}"
+        },
+        "styling": {
+          "title": "Estil",
+          "description": "Com de formal sona el text postprocessat.",
+          "options": {
+            "casual": "Informal",
+            "semi_casual": "Semiinformal",
+            "semi_formal": "Semiformal",
+            "formal": "Formal"
+          }
+        },
+        "structure": {
+          "title": "Estructura",
+          "description": "Paràgrafs en prosa o llistes en Markdown.",
+          "options": {
+            "prose": "Prosa",
+            "lists": "Llistes"
+          }
+        },
+        "context": {
+          "title": "Context",
+          "description": "Text general o un format de correu electrònic.",
+          "options": {
+            "general": "General",
+            "email": "Correu electrònic"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 amb una condició addicional: el model s'ha d'anomenar sempre \"S1-mini\" de \"Superwhisper\", amb aquestes majúscules i minúscules exactes."
+        },
+        "promptRequired": "Seleccioneu una indicació del Handy no buida al grup Indicacions. Fins aleshores, el postprocessament s'omet i s'utilitza la transcripció en brut.",
+        "promptHidden": "Aquest model utilitza la seva pròpia indicació fixa i els paràmetres d'Estil, Estructura i Context de dalt, de manera que l'editor d'indicacions està amagat."
       }
     },
     "history": {
       "title": "Historial",
+      "cleaned": "Postprocessat",
+      "cleanedWith": "Postprocessat amb {{model}}",
+      "raw": "En brut",
+      "copyRaw": "Copia el text en brut",
+      "copyPostProcessed": "Copia el text postprocessat",
+      "compare": {
+        "title": "Vista de comparació",
+        "diff": "Diferències",
+        "side_by_side": "Un al costat de l'altre",
+        "stacked": "Apilat"
+      },
+      "clearHistory": "Esborra l'historial",
+      "clearConfirmation": "Voleu suprimir {{count}} entrades de l'historial sense destacar i {{recordings}} enregistraments? Les entrades destacades i els seus enregistraments es conservaran.",
       "openFolder": "Obriu la carpeta d'enregistraments",
       "loading": "S'està carregant l'historial...",
       "empty": "Encara no hi ha transcripcions. Comenceu a enregistrar per crear l'historial!",
@@ -991,5 +1080,141 @@
     "learnMore": "Com es resol",
     "recorderBlocked": "Ara no se'n poden enregistrar dreceres: l'entrada segura del macOS bloca els esdeveniments de tecla. Resol primer l'avís d'entrada segura.",
     "dismiss": "Descarta"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Qualitat",
+      "speed": "Velocitat",
+      "recommended": "Recomanat",
+      "tooltip": "Primer àudio en {{firstAudio}} s, {{faster}}x més ràpid que en temps real, es carrega en {{load}} s"
+    },
+    "devices": {
+      "auto": "Automàtic",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Baixa aquest model abans de llegir.",
+      "audio": "No s'ha pogut obrir el dispositiu de sortida.",
+      "text": "No s'ha pogut preparar aquest text.",
+      "clock": "La sincronització de la reproducció ha fallat.",
+      "worker": "El procés de text a veu s'ha aturat.",
+      "unavailable": "El text a veu no està disponible.",
+      "notReady": "El text a veu encara s'està iniciant.",
+      "generic": "El text a veu ha fallat.",
+      "memory": "Cal almenys 1 GiB de memòria disponible.",
+      "gatedToken": "Les veus de Pocket requereixen un testimoni de Hugging Face i haver acceptat les condicions de les veus.",
+      "model": "Trieu un model de text a veu disponible.",
+      "device": "Aquest dispositiu no està disponible.",
+      "npuDriverTooOld": "El controlador de la NPU és massa antic. Actualitzeu-lo o trieu un altre dispositiu.",
+      "selection": "No s'ha pogut aplicar la selecció.",
+      "busy": "Ja hi ha una operació de text a veu en curs.",
+      "cancelled": "S'ha cancel·lat la lectura.",
+      "clipboard": "No s'ha pogut llegir el text del porta-retalls.",
+      "deviceNotSupported": "Aquest model no admet el dispositiu seleccionat.",
+      "deviceUnavailable": "El dispositiu seleccionat no està disponible.",
+      "download": "La baixada del model ha fallat.",
+      "driverDiscovery": "No s'ha pogut detectar el controlador de la NPU.",
+      "failed": "El procés ha fallat tres vegades. Seleccioneu un model per tornar-ho a provar.",
+      "integrity": "Un fitxer del model no ha superat la comprovació d'integritat.",
+      "invalidControls": "Trieu una velocitat de 0.5x a 2.0x i un to de -6 a +6 semitons.",
+      "invalidRatings": "Les valoracions del model falten o no són vàlides.",
+      "invalidVoice": "Trieu una veu per al model seleccionat.",
+      "outputUnavailable": "El dispositiu de sortida no està disponible.",
+      "path": "El directori d'emmagatzematge del text a veu no està disponible.",
+      "prepareFailed": "El dispositiu seleccionat no ha pogut preparar aquest model.",
+      "protocol": "El procés de text a veu ha retornat una resposta no vàlida.",
+      "registry": "El registre de models de text a veu no és vàlid.",
+      "settings": "No s'han pogut desar els paràmetres del text a veu.",
+      "start": "No s'ha pogut iniciar el procés de text a veu.",
+      "starting": "El procés de text a veu s'està iniciant.",
+      "tokenRejected": "S'ha rebutjat el testimoni de Hugging Face. Comproveu l'accés a les condicions de les veus de Pocket.",
+      "tokenRequired": "Definiu un testimoni de Hugging Face i accepteu les condicions de les veus de Pocket abans de baixar veus.",
+      "unknownModel": "El model de text a veu seleccionat és desconegut.",
+      "window": "No s'ha pogut obrir la finestra de lectura en veu alta.",
+      "accessDenied": "S'ha denegat l'accés als fitxers del model.",
+      "localIo": "No s'han pogut llegir ni escriure els fitxers del model.",
+      "downloading": "Aquest model ja s'està baixant."
+    },
+    "runOn": "Executa a",
+    "preparing": "S'està preparant per a {{device}}: {{graph}}",
+    "buffering": "S'està emmagatzemant a la memòria intermèdia",
+    "title": "Lectura en veu alta",
+    "textLabel": "Text a llegir",
+    "placeholder": "Enganxa el text a llegir",
+    "play": "Reprodueix",
+    "pause": "Pausa",
+    "stop": "Atura",
+    "close": "Tanca",
+    "progress": "Progrés",
+    "time": "{{elapsed}} s transcorreguts, {{remaining}} s restants",
+    "openModels": "Models de text a veu",
+    "outputFallback": "S'està utilitzant el dispositiu de sortida predeterminat",
+    "states": {
+      "waiting": "En espera",
+      "starting": "S'està iniciant",
+      "buffering": "S'està emmagatzemant a la memòria intermèdia",
+      "playing": "S'està reproduint",
+      "paused": "En pausa",
+      "finished": "Finalitzat",
+      "error": "Error"
+    },
+    "modelsTitle": "Models de text a veu",
+    "modelsSubtitle": "Trieu un model de veu. Les velocitats es mesuren en aquest equip.",
+    "downloaded": "Baixat",
+    "availableToDownload": "Disponible per baixar",
+    "recommended": "Recomanat",
+    "downloading": "S'està baixant",
+    "needsToken": "Necessita un testimoni de Hugging Face",
+    "tokenSet": "Testimoni definit",
+    "active": "Actiu",
+    "use": "Utilitza",
+    "download": "Baixa",
+    "delete": "Suprimeix",
+    "cancel": "Cancel·la",
+    "token": "Testimoni de Hugging Face",
+    "tokenHelp": "Només cal per a les veus restringides de Pocket després d'acceptar les condicions de les veus a Hugging Face. El testimoni es manté a la memòria i s'esborra quan es reinicia el Handy.",
+    "clearToken": "Esborra el testimoni",
+    "showToken": "Mostra el testimoni",
+    "hideToken": "Amaga el testimoni",
+    "saveToken": "Defineix el testimoni",
+    "model": "Model",
+    "voice": "Veu",
+    "preview": "Escolta la veu",
+    "speed": "Velocitat: {{value}}x",
+    "pitch": "To: {{value}} semitons",
+    "output": "Dispositiu de sortida",
+    "sameAsHandy": "Igual que el Handy",
+    "readCode": "Llegeix els blocs de codi",
+    "pocketAttribution": "Les veus de Pocket TTS tenen llicència CC-BY-4.0. Seguiu les condicions d'atribució i consentiment de cada veu a la fitxa del model.",
+    "supertonicRestrictions": "Supertonic 3 utilitza OpenRAIL-M. Reviseu-ne les restriccions d'ús a la fitxa del model.",
+    "kokoroAttribution": "Els pesos del model Kokoro utilitzen la llicència Apache-2.0.",
+    "status": {
+      "failed": "Ha fallat",
+      "ready": "A punt",
+      "starting": "S'està iniciant",
+      "stopping": "S'està aturant",
+      "unloaded": "Alliberat"
+    },
+    "previewSentence": "Lectura clara, una frase cada cop.",
+    "description": {
+      "pocket-en": "Veus angleses expressives amb la millor puntuació d'escolta.",
+      "supertonic-3": "Síntesi ràpida en anglès amb execució a la CPU, la GPU i la NPU.",
+      "kokoro-82m-int8": "Veus angleses compactes d'un model INT8."
+    },
+    "voiceCount": "{{count}} veus",
+    "downloadProgress": "Progrés de la baixada del model",
+    "settingsTitle": "Text a veu",
+    "speedLabel": "Velocitat",
+    "pitchLabel": "To",
+    "help": {
+      "model": "Trieu un model de text a veu baixat.",
+      "voice": "Trieu una veu per a aquest model i escolteu-la.",
+      "speed": "Ajusteu la velocitat de lectura del text.",
+      "pitch": "Ajusteu el to de la veu en semitons.",
+      "output": "Trieu on es reprodueix l'àudio de la lectura en veu alta.",
+      "readCode": "Inclou els blocs de codi delimitats en llegir."
+    }
   }
 }

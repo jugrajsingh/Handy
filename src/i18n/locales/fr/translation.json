@@ -3,20 +3,35 @@
     "settings": "Paramètres...",
     "checkUpdates": "Rechercher des mises à jour...",
     "copyLastTranscript": "Copier la dernière transcription",
-    "unloadModel": "Décharger le modèle",
+    "unloadModel": "Décharger le modèle de transcription",
+    "cleanup": "Modèle de post-traitement",
+    "cleanupReady": "prêt",
+    "cleanupNotLoaded": "non chargé",
+    "cleanupLoading": "chargement",
+    "cleanupError": "erreur",
+    "noCleanupModel": "Aucun modèle de post-traitement",
+    "unloadPostProcessingModel": "Décharger le modèle de post-traitement",
     "model": "Modèle",
+    "transcriptionModel": "Modèle de transcription",
     "quit": "Quitter",
     "cancel": "Annuler",
     "secureInputWarning": "⚠ Raccourcis bloqués par Secure Input",
     "language": "Langue",
     "autoLanguage": "Automatique",
-    "otherLanguages": "Autres langues"
+    "otherLanguages": "Autres langues",
+    "ttsModel": "Modèle de synthèse vocale",
+    "ttsUnload": "Décharger le modèle de synthèse vocale",
+    "ttsStarting": "Démarrage",
+    "ttsReady": "Chargé",
+    "ttsStopping": "Arrêt",
+    "ttsFailed": "Échec",
+    "ttsUnloaded": "Déchargé"
   },
   "sidebar": {
     "general": "Général",
-    "models": "Modèles",
+    "models": "Modèles de transcription",
     "advanced": "Avancé",
-    "postProcessing": "Post-traitement",
+    "postProcessing": "Modèles de post-traitement",
     "history": "Historique",
     "debug": "Débogage",
     "about": "À propos"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} sont déjà ajoutées."
   },
   "modelSelector": {
+    "status": "État du modèle : {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Personnalisé",
     "streaming": "Streaming",
     "active": "Actif",
@@ -336,10 +353,14 @@
         "none": "Aucun raccourci configuré",
         "notFound": "Raccourci non trouvé",
         "pressKeys": "Appuyez sur les touches...",
+        "unassigned": "Non attribué",
         "bindings": {
           "transcribe": {
             "name": "Raccourci de Transcription",
             "description": "Le raccourci clavier pour enregistrer et transcrire votre voix."
+          },
+          "transcribe_raw": {
+            "name": "Raccourci du texte brut"
           },
           "cancel": {
             "name": "Raccourci d'Annulation",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "Raccourci de post-traitement",
             "description": "Facultatif : Un raccourci dédié qui applique toujours le post-traitement IA à votre transcription."
+          },
+          "read_aloud": {
+            "name": "Raccourci de lecture à voix haute",
+            "description": "Ouvre la fenêtre et lit à voix haute le texte copié."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Raccourci clavier"
+      "provider": {
+        "title": "Fournisseur"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Annuler",
         "selectToEdit": "Sélectionnez un prompt ci-dessus pour voir et modifier ses détails.",
         "createFirst": "Cliquez sur 'Créer un nouveau prompt' ci-dessus pour créer votre premier prompt de post-traitement."
+      },
+      "localLlm": {
+        "noCleanupModel": "Aucun modèle de post-traitement",
+        "s1Description": "Utilise les réglages de style, de structure et de contexte.",
+        "plainDescription": "Utilise le prompt Handy sélectionné.",
+        "groupTitle": "Modèle local",
+        "size": "{{size}} MiB",
+        "downloaded": "Téléchargé",
+        "use": "Utiliser",
+        "download": "Télécharger",
+        "downloading": "Téléchargement {{percent}}%",
+        "delete": "Supprimer",
+        "status": {
+          "title": "État",
+          "description": "Le modèle se charge au début d'une dictée avec post-traitement et se décharge après le délai de déchargement du modèle.",
+          "notLoaded": "Non chargé",
+          "loading": "Chargement",
+          "ready": "Prêt",
+          "error": "Erreur : {{reason}}"
+        },
+        "styling": {
+          "title": "Style",
+          "description": "Le degré de formalité du texte post-traité.",
+          "options": {
+            "casual": "Décontracté",
+            "semi_casual": "Plutôt décontracté",
+            "semi_formal": "Plutôt formel",
+            "formal": "Formel"
+          }
+        },
+        "structure": {
+          "title": "Structure",
+          "description": "Paragraphes rédigés ou listes Markdown.",
+          "options": {
+            "prose": "Paragraphes",
+            "lists": "Listes"
+          }
+        },
+        "context": {
+          "title": "Contexte",
+          "description": "Texte général ou mise en forme d'e-mail.",
+          "options": {
+            "general": "Général",
+            "email": "E-mail"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 avec une condition supplémentaire : le modèle doit toujours être nommé \"S1-mini\" de \"Superwhisper\", avec exactement ces majuscules et minuscules."
+        },
+        "promptRequired": "Sélectionnez un prompt Handy non vide dans le groupe Prompts. Tant que ce n'est pas fait, le post-traitement est ignoré et la transcription brute est utilisée.",
+        "promptHidden": "Ce modèle utilise son propre prompt fixe et les réglages de style, de structure et de contexte ci-dessus, donc l'éditeur de prompt est masqué."
       }
     },
     "history": {
       "title": "Historique",
+      "cleaned": "Post-traité",
+      "cleanedWith": "Post-traité avec {{model}}",
+      "raw": "Brut",
+      "copyRaw": "Copier le texte brut",
+      "copyPostProcessed": "Copier le texte post-traité",
+      "compare": {
+        "title": "Vue de comparaison",
+        "diff": "Différences",
+        "side_by_side": "Côte à côte",
+        "stacked": "Empilé"
+      },
+      "clearHistory": "Effacer l'historique",
+      "clearConfirmation": "Supprimer {{count}} entrées d'historique non favorites et {{recordings}} enregistrements ? Les entrées favorites et leurs enregistrements seront conservés.",
       "openFolder": "Ouvrir le dossier des enregistrements",
       "loading": "Chargement de l'historique...",
       "empty": "Pas encore de transcriptions. Commencez à enregistrer pour créer votre historique !",
@@ -991,5 +1080,141 @@
     "learnMore": "Comment résoudre ce problème",
     "recorderBlocked": "Impossible d'enregistrer un raccourci pour le moment : Secure Input de macOS bloque les événements clavier. Résolvez d'abord l'avertissement Secure Input.",
     "dismiss": "Ignorer"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Qualité",
+      "speed": "Vitesse",
+      "recommended": "Recommandé",
+      "tooltip": "Premier audio en {{firstAudio}} s, {{faster}}x plus rapide que le temps réel, chargement en {{load}} s"
+    },
+    "devices": {
+      "auto": "Auto",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Téléchargez ce modèle avant la lecture.",
+      "audio": "Le périphérique de sortie n'a pas pu être ouvert.",
+      "text": "Ce texte n'a pas pu être préparé.",
+      "clock": "La synchronisation de la lecture a échoué.",
+      "worker": "Le processus de synthèse vocale s'est arrêté.",
+      "unavailable": "La synthèse vocale n'est pas disponible.",
+      "notReady": "La synthèse vocale démarre encore.",
+      "generic": "La synthèse vocale a échoué.",
+      "memory": "Au moins 1 GiB de mémoire disponible est requis.",
+      "gatedToken": "Les voix Pocket nécessitent un jeton Hugging Face et l'acceptation des conditions des voix.",
+      "model": "Choisissez un modèle de synthèse vocale disponible.",
+      "device": "Ce périphérique n'est pas disponible.",
+      "npuDriverTooOld": "Pilote NPU trop ancien. Mettez-le à jour ou choisissez un autre périphérique.",
+      "selection": "La sélection n'a pas pu être appliquée.",
+      "busy": "Une opération de synthèse vocale est déjà en cours.",
+      "cancelled": "La lecture a été annulée.",
+      "clipboard": "Le texte du presse-papiers n'a pas pu être lu.",
+      "deviceNotSupported": "Ce modèle ne prend pas en charge le périphérique sélectionné.",
+      "deviceUnavailable": "Le périphérique sélectionné n'est pas disponible.",
+      "download": "Le téléchargement du modèle a échoué.",
+      "driverDiscovery": "Le pilote NPU n'a pas pu être détecté.",
+      "failed": "Le processus a échoué trois fois. Sélectionnez un modèle pour réessayer.",
+      "integrity": "Un fichier du modèle a échoué à la vérification d'intégrité.",
+      "invalidControls": "Choisissez une vitesse de 0.5x à 2.0x et une hauteur de -6 à +6 demi-tons.",
+      "invalidRatings": "Les évaluations du modèle sont absentes ou invalides.",
+      "invalidVoice": "Choisissez une voix pour le modèle sélectionné.",
+      "outputUnavailable": "Le périphérique de sortie n'est pas disponible.",
+      "path": "Le répertoire de stockage de la synthèse vocale n'est pas disponible.",
+      "prepareFailed": "Le périphérique sélectionné n'a pas pu préparer ce modèle.",
+      "protocol": "Le processus de synthèse vocale a renvoyé une réponse invalide.",
+      "registry": "Le registre des modèles de synthèse vocale est invalide.",
+      "settings": "Les réglages de la synthèse vocale n'ont pas pu être enregistrés.",
+      "start": "Le processus de synthèse vocale n'a pas pu démarrer.",
+      "starting": "Le processus de synthèse vocale démarre.",
+      "tokenRejected": "Le jeton Hugging Face a été refusé. Vérifiez l'accès aux conditions des voix Pocket.",
+      "tokenRequired": "Définissez un jeton Hugging Face et acceptez les conditions des voix Pocket avant de télécharger des voix.",
+      "unknownModel": "Le modèle de synthèse vocale sélectionné est inconnu.",
+      "window": "La fenêtre de lecture à voix haute n'a pas pu être ouverte.",
+      "accessDenied": "L'accès aux fichiers du modèle a été refusé.",
+      "localIo": "Les fichiers du modèle n'ont pas pu être lus ou écrits.",
+      "downloading": "Ce modèle est déjà en cours de téléchargement."
+    },
+    "runOn": "Exécuter sur",
+    "preparing": "Préparation pour {{device}} : {{graph}}",
+    "buffering": "Mise en mémoire tampon",
+    "title": "Lecture à voix haute",
+    "textLabel": "Texte à lire",
+    "placeholder": "Collez le texte à lire",
+    "play": "Lecture",
+    "pause": "Pause",
+    "stop": "Arrêter",
+    "close": "Fermer",
+    "progress": "Progression",
+    "time": "{{elapsed}} s écoulées, {{remaining}} s restantes",
+    "openModels": "Modèles de synthèse vocale",
+    "outputFallback": "Utilisation du périphérique de sortie par défaut",
+    "states": {
+      "waiting": "En attente",
+      "starting": "Démarrage",
+      "buffering": "Mise en mémoire tampon",
+      "playing": "Lecture en cours",
+      "paused": "En pause",
+      "finished": "Terminé",
+      "error": "Erreur"
+    },
+    "modelsTitle": "Modèles de synthèse vocale",
+    "modelsSubtitle": "Choisissez un modèle de voix. Les vitesses sont mesurées sur cette machine.",
+    "downloaded": "Téléchargé",
+    "availableToDownload": "Disponible au téléchargement",
+    "recommended": "Recommandé",
+    "downloading": "Téléchargement",
+    "needsToken": "Nécessite un jeton Hugging Face",
+    "tokenSet": "Jeton défini",
+    "active": "Actif",
+    "use": "Utiliser",
+    "download": "Télécharger",
+    "delete": "Supprimer",
+    "cancel": "Annuler",
+    "token": "Jeton Hugging Face",
+    "tokenHelp": "Nécessaire uniquement pour les voix Pocket à accès restreint, après avoir accepté les conditions des voix sur Hugging Face. Le jeton reste en mémoire et est effacé au redémarrage de Handy.",
+    "clearToken": "Effacer le jeton",
+    "showToken": "Afficher le jeton",
+    "hideToken": "Masquer le jeton",
+    "saveToken": "Définir le jeton",
+    "model": "Modèle",
+    "voice": "Voix",
+    "preview": "Écouter la voix",
+    "speed": "Vitesse : {{value}}x",
+    "pitch": "Hauteur : {{value}} demi-tons",
+    "output": "Périphérique de sortie",
+    "sameAsHandy": "Identique à Handy",
+    "readCode": "Lire les blocs de code",
+    "pocketAttribution": "Les voix Pocket TTS sont sous licence CC-BY-4.0. Respectez les conditions d'attribution et de consentement de chaque voix indiquées sur la fiche du modèle.",
+    "supertonicRestrictions": "Supertonic 3 utilise OpenRAIL-M. Consultez ses restrictions d'utilisation sur la fiche du modèle.",
+    "kokoroAttribution": "Les poids du modèle Kokoro sont sous licence Apache-2.0.",
+    "status": {
+      "failed": "Échec",
+      "ready": "Prêt",
+      "starting": "Démarrage",
+      "stopping": "Arrêt",
+      "unloaded": "Déchargé"
+    },
+    "previewSentence": "Une lecture claire, une expression à la fois.",
+    "description": {
+      "pocket-en": "Voix anglaises expressives avec le meilleur score d'écoute.",
+      "supertonic-3": "Synthèse anglaise rapide avec exécution sur CPU, GPU et NPU.",
+      "kokoro-82m-int8": "Voix anglaises compactes issues d'un modèle INT8."
+    },
+    "voiceCount": "{{count}} voix",
+    "downloadProgress": "Progression du téléchargement du modèle",
+    "settingsTitle": "Synthèse vocale",
+    "speedLabel": "Vitesse",
+    "pitchLabel": "Hauteur",
+    "help": {
+      "model": "Choisissez un modèle de synthèse vocale téléchargé.",
+      "voice": "Choisissez une voix pour ce modèle et écoutez-la.",
+      "speed": "Réglez la vitesse de lecture du texte.",
+      "pitch": "Réglez la hauteur de la voix en demi-tons.",
+      "output": "Choisissez où l'audio de la lecture à voix haute est diffusé.",
+      "readCode": "Inclure les blocs de code délimités lors de la lecture."
+    }
   }
 }

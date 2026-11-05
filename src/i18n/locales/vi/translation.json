@@ -3,20 +3,35 @@
     "settings": "Cài đặt...",
     "checkUpdates": "Kiểm tra cập nhật...",
     "copyLastTranscript": "Sao chép bản chép lời mới nhất",
-    "unloadModel": "Dỡ mô hình",
+    "unloadModel": "Dỡ mô hình chuyển đổi giọng nói",
+    "cleanup": "Mô hình xử lý sau",
+    "cleanupReady": "sẵn sàng",
+    "cleanupNotLoaded": "chưa tải",
+    "cleanupLoading": "đang tải",
+    "cleanupError": "lỗi",
+    "noCleanupModel": "Không có mô hình xử lý sau",
+    "unloadPostProcessingModel": "Dỡ mô hình xử lý sau",
     "model": "Mô hình",
+    "transcriptionModel": "Mô hình chuyển đổi giọng nói",
     "quit": "Thoát",
     "cancel": "Hủy",
     "secureInputWarning": "⚠ Phím tắt bị Secure Input chặn",
     "language": "Ngôn ngữ",
     "autoLanguage": "Tự động",
-    "otherLanguages": "Ngôn ngữ khác"
+    "otherLanguages": "Ngôn ngữ khác",
+    "ttsModel": "Mô hình chuyển văn bản thành giọng nói",
+    "ttsUnload": "Dỡ mô hình chuyển văn bản thành giọng nói",
+    "ttsStarting": "Đang khởi động",
+    "ttsReady": "Đã tải",
+    "ttsStopping": "Đang dừng",
+    "ttsFailed": "Thất bại",
+    "ttsUnloaded": "Đã dỡ"
   },
   "sidebar": {
     "general": "Chung",
-    "models": "Mô hình",
+    "models": "Mô hình chuyển đổi giọng nói",
     "advanced": "Nâng cao",
-    "postProcessing": "Xử lý sau",
+    "postProcessing": "Mô hình xử lý sau",
     "history": "Lịch sử",
     "debug": "Gỡ lỗi",
     "about": "Giới thiệu"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "Đã thêm {{languages}} rồi."
   },
   "modelSelector": {
+    "status": "Trạng thái mô hình: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Tùy chỉnh",
     "streaming": "Truyền trực tiếp",
     "active": "Đang hoạt động",
@@ -336,10 +353,14 @@
         "none": "Chưa cấu hình phím tắt",
         "notFound": "Không tìm thấy phím tắt",
         "pressKeys": "Nhấn phím...",
+        "unassigned": "Chưa gán",
         "bindings": {
           "transcribe": {
             "name": "Phím tắt chuyển đổi",
             "description": "Phím tắt để ghi âm và chuyển đổi giọng nói của bạn."
+          },
+          "transcribe_raw": {
+            "name": "Phím tắt bản gốc"
           },
           "cancel": {
             "name": "Phím tắt hủy",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "Phím tắt xử lý sau",
             "description": "Tùy chọn: Phím tắt chuyên dụng luôn áp dụng xử lý sau bằng AI cho bản chuyển đổi của bạn."
+          },
+          "read_aloud": {
+            "name": "Phím tắt đọc to",
+            "description": "Mở cửa sổ popup và đọc to văn bản đã sao chép."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Phím tắt"
+      "provider": {
+        "title": "Nhà cung cấp"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Hủy",
         "selectToEdit": "Chọn một prompt ở trên để xem và chỉnh sửa chi tiết.",
         "createFirst": "Nhấn 'Tạo Prompt mới' ở trên để tạo prompt xử lý sau đầu tiên của bạn."
+      },
+      "localLlm": {
+        "noCleanupModel": "Không có mô hình xử lý sau",
+        "s1Description": "Dùng các tùy chọn phong cách, cấu trúc và ngữ cảnh.",
+        "plainDescription": "Dùng câu lệnh Handy bạn đã chọn.",
+        "groupTitle": "Mô hình cục bộ",
+        "size": "{{size}} MiB",
+        "downloaded": "Đã tải xuống",
+        "use": "Dùng",
+        "download": "Tải xuống",
+        "downloading": "Đang tải xuống {{percent}}%",
+        "delete": "Xóa",
+        "status": {
+          "title": "Trạng thái",
+          "description": "Mô hình được tải khi một lần đọc chính tả có xử lý sau bắt đầu và được dỡ sau thời gian chờ dỡ mô hình.",
+          "notLoaded": "Chưa tải",
+          "loading": "Đang tải",
+          "ready": "Sẵn sàng",
+          "error": "Lỗi: {{reason}}"
+        },
+        "styling": {
+          "title": "Phong cách",
+          "description": "Mức độ trang trọng của văn bản sau khi xử lý.",
+          "options": {
+            "casual": "Thân mật",
+            "semi_casual": "Hơi thân mật",
+            "semi_formal": "Hơi trang trọng",
+            "formal": "Trang trọng"
+          }
+        },
+        "structure": {
+          "title": "Cấu trúc",
+          "description": "Đoạn văn xuôi hoặc danh sách Markdown.",
+          "options": {
+            "prose": "Văn xuôi",
+            "lists": "Danh sách"
+          }
+        },
+        "context": {
+          "title": "Ngữ cảnh",
+          "description": "Văn bản chung hoặc bố cục email.",
+          "options": {
+            "general": "Chung",
+            "email": "Email"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 kèm một điều khoản bổ sung: mô hình phải luôn được gọi là \"S1-mini\" của \"Superwhisper\", đúng chính xác cách viết hoa và viết thường này."
+        },
+        "promptRequired": "Chọn một câu lệnh Handy không trống trong nhóm Câu lệnh. Cho đến lúc đó, bước xử lý sau bị bỏ qua và dùng bản ghi gốc.",
+        "promptHidden": "Mô hình này dùng câu lệnh cố định riêng cùng các cài đặt Phong cách, Cấu trúc và Ngữ cảnh ở trên, nên trình soạn câu lệnh bị ẩn."
       }
     },
     "history": {
       "title": "Lịch sử",
+      "cleaned": "Đã xử lý sau",
+      "cleanedWith": "Đã xử lý sau bằng {{model}}",
+      "raw": "Bản gốc",
+      "copyRaw": "Sao chép văn bản gốc",
+      "copyPostProcessed": "Sao chép văn bản đã xử lý sau",
+      "compare": {
+        "title": "Chế độ so sánh",
+        "diff": "Khác biệt",
+        "side_by_side": "Song song",
+        "stacked": "Xếp chồng"
+      },
+      "clearHistory": "Xóa lịch sử",
+      "clearConfirmation": "Xóa {{count}} mục lịch sử chưa gắn sao và {{recordings}} bản ghi âm? Các mục gắn sao và bản ghi âm của chúng sẽ được giữ lại.",
       "openFolder": "Mở thư mục ghi âm",
       "loading": "Đang tải lịch sử...",
       "empty": "Chưa có bản ghi nào. Bắt đầu ghi âm để xây dựng lịch sử của bạn!",
@@ -991,5 +1080,141 @@
     "learnMore": "Cách khắc phục",
     "recorderBlocked": "Hiện không thể ghi phím tắt — Secure Input của macOS đang chặn các sự kiện phím. Hãy xử lý cảnh báo Secure Input trước.",
     "dismiss": "Bỏ qua"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Chất lượng",
+      "speed": "Tốc độ",
+      "recommended": "Được đề xuất",
+      "tooltip": "Âm thanh đầu tiên sau {{firstAudio}} giây, nhanh hơn thời gian thực {{faster}}x, tải trong {{load}} giây"
+    },
+    "devices": {
+      "auto": "Tự động",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Hãy tải xuống mô hình này trước khi đọc.",
+      "audio": "Không thể mở thiết bị đầu ra.",
+      "text": "Không thể chuẩn bị văn bản này.",
+      "clock": "Đồng bộ thời gian phát lại thất bại.",
+      "worker": "Tiến trình chuyển văn bản thành giọng nói đã dừng.",
+      "unavailable": "Chuyển văn bản thành giọng nói không khả dụng.",
+      "notReady": "Chuyển văn bản thành giọng nói vẫn đang khởi động.",
+      "generic": "Chuyển văn bản thành giọng nói thất bại.",
+      "memory": "Cần ít nhất 1 GiB bộ nhớ khả dụng.",
+      "gatedToken": "Giọng Pocket yêu cầu token Hugging Face và việc chấp nhận điều khoản giọng nói.",
+      "model": "Hãy chọn một mô hình chuyển văn bản thành giọng nói khả dụng.",
+      "device": "Thiết bị này không khả dụng.",
+      "npuDriverTooOld": "Trình điều khiển NPU quá cũ. Hãy cập nhật hoặc chọn thiết bị khác.",
+      "selection": "Không thể áp dụng lựa chọn.",
+      "busy": "Một tác vụ chuyển văn bản thành giọng nói đang chạy.",
+      "cancelled": "Đã hủy việc đọc.",
+      "clipboard": "Không thể đọc văn bản trong clipboard.",
+      "deviceNotSupported": "Mô hình này không hỗ trợ thiết bị đã chọn.",
+      "deviceUnavailable": "Thiết bị đã chọn không khả dụng.",
+      "download": "Tải xuống mô hình thất bại.",
+      "driverDiscovery": "Không thể phát hiện trình điều khiển NPU.",
+      "failed": "Tiến trình đã thất bại ba lần. Hãy chọn một mô hình để thử lại.",
+      "integrity": "Một tệp mô hình không vượt qua kiểm tra tính toàn vẹn.",
+      "invalidControls": "Chọn tốc độ từ 0.5x đến 2.0x và cao độ từ -6 đến +6 nửa cung.",
+      "invalidRatings": "Xếp hạng mô hình bị thiếu hoặc không hợp lệ.",
+      "invalidVoice": "Hãy chọn một giọng cho mô hình đã chọn.",
+      "outputUnavailable": "Thiết bị đầu ra không khả dụng.",
+      "path": "Thư mục lưu trữ chuyển văn bản thành giọng nói không khả dụng.",
+      "prepareFailed": "Thiết bị đã chọn không thể chuẩn bị mô hình này.",
+      "protocol": "Tiến trình chuyển văn bản thành giọng nói trả về phản hồi không hợp lệ.",
+      "registry": "Danh mục mô hình chuyển văn bản thành giọng nói không hợp lệ.",
+      "settings": "Không thể lưu cài đặt chuyển văn bản thành giọng nói.",
+      "start": "Không thể khởi động tiến trình chuyển văn bản thành giọng nói.",
+      "starting": "Tiến trình chuyển văn bản thành giọng nói đang khởi động.",
+      "tokenRejected": "Token Hugging Face bị từ chối. Hãy kiểm tra quyền truy cập điều khoản giọng Pocket.",
+      "tokenRequired": "Hãy đặt token Hugging Face và chấp nhận điều khoản giọng Pocket trước khi tải giọng nói.",
+      "unknownModel": "Không nhận ra mô hình chuyển văn bản thành giọng nói đã chọn.",
+      "window": "Không thể mở cửa sổ đọc to.",
+      "accessDenied": "Quyền truy cập các tệp mô hình bị từ chối.",
+      "localIo": "Không thể đọc hoặc ghi các tệp mô hình.",
+      "downloading": "Mô hình này đang được tải xuống."
+    },
+    "runOn": "Chạy trên",
+    "preparing": "Đang chuẩn bị cho {{device}}: {{graph}}",
+    "buffering": "Đang đệm",
+    "title": "Đọc to",
+    "textLabel": "Văn bản cần đọc",
+    "placeholder": "Dán văn bản cần đọc",
+    "play": "Phát",
+    "pause": "Tạm dừng",
+    "stop": "Dừng",
+    "close": "Đóng",
+    "progress": "Tiến độ",
+    "time": "Đã qua {{elapsed}} giây, còn {{remaining}} giây",
+    "openModels": "Mô hình chuyển văn bản thành giọng nói",
+    "outputFallback": "Đang dùng thiết bị đầu ra mặc định",
+    "states": {
+      "waiting": "Đang chờ",
+      "starting": "Đang khởi động",
+      "buffering": "Đang đệm",
+      "playing": "Đang phát",
+      "paused": "Đã tạm dừng",
+      "finished": "Đã xong",
+      "error": "Lỗi"
+    },
+    "modelsTitle": "Mô hình chuyển văn bản thành giọng nói",
+    "modelsSubtitle": "Chọn một mô hình giọng nói. Tốc độ được đo trên máy này.",
+    "downloaded": "Đã tải xuống",
+    "availableToDownload": "Có thể tải xuống",
+    "recommended": "Được đề xuất",
+    "downloading": "Đang tải xuống",
+    "needsToken": "Cần token Hugging Face",
+    "tokenSet": "Đã đặt token",
+    "active": "Đang dùng",
+    "use": "Dùng",
+    "download": "Tải xuống",
+    "delete": "Xóa",
+    "cancel": "Hủy",
+    "token": "Token Hugging Face",
+    "tokenHelp": "Chỉ cần cho các giọng Pocket bị hạn chế sau khi chấp nhận điều khoản giọng nói trên Hugging Face. Token được giữ trong bộ nhớ và bị xóa khi Handy khởi động lại.",
+    "clearToken": "Xóa token",
+    "showToken": "Hiện token",
+    "hideToken": "Ẩn token",
+    "saveToken": "Đặt token",
+    "model": "Mô hình",
+    "voice": "Giọng nói",
+    "preview": "Nghe thử giọng",
+    "speed": "Tốc độ: {{value}}x",
+    "pitch": "Cao độ: {{value}} nửa cung",
+    "output": "Thiết bị đầu ra",
+    "sameAsHandy": "Giống Handy",
+    "readCode": "Đọc khối mã",
+    "pocketAttribution": "Giọng Pocket TTS được cấp phép theo CC-BY-4.0. Hãy tuân thủ ghi công và điều khoản đồng ý của từng giọng trên thẻ mô hình.",
+    "supertonicRestrictions": "Supertonic 3 dùng OpenRAIL-M. Hãy xem các hạn chế sử dụng trên thẻ mô hình.",
+    "kokoroAttribution": "Trọng số mô hình Kokoro dùng giấy phép Apache-2.0.",
+    "status": {
+      "failed": "Thất bại",
+      "ready": "Sẵn sàng",
+      "starting": "Đang khởi động",
+      "stopping": "Đang dừng",
+      "unloaded": "Đã dỡ"
+    },
+    "previewSentence": "Đọc rõ ràng, từng cụm từ một.",
+    "description": {
+      "pocket-en": "Giọng tiếng Anh giàu biểu cảm với điểm nghe cao nhất.",
+      "supertonic-3": "Tổng hợp tiếng Anh nhanh, chạy trên CPU, GPU và NPU.",
+      "kokoro-82m-int8": "Giọng tiếng Anh gọn nhẹ từ mô hình INT8."
+    },
+    "voiceCount": "{{count}} giọng",
+    "downloadProgress": "Tiến độ tải xuống mô hình",
+    "settingsTitle": "Chuyển văn bản thành giọng nói",
+    "speedLabel": "Tốc độ",
+    "pitchLabel": "Cao độ",
+    "help": {
+      "model": "Chọn một mô hình chuyển văn bản thành giọng nói đã tải xuống.",
+      "voice": "Chọn một giọng cho mô hình này và nghe thử.",
+      "speed": "Điều chỉnh tốc độ đọc văn bản.",
+      "pitch": "Điều chỉnh cao độ giọng theo nửa cung.",
+      "output": "Chọn nơi phát âm thanh đọc to.",
+      "readCode": "Bao gồm các khối mã khi đọc."
+    }
   }
 }

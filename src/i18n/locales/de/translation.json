@@ -3,20 +3,35 @@
     "settings": "Einstellungen...",
     "checkUpdates": "Nach Updates suchen...",
     "copyLastTranscript": "Letzte Transkription kopieren",
-    "unloadModel": "Modell entladen",
+    "unloadModel": "Transkriptionsmodell entladen",
+    "cleanup": "Nachbearbeitungsmodell",
+    "cleanupReady": "bereit",
+    "cleanupNotLoaded": "nicht geladen",
+    "cleanupLoading": "wird geladen",
+    "cleanupError": "Fehler",
+    "noCleanupModel": "Kein Nachbearbeitungsmodell",
+    "unloadPostProcessingModel": "Nachbearbeitungsmodell entladen",
     "model": "Modell",
+    "transcriptionModel": "Transkriptionsmodell",
     "quit": "Beenden",
     "cancel": "Abbrechen",
     "secureInputWarning": "⚠ Tastenkürzel durch Secure Input blockiert",
     "language": "Sprache",
     "autoLanguage": "Automatisch",
-    "otherLanguages": "Weitere Sprachen"
+    "otherLanguages": "Weitere Sprachen",
+    "ttsModel": "Sprachausgabemodell",
+    "ttsUnload": "Sprachausgabemodell entladen",
+    "ttsStarting": "Wird gestartet",
+    "ttsReady": "Geladen",
+    "ttsStopping": "Wird beendet",
+    "ttsFailed": "Fehlgeschlagen",
+    "ttsUnloaded": "Entladen"
   },
   "sidebar": {
     "general": "Allgemein",
-    "models": "Modelle",
+    "models": "Transkriptionsmodelle",
     "advanced": "Erweitert",
-    "postProcessing": "Nachbearbeitung",
+    "postProcessing": "Nachbearbeitungsmodelle",
     "history": "Verlauf",
     "debug": "Debug",
     "about": "Info"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} sind bereits hinzugefügt."
   },
   "modelSelector": {
+    "status": "Modellstatus: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Benutzerdefiniert",
     "streaming": "Streaming",
     "active": "Aktiv",
@@ -336,10 +353,14 @@
         "none": "Keine Tastenkürzel konfiguriert",
         "notFound": "Tastenkürzel nicht gefunden",
         "pressKeys": "Tasten drücken...",
+        "unassigned": "Nicht zugewiesen",
         "bindings": {
           "transcribe": {
             "name": "Transkriptions-Tastenkürzel",
             "description": "Das Tastenkürzel zum Aufnehmen und Transkribieren deiner Stimme."
+          },
+          "transcribe_raw": {
+            "name": "Rohtext-Tastenkürzel"
           },
           "cancel": {
             "name": "Abbrechen-Tastenkürzel",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "Nachbearbeitungs-Tastenkürzel",
             "description": "Optional: Ein dediziertes Tastenkürzel, das immer die KI-Nachbearbeitung auf deine Transkription anwendet."
+          },
+          "read_aloud": {
+            "name": "Vorlese-Tastenkürzel",
+            "description": "Öffnet das Popup und liest kopierten Text vor."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Tastenkürzel"
+      "provider": {
+        "title": "Anbieter"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Abbrechen",
         "selectToEdit": "Wähle oben einen Prompt aus, um dessen Details anzuzeigen und zu bearbeiten.",
         "createFirst": "Klicke oben auf 'Neuen Prompt erstellen', um deinen ersten Nachbearbeitungs-Prompt zu erstellen."
+      },
+      "localLlm": {
+        "noCleanupModel": "Kein Nachbearbeitungsmodell",
+        "s1Description": "Nutzt Einstellungen für Stil, Struktur und Kontext.",
+        "plainDescription": "Nutzt deinen ausgewählten Handy-Prompt.",
+        "groupTitle": "Lokales Modell",
+        "size": "{{size}} MiB",
+        "downloaded": "Heruntergeladen",
+        "use": "Verwenden",
+        "download": "Herunterladen",
+        "downloading": "Wird heruntergeladen {{percent}}%",
+        "delete": "Löschen",
+        "status": {
+          "title": "Status",
+          "description": "Das Modell wird geladen, wenn ein Diktat mit Nachbearbeitung beginnt, und nach Ablauf der Modell-Entladezeit wieder entladen.",
+          "notLoaded": "Nicht geladen",
+          "loading": "Wird geladen",
+          "ready": "Bereit",
+          "error": "Fehler: {{reason}}"
+        },
+        "styling": {
+          "title": "Stil",
+          "description": "Wie förmlich der nachbearbeitete Text klingt.",
+          "options": {
+            "casual": "Locker",
+            "semi_casual": "Eher locker",
+            "semi_formal": "Eher förmlich",
+            "formal": "Förmlich"
+          }
+        },
+        "structure": {
+          "title": "Struktur",
+          "description": "Fließtext-Absätze oder Markdown-Listen.",
+          "options": {
+            "prose": "Fließtext",
+            "lists": "Listen"
+          }
+        },
+        "context": {
+          "title": "Kontext",
+          "description": "Allgemeiner Text oder ein E-Mail-Layout.",
+          "options": {
+            "general": "Allgemein",
+            "email": "E-Mail"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 mit einer zusätzlichen Bedingung: Das Modell muss immer \"S1-mini\" von \"Superwhisper\" heißen, genau in dieser Groß- und Kleinschreibung."
+        },
+        "promptRequired": "Wähle in der Gruppe Prompts einen nicht leeren Handy-Prompt aus. Bis dahin wird die Nachbearbeitung übersprungen und das Rohtranskript verwendet.",
+        "promptHidden": "Dieses Modell nutzt seinen eigenen festen Prompt sowie die Einstellungen für Stil, Struktur und Kontext oben, daher ist der Prompt-Editor ausgeblendet."
       }
     },
     "history": {
       "title": "Verlauf",
+      "cleaned": "Nachbearbeitet",
+      "cleanedWith": "Nachbearbeitet mit {{model}}",
+      "raw": "Roh",
+      "copyRaw": "Rohtext kopieren",
+      "copyPostProcessed": "Nachbearbeiteten Text kopieren",
+      "compare": {
+        "title": "Vergleichsansicht",
+        "diff": "Unterschiede",
+        "side_by_side": "Nebeneinander",
+        "stacked": "Untereinander"
+      },
+      "clearHistory": "Verlauf löschen",
+      "clearConfirmation": "{{count}} nicht markierte Verlaufseinträge und {{recordings}} Aufnahmen entfernen? Markierte Einträge und ihre Aufnahmen bleiben erhalten.",
       "openFolder": "Aufnahmeordner öffnen",
       "loading": "Verlauf wird geladen...",
       "empty": "Noch keine Transkriptionen. Starte eine Aufnahme, um deinen Verlauf aufzubauen!",
@@ -991,5 +1080,141 @@
     "learnMore": "So behebst du das",
     "recorderBlocked": "Tastenkürzel können gerade nicht aufgezeichnet werden — macOS Secure Input blockiert Tastenereignisse. Behebe zuerst die Secure-Input-Warnung.",
     "dismiss": "Ausblenden"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Qualität",
+      "speed": "Geschwindigkeit",
+      "recommended": "Empfohlen",
+      "tooltip": "Erstes Audio nach {{firstAudio}} s, {{faster}}x schneller als Echtzeit, Ladezeit {{load}} s"
+    },
+    "devices": {
+      "auto": "Automatisch",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Lade dieses Modell vor dem Vorlesen herunter.",
+      "audio": "Das Ausgabegerät konnte nicht geöffnet werden.",
+      "text": "Dieser Text konnte nicht aufbereitet werden.",
+      "clock": "Die Wiedergabezeitsteuerung ist fehlgeschlagen.",
+      "worker": "Der Sprachausgabe-Worker wurde beendet.",
+      "unavailable": "Die Sprachausgabe ist nicht verfügbar.",
+      "notReady": "Die Sprachausgabe startet noch.",
+      "generic": "Die Sprachausgabe ist fehlgeschlagen.",
+      "memory": "Mindestens 1 GiB verfügbarer Arbeitsspeicher ist erforderlich.",
+      "gatedToken": "Pocket-Stimmen erfordern ein Hugging Face-Token und akzeptierte Stimmbedingungen.",
+      "model": "Wähle ein verfügbares Sprachausgabemodell.",
+      "device": "Dieses Gerät ist nicht verfügbar.",
+      "npuDriverTooOld": "NPU-Treiber zu alt. Aktualisiere ihn oder wähle ein anderes Gerät.",
+      "selection": "Die Auswahl konnte nicht angewendet werden.",
+      "busy": "Ein Sprachausgabe-Vorgang läuft bereits.",
+      "cancelled": "Das Vorlesen wurde abgebrochen.",
+      "clipboard": "Der Text aus der Zwischenablage konnte nicht gelesen werden.",
+      "deviceNotSupported": "Dieses Modell unterstützt das ausgewählte Gerät nicht.",
+      "deviceUnavailable": "Das ausgewählte Gerät ist nicht verfügbar.",
+      "download": "Der Modell-Download ist fehlgeschlagen.",
+      "driverDiscovery": "Der NPU-Treiber konnte nicht erkannt werden.",
+      "failed": "Der Worker ist dreimal fehlgeschlagen. Wähle ein Modell, um es erneut zu versuchen.",
+      "integrity": "Eine Modelldatei hat die Integritätsprüfung nicht bestanden.",
+      "invalidControls": "Wähle eine Geschwindigkeit von 0.5x bis 2.0x und eine Tonhöhe von -6 bis +6 Halbtönen.",
+      "invalidRatings": "Die Modellbewertungen fehlen oder sind ungültig.",
+      "invalidVoice": "Wähle eine Stimme für das ausgewählte Modell.",
+      "outputUnavailable": "Das Ausgabegerät ist nicht verfügbar.",
+      "path": "Das Speicherverzeichnis der Sprachausgabe ist nicht verfügbar.",
+      "prepareFailed": "Das ausgewählte Gerät konnte dieses Modell nicht vorbereiten.",
+      "protocol": "Der Sprachausgabe-Worker hat eine ungültige Antwort geliefert.",
+      "registry": "Die Modellregistrierung der Sprachausgabe ist ungültig.",
+      "settings": "Die Einstellungen der Sprachausgabe konnten nicht gespeichert werden.",
+      "start": "Der Sprachausgabe-Worker konnte nicht gestartet werden.",
+      "starting": "Der Sprachausgabe-Worker startet.",
+      "tokenRejected": "Das Hugging Face-Token wurde abgelehnt. Prüfe den Zugriff auf die Pocket-Stimmbedingungen.",
+      "tokenRequired": "Lege ein Hugging Face-Token fest und akzeptiere die Pocket-Stimmbedingungen, bevor du Stimmen herunterlädst.",
+      "unknownModel": "Das ausgewählte Sprachausgabemodell ist unbekannt.",
+      "window": "Das Vorlesefenster konnte nicht geöffnet werden.",
+      "accessDenied": "Der Zugriff auf die Modelldateien wurde verweigert.",
+      "localIo": "Die Modelldateien konnten nicht gelesen oder geschrieben werden.",
+      "downloading": "Dieses Modell wird bereits heruntergeladen."
+    },
+    "runOn": "Ausführen auf",
+    "preparing": "Vorbereitung für {{device}}: {{graph}}",
+    "buffering": "Pufferung",
+    "title": "Vorlesen",
+    "textLabel": "Vorzulesender Text",
+    "placeholder": "Text zum Vorlesen einfügen",
+    "play": "Wiedergabe",
+    "pause": "Pause",
+    "stop": "Stopp",
+    "close": "Schließen",
+    "progress": "Fortschritt",
+    "time": "{{elapsed}} s vergangen, {{remaining}} s verbleibend",
+    "openModels": "Sprachausgabemodelle",
+    "outputFallback": "Standard-Ausgabegerät wird verwendet",
+    "states": {
+      "waiting": "Wartet",
+      "starting": "Startet",
+      "buffering": "Pufferung",
+      "playing": "Wiedergabe läuft",
+      "paused": "Pausiert",
+      "finished": "Beendet",
+      "error": "Fehler"
+    },
+    "modelsTitle": "Sprachausgabemodelle",
+    "modelsSubtitle": "Wähle ein Stimmmodell. Die Geschwindigkeiten werden auf diesem Rechner gemessen.",
+    "downloaded": "Heruntergeladen",
+    "availableToDownload": "Zum Herunterladen verfügbar",
+    "recommended": "Empfohlen",
+    "downloading": "Wird heruntergeladen",
+    "needsToken": "Benötigt ein Hugging Face-Token",
+    "tokenSet": "Token festgelegt",
+    "active": "Aktiv",
+    "use": "Verwenden",
+    "download": "Herunterladen",
+    "delete": "Löschen",
+    "cancel": "Abbrechen",
+    "token": "Hugging Face-Token",
+    "tokenHelp": "Nur für geschützte Pocket-Stimmen nötig, nachdem du die Stimmbedingungen auf Hugging Face akzeptiert hast. Das Token bleibt im Arbeitsspeicher und wird beim Neustart von Handy gelöscht.",
+    "clearToken": "Token löschen",
+    "showToken": "Token anzeigen",
+    "hideToken": "Token ausblenden",
+    "saveToken": "Token festlegen",
+    "model": "Modell",
+    "voice": "Stimme",
+    "preview": "Stimme anhören",
+    "speed": "Geschwindigkeit: {{value}}x",
+    "pitch": "Tonhöhe: {{value}} Halbtöne",
+    "output": "Ausgabegerät",
+    "sameAsHandy": "Wie Handy",
+    "readCode": "Codeblöcke vorlesen",
+    "pocketAttribution": "Pocket TTS-Stimmen stehen unter der Lizenz CC-BY-4.0. Beachte die Namensnennungs- und Einwilligungsbedingungen jeder Stimme auf der Modellkarte.",
+    "supertonicRestrictions": "Supertonic 3 verwendet OpenRAIL-M. Lies die Nutzungsbeschränkungen auf der Modellkarte.",
+    "kokoroAttribution": "Die Modellgewichte von Kokoro stehen unter der Apache-2.0-Lizenz.",
+    "status": {
+      "failed": "Fehlgeschlagen",
+      "ready": "Bereit",
+      "starting": "Startet",
+      "stopping": "Wird beendet",
+      "unloaded": "Entladen"
+    },
+    "previewSentence": "Deutlich gelesen, eine Wendung nach der anderen.",
+    "description": {
+      "pocket-en": "Ausdrucksstarke englische Stimmen mit der besten Hörbewertung.",
+      "supertonic-3": "Schnelle englische Sprachsynthese mit CPU-, GPU- und NPU-Ausführung.",
+      "kokoro-82m-int8": "Kompakte englische Stimmen aus einem INT8-Modell."
+    },
+    "voiceCount": "{{count}} Stimmen",
+    "downloadProgress": "Fortschritt des Modell-Downloads",
+    "settingsTitle": "Sprachausgabe",
+    "speedLabel": "Geschwindigkeit",
+    "pitchLabel": "Tonhöhe",
+    "help": {
+      "model": "Wähle ein heruntergeladenes Sprachausgabemodell.",
+      "voice": "Wähle eine Stimme für dieses Modell und höre sie an.",
+      "speed": "Stelle ein, wie schnell der Text gelesen wird.",
+      "pitch": "Stelle die Tonhöhe der Stimme in Halbtönen ein.",
+      "output": "Wähle, wo die Vorlese-Audioausgabe abgespielt wird.",
+      "readCode": "Umschlossene Codeblöcke beim Vorlesen einbeziehen."
+    }
   }
 }

@@ -3,20 +3,35 @@
     "settings": "설정...",
     "checkUpdates": "업데이트 확인...",
     "copyLastTranscript": "마지막 녹음 내용 복사",
-    "unloadModel": "모델 언로드",
+    "unloadModel": "음성 텍스트 변환 모델 언로드",
+    "cleanup": "후처리 모델",
+    "cleanupReady": "준비됨",
+    "cleanupNotLoaded": "로드되지 않음",
+    "cleanupLoading": "로딩 중",
+    "cleanupError": "오류",
+    "noCleanupModel": "후처리 모델 없음",
+    "unloadPostProcessingModel": "후처리 모델 언로드",
     "model": "모델",
+    "transcriptionModel": "음성 텍스트 변환 모델",
     "quit": "종료",
     "cancel": "취소",
     "secureInputWarning": "⚠ Secure Input으로 단축키가 차단됨",
     "language": "언어",
     "autoLanguage": "자동",
-    "otherLanguages": "기타 언어"
+    "otherLanguages": "기타 언어",
+    "ttsModel": "텍스트 음성 변환 모델",
+    "ttsUnload": "텍스트 음성 변환 모델 언로드",
+    "ttsStarting": "시작 중",
+    "ttsReady": "로드됨",
+    "ttsStopping": "중지 중",
+    "ttsFailed": "실패",
+    "ttsUnloaded": "언로드됨"
   },
   "sidebar": {
     "general": "일반",
-    "models": "모델",
+    "models": "음성 텍스트 변환 모델",
     "advanced": "고급",
-    "postProcessing": "후처리",
+    "postProcessing": "후처리 모델",
     "history": "히스토리",
     "debug": "디버그",
     "about": "정보"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}}은(는) 이미 추가되었습니다."
   },
   "modelSelector": {
+    "status": "모델 상태: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "사용자 정의",
     "streaming": "스트리밍",
     "active": "활성",
@@ -336,10 +353,14 @@
         "none": "설정된 단축키 없음",
         "notFound": "단축키를 찾을 수 없음",
         "pressKeys": "키를 눌러주세요...",
+        "unassigned": "지정되지 않음",
         "bindings": {
           "transcribe": {
             "name": "음성 텍스트 변환 단축키",
             "description": "음성을 녹음하고 테스트로 변환하는 키보드 단축키입니다."
+          },
+          "transcribe_raw": {
+            "name": "원본 단축키"
           },
           "cancel": {
             "name": "취소 단축키",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "후처리 단축키",
             "description": "선택 사항: 항상 AI 후처리를 적용하는 전용 단축키입니다."
+          },
+          "read_aloud": {
+            "name": "소리 내어 읽기 단축키",
+            "description": "팝업을 열고 복사한 텍스트를 소리 내어 읽습니다."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "단축키"
+      "provider": {
+        "title": "제공자"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "취소",
         "selectToEdit": "세부 정보를 보고 편집하려면 위에서 프롬프트를 선택하세요.",
         "createFirst": "첫 번째 후처리 프롬프트를 만들려면 위의 '새 프롬프트 만들기'를 클릭하세요."
+      },
+      "localLlm": {
+        "noCleanupModel": "후처리 모델 없음",
+        "s1Description": "스타일, 구조, 맥락 설정을 사용합니다.",
+        "plainDescription": "선택한 Handy 프롬프트를 사용합니다.",
+        "groupTitle": "로컬 모델",
+        "size": "{{size}} MiB",
+        "downloaded": "다운로드됨",
+        "use": "사용",
+        "download": "다운로드",
+        "downloading": "다운로드 중 {{percent}}%",
+        "delete": "삭제",
+        "status": {
+          "title": "상태",
+          "description": "모델은 후처리 받아쓰기가 시작될 때 로드되고, 모델 언로드 제한 시간이 지나면 언로드됩니다.",
+          "notLoaded": "로드되지 않음",
+          "loading": "로딩 중",
+          "ready": "준비됨",
+          "error": "오류: {{reason}}"
+        },
+        "styling": {
+          "title": "스타일",
+          "description": "후처리된 텍스트의 격식 정도입니다.",
+          "options": {
+            "casual": "캐주얼",
+            "semi_casual": "약간 캐주얼",
+            "semi_formal": "약간 격식체",
+            "formal": "격식체"
+          }
+        },
+        "structure": {
+          "title": "구조",
+          "description": "산문 단락 또는 Markdown 목록입니다.",
+          "options": {
+            "prose": "산문",
+            "lists": "목록"
+          }
+        },
+        "context": {
+          "title": "맥락",
+          "description": "일반 텍스트 또는 이메일 형식입니다.",
+          "options": {
+            "general": "일반",
+            "email": "이메일"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0에 조건 하나가 추가됩니다: 이 모델은 항상 \"Superwhisper\"의 \"S1-mini\"로, 대소문자를 정확히 이대로 표기해야 합니다."
+        },
+        "promptRequired": "프롬프트 그룹에서 비어 있지 않은 Handy 프롬프트를 선택하세요. 선택하기 전까지는 후처리를 건너뛰고 원본 텍스트 변환 결과를 사용합니다.",
+        "promptHidden": "이 모델은 자체 고정 프롬프트와 위의 스타일, 구조, 맥락 설정을 사용하므로 프롬프트 편집기가 숨겨집니다."
       }
     },
     "history": {
       "title": "히스토리",
+      "cleaned": "후처리됨",
+      "cleanedWith": "{{model}}(으)로 후처리됨",
+      "raw": "원본",
+      "copyRaw": "원본 텍스트 복사",
+      "copyPostProcessed": "후처리된 텍스트 복사",
+      "compare": {
+        "title": "비교 보기",
+        "diff": "차이점",
+        "side_by_side": "나란히",
+        "stacked": "세로로"
+      },
+      "clearHistory": "히스토리 지우기",
+      "clearConfirmation": "별표 없는 히스토리 항목 {{count}}개와 녹음 {{recordings}}개를 삭제할까요? 별표 표시된 항목과 해당 녹음은 유지됩니다.",
       "openFolder": "녹음 폴더 열기",
       "loading": "히스토리 로딩 중...",
       "empty": "아직 변환된 내용이 없습니다. 녹음을 시작하여 히스토리를 만드세요!",
@@ -991,5 +1080,141 @@
     "learnMore": "해결 방법",
     "recorderBlocked": "지금은 단축키를 등록할 수 없습니다. macOS Secure Input이 키 이벤트를 차단하고 있습니다. Secure Input 경고를 먼저 해결하세요.",
     "dismiss": "닫기"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "품질",
+      "speed": "속도",
+      "recommended": "추천",
+      "tooltip": "첫 오디오 {{firstAudio}}초, 실시간보다 {{faster}}배 빠름, 로딩 {{load}}초"
+    },
+    "devices": {
+      "auto": "자동",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "읽기 전에 이 모델을 다운로드하세요.",
+      "audio": "출력 장치를 열 수 없습니다.",
+      "text": "이 텍스트를 준비할 수 없습니다.",
+      "clock": "재생 타이밍 처리에 실패했습니다.",
+      "worker": "텍스트 음성 변환 작업 프로세스가 중지되었습니다.",
+      "unavailable": "텍스트 음성 변환을 사용할 수 없습니다.",
+      "notReady": "텍스트 음성 변환이 아직 시작 중입니다.",
+      "generic": "텍스트 음성 변환에 실패했습니다.",
+      "memory": "사용 가능한 메모리가 최소 1 GiB 필요합니다.",
+      "gatedToken": "Pocket 음성에는 Hugging Face 토큰과 음성 약관 동의가 필요합니다.",
+      "model": "사용 가능한 텍스트 음성 변환 모델을 선택하세요.",
+      "device": "이 장치를 사용할 수 없습니다.",
+      "npuDriverTooOld": "NPU 드라이버가 너무 오래되었습니다. 업데이트하거나 다른 장치를 선택하세요.",
+      "selection": "선택 항목을 적용할 수 없습니다.",
+      "busy": "텍스트 음성 변환 작업이 이미 실행 중입니다.",
+      "cancelled": "읽기가 취소되었습니다.",
+      "clipboard": "클립보드 텍스트를 읽을 수 없습니다.",
+      "deviceNotSupported": "이 모델은 선택한 장치를 지원하지 않습니다.",
+      "deviceUnavailable": "선택한 장치를 사용할 수 없습니다.",
+      "download": "모델 다운로드에 실패했습니다.",
+      "driverDiscovery": "NPU 드라이버를 감지할 수 없습니다.",
+      "failed": "작업 프로세스가 세 번 실패했습니다. 모델을 선택해 다시 시도하세요.",
+      "integrity": "모델 파일이 무결성 검사를 통과하지 못했습니다.",
+      "invalidControls": "속도는 0.5x에서 2.0x, 피치는 -6에서 +6 반음 사이로 선택하세요.",
+      "invalidRatings": "모델 평가가 없거나 올바르지 않습니다.",
+      "invalidVoice": "선택한 모델의 음성을 선택하세요.",
+      "outputUnavailable": "출력 장치를 사용할 수 없습니다.",
+      "path": "텍스트 음성 변환 저장 디렉터리를 사용할 수 없습니다.",
+      "prepareFailed": "선택한 장치에서 이 모델을 준비할 수 없습니다.",
+      "protocol": "텍스트 음성 변환 작업 프로세스가 잘못된 응답을 반환했습니다.",
+      "registry": "텍스트 음성 변환 모델 레지스트리가 올바르지 않습니다.",
+      "settings": "텍스트 음성 변환 설정을 저장할 수 없습니다.",
+      "start": "텍스트 음성 변환 작업 프로세스를 시작할 수 없습니다.",
+      "starting": "텍스트 음성 변환 작업 프로세스를 시작하는 중입니다.",
+      "tokenRejected": "Hugging Face 토큰이 거부되었습니다. Pocket 음성 약관에 대한 접근 권한을 확인하세요.",
+      "tokenRequired": "음성을 다운로드하기 전에 Hugging Face 토큰을 설정하고 Pocket 음성 약관에 동의하세요.",
+      "unknownModel": "선택한 텍스트 음성 변환 모델을 알 수 없습니다.",
+      "window": "소리 내어 읽기 창을 열 수 없습니다.",
+      "accessDenied": "모델 파일에 대한 접근이 거부되었습니다.",
+      "localIo": "모델 파일을 읽거나 쓸 수 없습니다.",
+      "downloading": "이 모델은 이미 다운로드 중입니다."
+    },
+    "runOn": "실행 장치",
+    "preparing": "{{device}} 준비 중: {{graph}}",
+    "buffering": "버퍼링 중",
+    "title": "소리 내어 읽기",
+    "textLabel": "읽을 텍스트",
+    "placeholder": "읽을 텍스트를 붙여넣으세요",
+    "play": "재생",
+    "pause": "일시 정지",
+    "stop": "중지",
+    "close": "닫기",
+    "progress": "진행률",
+    "time": "{{elapsed}}초 경과, {{remaining}}초 남음",
+    "openModels": "텍스트 음성 변환 모델",
+    "outputFallback": "기본 출력 장치 사용 중",
+    "states": {
+      "waiting": "대기 중",
+      "starting": "시작 중",
+      "buffering": "버퍼링 중",
+      "playing": "재생 중",
+      "paused": "일시 정지됨",
+      "finished": "완료",
+      "error": "오류"
+    },
+    "modelsTitle": "텍스트 음성 변환 모델",
+    "modelsSubtitle": "음성 모델을 선택하세요. 속도는 이 컴퓨터에서 측정한 값입니다.",
+    "downloaded": "다운로드됨",
+    "availableToDownload": "다운로드 가능",
+    "recommended": "추천",
+    "downloading": "다운로드 중",
+    "needsToken": "Hugging Face 토큰 필요",
+    "tokenSet": "토큰 설정됨",
+    "active": "사용 중",
+    "use": "사용",
+    "download": "다운로드",
+    "delete": "삭제",
+    "cancel": "취소",
+    "token": "Hugging Face 토큰",
+    "tokenHelp": "Hugging Face에서 음성 약관에 동의한 뒤 Pocket 제한 음성을 사용할 때만 필요합니다. 토큰은 메모리에만 유지되며 Handy를 다시 시작하면 삭제됩니다.",
+    "clearToken": "토큰 지우기",
+    "showToken": "토큰 표시",
+    "hideToken": "토큰 숨기기",
+    "saveToken": "토큰 설정",
+    "model": "모델",
+    "voice": "음성",
+    "preview": "음성 미리 듣기",
+    "speed": "속도: {{value}}x",
+    "pitch": "피치: {{value}} 반음",
+    "output": "출력 장치",
+    "sameAsHandy": "Handy와 동일",
+    "readCode": "코드 블록 읽기",
+    "pocketAttribution": "Pocket TTS 음성은 CC-BY-4.0 라이선스로 제공됩니다. 모델 카드에 안내된 각 음성의 출처 표시 및 동의 조건을 따르세요.",
+    "supertonicRestrictions": "Supertonic 3은 OpenRAIL-M을 사용합니다. 모델 카드에서 사용 제한을 확인하세요.",
+    "kokoroAttribution": "Kokoro 모델 가중치는 Apache-2.0 라이선스를 사용합니다.",
+    "status": {
+      "failed": "실패",
+      "ready": "준비됨",
+      "starting": "시작 중",
+      "stopping": "중지 중",
+      "unloaded": "언로드됨"
+    },
+    "previewSentence": "한 번에 한 구절씩 또렷하게 읽습니다.",
+    "description": {
+      "pocket-en": "청취 점수가 가장 높은 표현력 있는 영어 음성입니다.",
+      "supertonic-3": "CPU, GPU, NPU에서 실행되는 빠른 영어 음성 합성입니다.",
+      "kokoro-82m-int8": "INT8 모델의 컴팩트한 영어 음성입니다."
+    },
+    "voiceCount": "음성 {{count}}개",
+    "downloadProgress": "모델 다운로드 진행률",
+    "settingsTitle": "텍스트 음성 변환",
+    "speedLabel": "속도",
+    "pitchLabel": "피치",
+    "help": {
+      "model": "다운로드한 텍스트 음성 변환 모델을 선택합니다.",
+      "voice": "이 모델의 음성을 선택하고 미리 들어 보세요.",
+      "speed": "텍스트를 읽는 속도를 조정합니다.",
+      "pitch": "음성 피치를 반음 단위로 조정합니다.",
+      "output": "소리 내어 읽기 오디오를 재생할 위치를 선택합니다.",
+      "readCode": "읽을 때 코드 블록을 포함합니다."
+    }
   }
 }

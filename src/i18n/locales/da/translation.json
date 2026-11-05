@@ -3,20 +3,35 @@
     "settings": "Indstillinger...",
     "checkUpdates": "Tjek for opdateringer...",
     "copyLastTranscript": "Kopiér seneste transskription",
-    "unloadModel": "Frigør model",
+    "unloadModel": "Frigør transskriptionsmodel",
+    "cleanup": "Efterbehandlingsmodel",
+    "cleanupReady": "klar",
+    "cleanupNotLoaded": "ikke indlæst",
+    "cleanupLoading": "indlæser",
+    "cleanupError": "fejl",
+    "noCleanupModel": "Ingen efterbehandlingsmodel",
+    "unloadPostProcessingModel": "Frigør efterbehandlingsmodel",
     "model": "Model",
+    "transcriptionModel": "Transskriptionsmodel",
     "quit": "Afslut",
     "cancel": "Annuller",
     "secureInputWarning": "⚠ Genveje blokeret af Secure Input",
     "language": "Sprog",
     "autoLanguage": "Automatisk",
-    "otherLanguages": "Andre sprog"
+    "otherLanguages": "Andre sprog",
+    "ttsModel": "Tekst-til-tale-model",
+    "ttsUnload": "Frigør tekst-til-tale-model",
+    "ttsStarting": "Starter",
+    "ttsReady": "Indlæst",
+    "ttsStopping": "Stopper",
+    "ttsFailed": "Mislykkedes",
+    "ttsUnloaded": "Frigjort"
   },
   "sidebar": {
     "general": "Generelt",
-    "models": "Modeller",
+    "models": "Transskriptionsmodeller",
     "advanced": "Avanceret",
-    "postProcessing": "Efterbehandling",
+    "postProcessing": "Efterbehandlingsmodeller",
     "history": "Historik",
     "debug": "Fejlfinding",
     "about": "Om"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} er allerede tilføjet."
   },
   "modelSelector": {
+    "status": "Modelstatus: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "Brugerdefineret",
     "streaming": "Streaming",
     "active": "Aktiv",
@@ -336,10 +353,14 @@
         "none": "Ingen genveje konfigureret",
         "notFound": "Genvej ikke fundet",
         "pressKeys": "Tryk på ønskede taster...",
+        "unassigned": "Ikke tildelt",
         "bindings": {
           "transcribe": {
             "name": "Transskriptionsgenvej",
             "description": "Tastaturgenvejen til at optage og transskribere din stemme."
+          },
+          "transcribe_raw": {
+            "name": "Genvej til rå transskription"
           },
           "cancel": {
             "name": "Annulleringsgenvej",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "Genvej til efterbehandling",
             "description": "Valgfrit: En dedikeret genvej, der altid anvender AI-efterbehandling på din transskription."
+          },
+          "read_aloud": {
+            "name": "Genvej til oplæsning",
+            "description": "Åbner vinduet og læser kopieret tekst højt."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "Genvejstast"
+      "provider": {
+        "title": "Udbyder"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "Annuller",
         "selectToEdit": "Vælg en prompt ovenfor for at se og redigere dens detaljer.",
         "createFirst": "Klik på 'Opret ny prompt' ovenfor for at oprette din første efterbehandlingsprompt."
+      },
+      "localLlm": {
+        "noCleanupModel": "Ingen efterbehandlingsmodel",
+        "s1Description": "Bruger indstillinger for stil, struktur og kontekst.",
+        "plainDescription": "Bruger din valgte Handy-prompt.",
+        "groupTitle": "Lokal model",
+        "size": "{{size}} MiB",
+        "downloaded": "Downloadet",
+        "use": "Brug",
+        "download": "Download",
+        "downloading": "Downloader {{percent}}%",
+        "delete": "Slet",
+        "status": {
+          "title": "Status",
+          "description": "Modellen indlæses, når en diktering med efterbehandling starter, og frigøres efter tidsgrænsen for modelfrigørelse.",
+          "notLoaded": "Ikke indlæst",
+          "loading": "Indlæser",
+          "ready": "Klar",
+          "error": "Fejl: {{reason}}"
+        },
+        "styling": {
+          "title": "Stil",
+          "description": "Hvor formel den efterbehandlede tekst lyder.",
+          "options": {
+            "casual": "Afslappet",
+            "semi_casual": "Halvafslappet",
+            "semi_formal": "Halvformel",
+            "formal": "Formel"
+          }
+        },
+        "structure": {
+          "title": "Struktur",
+          "description": "Løbende afsnit eller Markdown-lister.",
+          "options": {
+            "prose": "Løbende tekst",
+            "lists": "Lister"
+          }
+        },
+        "context": {
+          "title": "Kontekst",
+          "description": "Almindelig tekst eller et e-mail-layout.",
+          "options": {
+            "general": "Almindelig",
+            "email": "E-mail"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 med ét ekstra vilkår: modellen skal altid kaldes \"S1-mini\" fra \"Superwhisper\", med præcis den brug af store og små bogstaver."
+        },
+        "promptRequired": "Vælg en ikke-tom Handy-prompt i gruppen Prompts. Indtil da springes efterbehandling over, og den rå transskription bruges.",
+        "promptHidden": "Denne model bruger sin egen faste prompt og indstillingerne Stil, Struktur og Kontekst ovenfor, så promptredigeringen er skjult."
       }
     },
     "history": {
       "title": "Historik",
+      "cleaned": "Efterbehandlet",
+      "cleanedWith": "Efterbehandlet med {{model}}",
+      "raw": "Rå",
+      "copyRaw": "Kopiér rå tekst",
+      "copyPostProcessed": "Kopiér efterbehandlet tekst",
+      "compare": {
+        "title": "Sammenligningsvisning",
+        "diff": "Forskelle",
+        "side_by_side": "Side om side",
+        "stacked": "Stablet"
+      },
+      "clearHistory": "Ryd historik",
+      "clearConfirmation": "Fjern {{count}} historikposter uden stjerne og {{recordings}} optagelser? Poster med stjerne og deres optagelser bevares.",
       "openFolder": "Åbn optagelsesmappe",
       "loading": "Indlæser historik...",
       "empty": "Ingen transskriptioner endnu. Start optagelse for at opbygge din historik!",
@@ -991,5 +1080,141 @@
     "learnMore": "Sådan løser du det",
     "recorderBlocked": "Genveje kan ikke optages lige nu — macOS Secure Input blokerer tastehændelser. Løs advarslen om Secure Input først.",
     "dismiss": "Afvis"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "Kvalitet",
+      "speed": "Hastighed",
+      "recommended": "Anbefalet",
+      "tooltip": "Første lyd efter {{firstAudio}} s, {{faster}}x hurtigere end realtid, indlæses på {{load}} s"
+    },
+    "devices": {
+      "auto": "Auto",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "Download denne model, før der læses op.",
+      "audio": "Udgangsenheden kunne ikke åbnes.",
+      "text": "Denne tekst kunne ikke forberedes.",
+      "clock": "Timingen af afspilningen mislykkedes.",
+      "worker": "Arbejdsprocessen til tekst-til-tale stoppede.",
+      "unavailable": "Tekst-til-tale er ikke tilgængelig.",
+      "notReady": "Tekst-til-tale starter stadig.",
+      "generic": "Tekst-til-tale mislykkedes.",
+      "memory": "Mindst 1 GiB ledig hukommelse er påkrævet.",
+      "gatedToken": "Pocket-stemmer kræver et Hugging Face-token og accepterede stemmevilkår.",
+      "model": "Vælg en tilgængelig tekst-til-tale-model.",
+      "device": "Denne enhed er ikke tilgængelig.",
+      "npuDriverTooOld": "NPU-driveren er for gammel. Opdater den, eller vælg en anden enhed.",
+      "selection": "Valget kunne ikke anvendes.",
+      "busy": "En tekst-til-tale-handling kører allerede.",
+      "cancelled": "Oplæsningen blev annulleret.",
+      "clipboard": "Teksten på udklipsholderen kunne ikke læses.",
+      "deviceNotSupported": "Denne model understøtter ikke den valgte enhed.",
+      "deviceUnavailable": "Den valgte enhed er ikke tilgængelig.",
+      "download": "Modeldownloadet mislykkedes.",
+      "driverDiscovery": "NPU-driveren kunne ikke registreres.",
+      "failed": "Arbejdsprocessen fejlede tre gange. Vælg en model for at prøve igen.",
+      "integrity": "En modelfil bestod ikke integritetskontrollen.",
+      "invalidControls": "Vælg en hastighed fra 0.5x til 2.0x og en tonehøjde fra -6 til +6 halvtoner.",
+      "invalidRatings": "Modelvurderingerne mangler eller er ugyldige.",
+      "invalidVoice": "Vælg en stemme til den valgte model.",
+      "outputUnavailable": "Udgangsenheden er ikke tilgængelig.",
+      "path": "Lagermappen til tekst-til-tale er ikke tilgængelig.",
+      "prepareFailed": "Den valgte enhed kunne ikke forberede denne model.",
+      "protocol": "Arbejdsprocessen til tekst-til-tale returnerede et ugyldigt svar.",
+      "registry": "Registret over tekst-til-tale-modeller er ugyldigt.",
+      "settings": "Indstillingerne for tekst-til-tale kunne ikke gemmes.",
+      "start": "Arbejdsprocessen til tekst-til-tale kunne ikke starte.",
+      "starting": "Arbejdsprocessen til tekst-til-tale starter.",
+      "tokenRejected": "Hugging Face-tokenet blev afvist. Kontrollér adgangen til Pocket-stemmevilkårene.",
+      "tokenRequired": "Angiv et Hugging Face-token, og accepter Pocket-stemmevilkårene, før du downloader stemmer.",
+      "unknownModel": "Den valgte tekst-til-tale-model er ukendt.",
+      "window": "Oplæsningsvinduet kunne ikke åbnes.",
+      "accessDenied": "Adgang til modelfilerne blev nægtet.",
+      "localIo": "Modelfilerne kunne ikke læses eller skrives.",
+      "downloading": "Denne model downloades allerede."
+    },
+    "runOn": "Kør på",
+    "preparing": "Forbereder til {{device}}: {{graph}}",
+    "buffering": "Buffer",
+    "title": "Oplæsning",
+    "textLabel": "Tekst, der skal læses op",
+    "placeholder": "Indsæt tekst, der skal læses op",
+    "play": "Afspil",
+    "pause": "Pause",
+    "stop": "Stop",
+    "close": "Luk",
+    "progress": "Fremdrift",
+    "time": "{{elapsed}} s gået, {{remaining}} s tilbage",
+    "openModels": "Tekst-til-tale-modeller",
+    "outputFallback": "Bruger standardudgangsenheden",
+    "states": {
+      "waiting": "Venter",
+      "starting": "Starter",
+      "buffering": "Buffer",
+      "playing": "Afspiller",
+      "paused": "På pause",
+      "finished": "Færdig",
+      "error": "Fejl"
+    },
+    "modelsTitle": "Tekst-til-tale-modeller",
+    "modelsSubtitle": "Vælg en stemmemodel. Hastigheder måles på denne maskine.",
+    "downloaded": "Downloadet",
+    "availableToDownload": "Tilgængelig til download",
+    "recommended": "Anbefalet",
+    "downloading": "Downloader",
+    "needsToken": "Kræver et Hugging Face-token",
+    "tokenSet": "Token angivet",
+    "active": "Aktiv",
+    "use": "Brug",
+    "download": "Download",
+    "delete": "Slet",
+    "cancel": "Annuller",
+    "token": "Hugging Face-token",
+    "tokenHelp": "Kun nødvendigt til låste Pocket-stemmer efter accept af stemmevilkårene på Hugging Face. Tokenet bliver i hukommelsen og ryddes, når Handy genstartes.",
+    "clearToken": "Ryd token",
+    "showToken": "Vis token",
+    "hideToken": "Skjul token",
+    "saveToken": "Angiv token",
+    "model": "Model",
+    "voice": "Stemme",
+    "preview": "Forhåndshør stemmen",
+    "speed": "Hastighed: {{value}}x",
+    "pitch": "Tonehøjde: {{value}} halvtoner",
+    "output": "Udgangsenhed",
+    "sameAsHandy": "Samme som Handy",
+    "readCode": "Læs kodeblokke op",
+    "pocketAttribution": "Pocket TTS-stemmer er licenseret under CC-BY-4.0. Følg hver stemmes vilkår for kreditering og samtykke på modelkortet.",
+    "supertonicRestrictions": "Supertonic 3 bruger OpenRAIL-M. Gennemgå dens brugsbegrænsninger på modelkortet.",
+    "kokoroAttribution": "Kokoro-modellens vægte bruger Apache-2.0-licensen.",
+    "status": {
+      "failed": "Mislykkedes",
+      "ready": "Klar",
+      "starting": "Starter",
+      "stopping": "Stopper",
+      "unloaded": "Frigjort"
+    },
+    "previewSentence": "Læser tydeligt, én frase ad gangen.",
+    "description": {
+      "pocket-en": "Udtryksfulde engelske stemmer med den højeste lyttescore.",
+      "supertonic-3": "Hurtig engelsk syntese med kørsel på CPU, GPU og NPU.",
+      "kokoro-82m-int8": "Kompakte engelske stemmer fra en INT8-model."
+    },
+    "voiceCount": "{{count}} stemmer",
+    "downloadProgress": "Fremdrift for modeldownload",
+    "settingsTitle": "Tekst-til-tale",
+    "speedLabel": "Hastighed",
+    "pitchLabel": "Tonehøjde",
+    "help": {
+      "model": "Vælg en downloadet tekst-til-tale-model.",
+      "voice": "Vælg en stemme til denne model, og forhåndshør den.",
+      "speed": "Juster, hvor hurtigt teksten læses op.",
+      "pitch": "Juster stemmens tonehøjde i halvtoner.",
+      "output": "Vælg, hvor oplæsningslyden afspilles.",
+      "readCode": "Medtag indhegnede kodeblokke ved oplæsning."
+    }
   }
 }

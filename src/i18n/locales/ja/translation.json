@@ -3,20 +3,35 @@
     "settings": "設定…",
     "checkUpdates": "アップデートを確認…",
     "copyLastTranscript": "最新の文字起こしをコピー",
-    "unloadModel": "モデルをアンロード",
+    "unloadModel": "文字起こしモデルをアンロード",
+    "cleanup": "後処理モデル",
+    "cleanupReady": "準備完了",
+    "cleanupNotLoaded": "未読み込み",
+    "cleanupLoading": "読み込み中",
+    "cleanupError": "エラー",
+    "noCleanupModel": "後処理モデルなし",
+    "unloadPostProcessingModel": "後処理モデルをアンロード",
     "model": "モデル",
+    "transcriptionModel": "文字起こしモデル",
     "quit": "終了",
     "cancel": "キャンセル",
     "secureInputWarning": "⚠ Secure Input でショートカットがブロック中",
     "language": "言語",
     "autoLanguage": "自動",
-    "otherLanguages": "その他の言語"
+    "otherLanguages": "その他の言語",
+    "ttsModel": "音声合成モデル",
+    "ttsUnload": "音声合成モデルをアンロード",
+    "ttsStarting": "起動中",
+    "ttsReady": "読み込み済み",
+    "ttsStopping": "停止中",
+    "ttsFailed": "失敗",
+    "ttsUnloaded": "アンロード済み"
   },
   "sidebar": {
     "general": "一般",
-    "models": "モデル",
+    "models": "文字起こしモデル",
     "advanced": "詳細設定",
-    "postProcessing": "後処理",
+    "postProcessing": "後処理モデル",
     "history": "履歴",
     "debug": "デバッグ",
     "about": "概要"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} はすでに追加されています。"
   },
   "modelSelector": {
+    "status": "モデルの状態: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "カスタム",
     "streaming": "ストリーミング",
     "active": "アクティブ",
@@ -336,10 +353,14 @@
         "none": "ショートカットが設定されていません",
         "notFound": "ショートカットが見つかりません",
         "pressKeys": "キーを押してください…",
+        "unassigned": "未割り当て",
         "bindings": {
           "transcribe": {
             "name": "文字起こしのショートカット",
             "description": "音声を録音して文字起こしするためのキーボードショートカット。"
+          },
+          "transcribe_raw": {
+            "name": "未加工のショートカット"
           },
           "cancel": {
             "name": "キャンセルのショートカット",
@@ -348,6 +369,10 @@
           "transcribe_with_post_process": {
             "name": "後処理のショートカット",
             "description": "文字起こしに常に AI 後処理を適用するキーボードショートカット。 (任意)"
+          },
+          "read_aloud": {
+            "name": "読み上げのショートカット",
+            "description": "ポップアップを開き、コピーしたテキストを読み上げます。"
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "ショートカット"
+      "provider": {
+        "title": "プロバイダー"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "キャンセル",
         "selectToEdit": "上からプロンプトを選択して、詳細を表示・編集します。",
         "createFirst": "上の「新しいプロンプトを作成」をクリックして、最初の後処理プロンプトを作成してください。"
+      },
+      "localLlm": {
+        "noCleanupModel": "後処理モデルなし",
+        "s1Description": "スタイル、構成、コンテキストの設定を使用します。",
+        "plainDescription": "選択した Handy のプロンプトを使用します。",
+        "groupTitle": "ローカルモデル",
+        "size": "{{size}} MiB",
+        "downloaded": "ダウンロード済み",
+        "use": "使用",
+        "download": "ダウンロード",
+        "downloading": "ダウンロード中 {{percent}}%",
+        "delete": "削除",
+        "status": {
+          "title": "状態",
+          "description": "モデルは後処理付きの音声入力が始まると読み込まれ、モデルのアンロードタイムアウト後にアンロードされます。",
+          "notLoaded": "未読み込み",
+          "loading": "読み込み中",
+          "ready": "準備完了",
+          "error": "エラー: {{reason}}"
+        },
+        "styling": {
+          "title": "スタイル",
+          "description": "後処理後のテキストの丁寧さ。",
+          "options": {
+            "casual": "カジュアル",
+            "semi_casual": "ややカジュアル",
+            "semi_formal": "ややフォーマル",
+            "formal": "フォーマル"
+          }
+        },
+        "structure": {
+          "title": "構成",
+          "description": "文章の段落または Markdown のリスト。",
+          "options": {
+            "prose": "文章",
+            "lists": "リスト"
+          }
+        },
+        "context": {
+          "title": "コンテキスト",
+          "description": "一般的なテキストまたはメール形式。",
+          "options": {
+            "general": "一般",
+            "email": "メール"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 に 1 つの条件が追加されています: このモデルは常に \"Superwhisper\" の \"S1-mini\" と、この大文字と小文字のとおりに表記する必要があります。"
+        },
+        "promptRequired": "「プロンプト」グループで空でない Handy のプロンプトを選択してください。選択するまで後処理はスキップされ、未加工の文字起こしが使われます。",
+        "promptHidden": "このモデルは独自の固定プロンプトと上記のスタイル、構成、コンテキストの設定を使用するため、プロンプトエディターは非表示です。"
       }
     },
     "history": {
       "title": "履歴",
+      "cleaned": "後処理済み",
+      "cleanedWith": "{{model}} で後処理済み",
+      "raw": "未加工",
+      "copyRaw": "未加工のテキストをコピー",
+      "copyPostProcessed": "後処理済みのテキストをコピー",
+      "compare": {
+        "title": "比較表示",
+        "diff": "差分",
+        "side_by_side": "左右に並べる",
+        "stacked": "縦に並べる"
+      },
+      "clearHistory": "履歴を消去",
+      "clearConfirmation": "スターなしの履歴 {{count}} 件と録音 {{recordings}} 件を削除しますか? スター付きの項目とその録音は保持されます。",
       "openFolder": "録音フォルダを開く",
       "loading": "履歴を読み込み中…",
       "empty": "まだ文字起こしがありません。録音を開始して履歴を作成しましょう!",
@@ -991,5 +1080,141 @@
     "learnMore": "解決方法",
     "recorderBlocked": "現在ショートカットを記録できません。macOS の Secure Input がキーイベントをブロックしています。先に Secure Input の警告を解消してください。",
     "dismiss": "閉じる"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "品質",
+      "speed": "速度",
+      "recommended": "おすすめ",
+      "tooltip": "最初の音声まで {{firstAudio}} 秒、リアルタイムの {{faster}} 倍速、読み込みに {{load}} 秒"
+    },
+    "devices": {
+      "auto": "自動",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "読み上げる前にこのモデルをダウンロードしてください。",
+      "audio": "出力デバイスを開けませんでした。",
+      "text": "このテキストを準備できませんでした。",
+      "clock": "再生タイミングの処理に失敗しました。",
+      "worker": "音声合成ワーカーが停止しました。",
+      "unavailable": "音声合成は利用できません。",
+      "notReady": "音声合成はまだ起動中です。",
+      "generic": "音声合成に失敗しました。",
+      "memory": "利用可能なメモリが 1 GiB 以上必要です。",
+      "gatedToken": "Pocket の音声には Hugging Face トークンと音声利用規約への同意が必要です。",
+      "model": "利用可能な音声合成モデルを選択してください。",
+      "device": "このデバイスは利用できません。",
+      "npuDriverTooOld": "NPU ドライバーが古すぎます。更新するか、別のデバイスを選択してください。",
+      "selection": "選択内容を適用できませんでした。",
+      "busy": "音声合成の処理がすでに実行中です。",
+      "cancelled": "読み上げをキャンセルしました。",
+      "clipboard": "クリップボードのテキストを読み取れませんでした。",
+      "deviceNotSupported": "このモデルは選択したデバイスに対応していません。",
+      "deviceUnavailable": "選択したデバイスは利用できません。",
+      "download": "モデルのダウンロードに失敗しました。",
+      "driverDiscovery": "NPU ドライバーを検出できませんでした。",
+      "failed": "ワーカーが 3 回失敗しました。モデルを選択して再試行してください。",
+      "integrity": "モデルファイルが整合性チェックに失敗しました。",
+      "invalidControls": "速度は 0.5x から 2.0x、ピッチは -6 から +6 半音の範囲で選択してください。",
+      "invalidRatings": "モデルの評価が見つからないか、無効です。",
+      "invalidVoice": "選択したモデルの音声を選択してください。",
+      "outputUnavailable": "出力デバイスは利用できません。",
+      "path": "音声合成の保存ディレクトリは利用できません。",
+      "prepareFailed": "選択したデバイスでこのモデルを準備できませんでした。",
+      "protocol": "音声合成ワーカーが無効な応答を返しました。",
+      "registry": "音声合成モデルのレジストリが無効です。",
+      "settings": "音声合成の設定を保存できませんでした。",
+      "start": "音声合成ワーカーを起動できませんでした。",
+      "starting": "音声合成ワーカーを起動しています。",
+      "tokenRejected": "Hugging Face トークンが拒否されました。Pocket の音声利用規約へのアクセス権を確認してください。",
+      "tokenRequired": "音声をダウンロードする前に、Hugging Face トークンを設定し、Pocket の音声利用規約に同意してください。",
+      "unknownModel": "選択した音声合成モデルが不明です。",
+      "window": "読み上げウィンドウを開けませんでした。",
+      "accessDenied": "モデルファイルへのアクセスが拒否されました。",
+      "localIo": "モデルファイルを読み書きできませんでした。",
+      "downloading": "このモデルはすでにダウンロード中です。"
+    },
+    "runOn": "実行デバイス",
+    "preparing": "{{device}} 用に準備中: {{graph}}",
+    "buffering": "バッファリング中",
+    "title": "読み上げ",
+    "textLabel": "読み上げるテキスト",
+    "placeholder": "読み上げるテキストを貼り付け",
+    "play": "再生",
+    "pause": "一時停止",
+    "stop": "停止",
+    "close": "閉じる",
+    "progress": "進行状況",
+    "time": "経過 {{elapsed}} 秒、残り {{remaining}} 秒",
+    "openModels": "音声合成モデル",
+    "outputFallback": "既定の出力デバイスを使用中",
+    "states": {
+      "waiting": "待機中",
+      "starting": "起動中",
+      "buffering": "バッファリング中",
+      "playing": "再生中",
+      "paused": "一時停止中",
+      "finished": "完了",
+      "error": "エラー"
+    },
+    "modelsTitle": "音声合成モデル",
+    "modelsSubtitle": "音声モデルを選択します。速度はこのマシンで計測されたものです。",
+    "downloaded": "ダウンロード済み",
+    "availableToDownload": "ダウンロード可能",
+    "recommended": "おすすめ",
+    "downloading": "ダウンロード中",
+    "needsToken": "Hugging Face トークンが必要",
+    "tokenSet": "トークン設定済み",
+    "active": "使用中",
+    "use": "使用",
+    "download": "ダウンロード",
+    "delete": "削除",
+    "cancel": "キャンセル",
+    "token": "Hugging Face トークン",
+    "tokenHelp": "Hugging Face で音声利用規約に同意したうえで Pocket の制限付き音声を使う場合にのみ必要です。トークンはメモリ内にのみ保持され、Handy の再起動時に消去されます。",
+    "clearToken": "トークンを消去",
+    "showToken": "トークンを表示",
+    "hideToken": "トークンを非表示",
+    "saveToken": "トークンを設定",
+    "model": "モデル",
+    "voice": "音声",
+    "preview": "音声を試聴",
+    "speed": "速度: {{value}}x",
+    "pitch": "ピッチ: {{value}} 半音",
+    "output": "出力デバイス",
+    "sameAsHandy": "Handy と同じ",
+    "readCode": "コードブロックを読み上げ",
+    "pocketAttribution": "Pocket TTS の音声は CC-BY-4.0 でライセンスされています。モデルカードに記載された各音声のクレジット表記と同意条件に従ってください。",
+    "supertonicRestrictions": "Supertonic 3 は OpenRAIL-M を使用しています。モデルカードで使用制限を確認してください。",
+    "kokoroAttribution": "Kokoro のモデルウェイトは Apache-2.0 ライセンスです。",
+    "status": {
+      "failed": "失敗",
+      "ready": "準備完了",
+      "starting": "起動中",
+      "stopping": "停止中",
+      "unloaded": "アンロード済み"
+    },
+    "previewSentence": "ひとつずつ、はっきりと読み上げます。",
+    "description": {
+      "pocket-en": "最も高い聴感評価を得た、表現豊かな英語の音声。",
+      "supertonic-3": "CPU、GPU、NPU で実行できる高速な英語音声合成。",
+      "kokoro-82m-int8": "INT8 モデルによるコンパクトな英語の音声。"
+    },
+    "voiceCount": "{{count}} 件の音声",
+    "downloadProgress": "モデルのダウンロード進行状況",
+    "settingsTitle": "音声合成",
+    "speedLabel": "速度",
+    "pitchLabel": "ピッチ",
+    "help": {
+      "model": "ダウンロード済みの音声合成モデルを選択します。",
+      "voice": "このモデルの音声を選択して試聴します。",
+      "speed": "テキストを読み上げる速さを調整します。",
+      "pitch": "音声のピッチを半音単位で調整します。",
+      "output": "読み上げ音声の再生先を選択します。",
+      "readCode": "読み上げ時にコードブロックを含めます。"
+    }
   }
 }

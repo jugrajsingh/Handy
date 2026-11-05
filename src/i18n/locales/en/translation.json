@@ -656,9 +656,6 @@
       "provider": {
         "title": "Provider"
       },
-      "hotkey": {
-        "title": "Hotkey"
-      },
       "api": {
         "title": "API",
         "provider": {
@@ -725,11 +722,6 @@
         "size": "{{size}} MiB",
         "downloaded": "Downloaded",
         "use": "Use",
-        "model": {
-          "title": "Local model",
-          "description": "Runs on this computer's CPU through a bundled llama.cpp server. Transcripts never leave the machine.",
-          "placeholder": "Select a model"
-        },
         "download": "Download",
         "downloading": "Downloading {{percent}}%",
         "delete": "Delete",

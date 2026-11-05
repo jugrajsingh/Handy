@@ -3,20 +3,35 @@
     "settings": "הגדרות...",
     "checkUpdates": "בדוק עדכונים...",
     "copyLastTranscript": "העתק את התמלול האחרון",
-    "unloadModel": "פרוק מודל",
+    "unloadModel": "פרוק את מודל התמלול",
+    "cleanup": "מודל עיבוד משלים",
+    "cleanupReady": "מוכן",
+    "cleanupNotLoaded": "לא נטען",
+    "cleanupLoading": "טוען",
+    "cleanupError": "שגיאה",
+    "noCleanupModel": "אין מודל עיבוד משלים",
+    "unloadPostProcessingModel": "פרוק את מודל העיבוד המשלים",
     "model": "מודל",
+    "transcriptionModel": "מודל תמלול",
     "quit": "יציאה",
     "cancel": "ביטול",
     "secureInputWarning": "⚠ קיצורי המקשים חסומים על ידי Secure Input",
     "language": "שפה",
     "autoLanguage": "אוטומטי",
-    "otherLanguages": "שפות אחרות"
+    "otherLanguages": "שפות אחרות",
+    "ttsModel": "מודל הקראה",
+    "ttsUnload": "פרוק את מודל ההקראה",
+    "ttsStarting": "מתחיל",
+    "ttsReady": "נטען",
+    "ttsStopping": "נעצר",
+    "ttsFailed": "נכשל",
+    "ttsUnloaded": "לא נטען"
   },
   "sidebar": {
     "general": "כללי",
-    "models": "מודלים",
+    "models": "מודלי תמלול",
     "advanced": "מתקדם",
-    "postProcessing": "עיבוד משלים",
+    "postProcessing": "מודלי עיבוד משלים",
     "history": "היסטוריה",
     "debug": "ניפוי שגיאות",
     "about": "אודות"
@@ -306,6 +321,8 @@
     "alreadyAdded_other": "{{languages}} כבר נוספו."
   },
   "modelSelector": {
+    "status": "מצב המודל: {{modelName}}",
+    "size": "{{size}} MiB",
     "custom": "מותאם אישית",
     "streaming": "סטרימינג",
     "active": "פעיל",
@@ -336,18 +353,26 @@
         "none": "לא הוגדרו קיצורי מקשים",
         "notFound": "קיצור הדרך לא נמצא",
         "pressKeys": "לחץ על המקשים...",
+        "unassigned": "לא הוקצה",
         "bindings": {
           "transcribe": {
             "name": "קיצור מקשים לתמלול",
             "description": "קיצור המקלדת להקלטה ולתמלול הקול שלך."
+          },
+          "transcribe_raw": {
+            "name": "קיצור מקשים לטקסט גולמי"
           },
           "cancel": {
             "name": "קיצור מקשים לביטול",
             "description": "קיצור המקלדת לביטול ההקלטה הנוכחית."
           },
           "transcribe_with_post_process": {
-            "name": "קיצור לעיבוד משלים",
+            "name": "קיצור מקשים לעיבוד משלים",
             "description": "אופציונלי: קיצור מקשים ייעודי שתמיד מפעיל עיבוד AI על התמלול."
+          },
+          "read_aloud": {
+            "name": "קיצור מקשים להקראה",
+            "description": "פתח את החלון והקרא בקול את הטקסט שהועתק."
           }
         },
         "errors": {
@@ -628,8 +653,8 @@
       }
     },
     "postProcessing": {
-      "hotkey": {
-        "title": "קיצור מקשים"
+      "provider": {
+        "title": "ספק"
       },
       "api": {
         "title": "API",
@@ -688,10 +713,74 @@
         "cancel": "ביטול",
         "selectToEdit": "בחר פרומפט למעלה כדי לצפות בפרטים שלו ולערוך אותם.",
         "createFirst": "לחץ על 'צור פרומפט חדש' למעלה כדי ליצור את פרומפט העיבוד הראשון שלך."
+      },
+      "localLlm": {
+        "noCleanupModel": "אין מודל עיבוד משלים",
+        "s1Description": "משתמש בהגדרות סגנון, מבנה והקשר.",
+        "plainDescription": "משתמש בפרומפט Handy שבחרת.",
+        "groupTitle": "מודל מקומי",
+        "size": "{{size}} MiB",
+        "downloaded": "הורד",
+        "use": "השתמש",
+        "download": "הורד",
+        "downloading": "מוריד {{percent}}%",
+        "delete": "מחק",
+        "status": {
+          "title": "מצב",
+          "description": "המודל נטען כשמתחילה הכתבה עם עיבוד משלים, ונפרק לאחר זמן הקצאת פריקת המודל.",
+          "notLoaded": "לא נטען",
+          "loading": "טוען",
+          "ready": "מוכן",
+          "error": "שגיאה: {{reason}}"
+        },
+        "styling": {
+          "title": "סגנון",
+          "description": "עד כמה הטקסט המעובד נקרא רשמי.",
+          "options": {
+            "casual": "יומיומי",
+            "semi_casual": "חצי יומיומי",
+            "semi_formal": "חצי רשמי",
+            "formal": "רשמי"
+          }
+        },
+        "structure": {
+          "title": "מבנה",
+          "description": "פסקאות טקסט רציף או רשימות Markdown.",
+          "options": {
+            "prose": "טקסט רציף",
+            "lists": "רשימות"
+          }
+        },
+        "context": {
+          "title": "הקשר",
+          "description": "טקסט כללי או פריסת אימייל.",
+          "options": {
+            "general": "כללי",
+            "email": "אימייל"
+          }
+        },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 עם תנאי נוסף אחד: יש לקרוא למודל תמיד \"S1-mini\" מאת \"Superwhisper\", בדיוק באותיות גדולות וקטנות אלה."
+        },
+        "promptRequired": "בחר פרומפט Handy שאינו ריק בקבוצת הפרומפטים. עד אז, העיבוד המשלים מדולג ומשתמשים בתמלול הגולמי.",
+        "promptHidden": "מודל זה משתמש בפרומפט קבוע משלו ובהגדרות סגנון, מבנה והקשר שלמעלה, ולכן עורך הפרומפט מוסתר."
       }
     },
     "history": {
       "title": "היסטוריה",
+      "cleaned": "לאחר עיבוד משלים",
+      "cleanedWith": "עובד משלים באמצעות {{model}}",
+      "raw": "גולמי",
+      "copyRaw": "העתק טקסט גולמי",
+      "copyPostProcessed": "העתק טקסט מעובד",
+      "compare": {
+        "title": "תצוגת השוואה",
+        "diff": "הבדלים",
+        "side_by_side": "זה לצד זה",
+        "stacked": "זה מעל זה"
+      },
+      "clearHistory": "נקה היסטוריה",
+      "clearConfirmation": "להסיר {{count}} רשומות היסטוריה ללא כוכב ו-{{recordings}} הקלטות? רשומות מסומנות בכוכב וההקלטות שלהן יישמרו.",
       "openFolder": "פתח את תיקיית ההקלטות",
       "loading": "טוען היסטוריה...",
       "empty": "עדיין אין תמלולים. התחל להקליט כדי לבנות את ההיסטוריה שלך!",
@@ -991,5 +1080,141 @@
     "learnMore": "איך לתקן את זה",
     "recorderBlocked": "לא ניתן להקליט קיצורים כרגע — Secure Input של macOS חוסם אירועי מקשים. פתור תחילה את אזהרת Secure Input.",
     "dismiss": "התעלם"
+  },
+  "tts": {
+    "ratings": {
+      "quality": "איכות",
+      "speed": "מהירות",
+      "recommended": "מומלץ",
+      "tooltip": "שמע ראשון תוך {{firstAudio}} שנ', מהיר פי {{faster}} מזמן אמת, נטען תוך {{load}} שנ'"
+    },
+    "devices": {
+      "auto": "אוטומטי",
+      "cpu": "CPU",
+      "gpu": "GPU",
+      "npu": "NPU"
+    },
+    "errors": {
+      "notDownloaded": "הורד מודל זה לפני ההקראה.",
+      "audio": "לא ניתן לפתוח את התקן הפלט.",
+      "text": "לא ניתן להכין את הטקסט הזה.",
+      "clock": "תזמון ההשמעה נכשל.",
+      "worker": "תהליך ההקראה נעצר.",
+      "unavailable": "ההקראה אינה זמינה.",
+      "notReady": "ההקראה עדיין מתחילה.",
+      "generic": "ההקראה נכשלה.",
+      "memory": "נדרש לפחות 1 GiB של זיכרון פנוי.",
+      "gatedToken": "קולות Pocket דורשים אסימון Hugging Face ואישור תנאי הקולות.",
+      "model": "בחר מודל הקראה זמין.",
+      "device": "התקן זה אינו זמין.",
+      "npuDriverTooOld": "מנהל ההתקן של NPU ישן מדי. עדכן אותו או בחר התקן אחר.",
+      "selection": "לא ניתן להחיל את הבחירה.",
+      "busy": "פעולת הקראה כבר רצה.",
+      "cancelled": "ההקראה בוטלה.",
+      "clipboard": "לא ניתן לקרוא את הטקסט מהלוח.",
+      "deviceNotSupported": "מודל זה אינו תומך בהתקן שנבחר.",
+      "deviceUnavailable": "ההתקן שנבחר אינו זמין.",
+      "download": "הורדת המודל נכשלה.",
+      "driverDiscovery": "לא ניתן לזהות את מנהל ההתקן של NPU.",
+      "failed": "התהליך נכשל שלוש פעמים. בחר מודל כדי לנסות שוב.",
+      "integrity": "קובץ מודל נכשל בבדיקת השלמות.",
+      "invalidControls": "בחר מהירות בין 0.5x ל-2.0x וגובה צליל בין -6 ל-+6 חצאי טונים.",
+      "invalidRatings": "דירוגי המודל חסרים או לא תקינים.",
+      "invalidVoice": "בחר קול למודל שנבחר.",
+      "outputUnavailable": "התקן הפלט אינו זמין.",
+      "path": "ספריית האחסון של ההקראה אינה זמינה.",
+      "prepareFailed": "ההתקן שנבחר לא הצליח להכין את המודל הזה.",
+      "protocol": "תהליך ההקראה החזיר תגובה לא תקינה.",
+      "registry": "רישום מודלי ההקראה אינו תקין.",
+      "settings": "לא ניתן לשמור את הגדרות ההקראה.",
+      "start": "לא ניתן להפעיל את תהליך ההקראה.",
+      "starting": "תהליך ההקראה מתחיל.",
+      "tokenRejected": "אסימון Hugging Face נדחה. בדוק את הגישה לתנאי הקולות של Pocket.",
+      "tokenRequired": "הגדר אסימון Hugging Face ואשר את תנאי הקולות של Pocket לפני הורדת קולות.",
+      "unknownModel": "מודל ההקראה שנבחר אינו מוכר.",
+      "window": "לא ניתן לפתוח את חלון ההקראה.",
+      "accessDenied": "הגישה לקובצי המודל נדחתה.",
+      "localIo": "לא ניתן לקרוא או לכתוב את קובצי המודל.",
+      "downloading": "מודל זה כבר בהורדה."
+    },
+    "runOn": "הפעל על",
+    "preparing": "מתכונן עבור {{device}}: {{graph}}",
+    "buffering": "מבצע אחסון זמני",
+    "title": "הקראה",
+    "textLabel": "טקסט להקראה",
+    "placeholder": "הדבק טקסט להקראה",
+    "play": "נגן",
+    "pause": "השהה",
+    "stop": "עצור",
+    "close": "סגור",
+    "progress": "התקדמות",
+    "time": "חלפו {{elapsed}} שנ', נותרו {{remaining}} שנ'",
+    "openModels": "מודלי הקראה",
+    "outputFallback": "משתמש בהתקן הפלט המוגדר כברירת מחדל",
+    "states": {
+      "waiting": "ממתין",
+      "starting": "מתחיל",
+      "buffering": "מבצע אחסון זמני",
+      "playing": "מנגן",
+      "paused": "מושהה",
+      "finished": "הסתיים",
+      "error": "שגיאה"
+    },
+    "modelsTitle": "מודלי הקראה",
+    "modelsSubtitle": "בחר מודל קול. המהירויות נמדדות על מחשב זה.",
+    "downloaded": "הורד",
+    "availableToDownload": "זמין להורדה",
+    "recommended": "מומלץ",
+    "downloading": "מוריד",
+    "needsToken": "נדרש אסימון Hugging Face",
+    "tokenSet": "האסימון הוגדר",
+    "active": "פעיל",
+    "use": "השתמש",
+    "download": "הורד",
+    "delete": "מחק",
+    "cancel": "ביטול",
+    "token": "אסימון Hugging Face",
+    "tokenHelp": "נדרש רק לקולות Pocket הנעולים, לאחר אישור תנאי הקולות ב-Hugging Face. האסימון נשמר בזיכרון ונמחק כש-Handy מופעל מחדש.",
+    "clearToken": "נקה אסימון",
+    "showToken": "הצג אסימון",
+    "hideToken": "הסתר אסימון",
+    "saveToken": "הגדר אסימון",
+    "model": "מודל",
+    "voice": "קול",
+    "preview": "השמע דוגמה של הקול",
+    "speed": "מהירות: {{value}}x",
+    "pitch": "גובה צליל: {{value}} חצאי טונים",
+    "output": "התקן פלט",
+    "sameAsHandy": "זהה ל-Handy",
+    "readCode": "הקרא בלוקי קוד",
+    "pocketAttribution": "קולות Pocket TTS מורשים תחת CC-BY-4.0. עקוב אחר תנאי הייחוס וההסכמה של כל קול בכרטיס המודל.",
+    "supertonicRestrictions": "Supertonic 3 משתמש ב-OpenRAIL-M. עיין במגבלות השימוש בכרטיס המודל.",
+    "kokoroAttribution": "משקלי המודל Kokoro מורשים תחת Apache-2.0.",
+    "status": {
+      "failed": "נכשל",
+      "ready": "מוכן",
+      "starting": "מתחיל",
+      "stopping": "נעצר",
+      "unloaded": "לא נטען"
+    },
+    "previewSentence": "קריאה ברורה, ביטוי אחר ביטוי.",
+    "description": {
+      "pocket-en": "קולות אנגליים עשירי הבעה עם ציון ההאזנה הגבוה ביותר.",
+      "supertonic-3": "סינתזה מהירה של אנגלית עם הרצה על CPU, GPU ו-NPU.",
+      "kokoro-82m-int8": "קולות אנגליים קומפקטיים ממודל INT8."
+    },
+    "voiceCount": "קולות: {{count}}",
+    "downloadProgress": "התקדמות הורדת המודל",
+    "settingsTitle": "הקראה",
+    "speedLabel": "מהירות",
+    "pitchLabel": "גובה צליל",
+    "help": {
+      "model": "בחר מודל הקראה שהורד.",
+      "voice": "בחר קול למודל זה והשמע דוגמה.",
+      "speed": "התאם את מהירות הקראת הטקסט.",
+      "pitch": "התאם את גובה הצליל בחצאי טונים.",
+      "output": "בחר היכן ישמע שמע ההקראה.",
+      "readCode": "כלול בלוקי קוד מגודרים בעת ההקראה."
+    }
   }
 }
