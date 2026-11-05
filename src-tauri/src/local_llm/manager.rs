@@ -1,8 +1,8 @@
 //! Lifecycle of the local model: warm-up, serial requests, idle unload,
 //! crash restart and the failed-start policy (three failed starts in a row enter `Failed`;
 //! a third failure that is a start timeout earns one retry per cooldown, any other third
-//! failure lasts till `reset_failure` or `unload`, the actions behind selecting a model,
-//! deleting one and the tray's unload). Verification runs outside the backend mutex.
+//! failure lasts till `reset_failure` or `unload`, the actions behind selecting a model and
+//! deleting one). Verification runs outside the backend mutex.
 
 use super::backend::{BackendOpts, GenerateRequest, KillSwitch, TextModelBackend};
 use super::registry::{self, ModelEntry, PromptStyle};
