@@ -590,7 +590,8 @@ impl TextModelBackend for LlamaServerBackend {
         let binary = resolve_binary(self.binary_env.clone(), &self.installed)?;
         let deadline = Instant::now() + opts.start_timeout;
         let mut last = LocalLlmError::StartTimeout;
-        for attempt in 1..=SPAWN_ATTEMPTS {
+        let attempts = if opts.single_spawn { 1 } else { SPAWN_ATTEMPTS };
+        for attempt in 1..=attempts {
             match self.start_once(&binary, opts, deadline) {
                 StartOutcome::Ready(running) => {
                     info!(
@@ -601,7 +602,7 @@ impl TextModelBackend for LlamaServerBackend {
                     return Ok(());
                 }
                 StartOutcome::ExitedEarly(msg) => {
-                    warn!("local-llm: {msg} (attempt {attempt}/{SPAWN_ATTEMPTS})");
+                    warn!("local-llm: {msg} (attempt {attempt}/{attempts})");
                     last = LocalLlmError::StartFailed(msg);
                     if Instant::now() >= deadline {
                         break;
@@ -721,6 +722,7 @@ pub(crate) mod tests {
             ctx: 4096,
             start_timeout,
             cancel: Arc::new(AtomicBool::new(false)),
+            single_spawn: false,
         }
     }
 
@@ -1420,6 +1422,27 @@ PY"#,
             "a crash seen in any attempt must decide the outcome"
         );
         assert!(!backend.is_alive());
+    }
+
+    #[test]
+    fn single_spawn_does_not_restart_after_an_early_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("spawns");
+        let bin = fake_binary(
+            dir.path(),
+            &format!("echo x >> '{}'\nexit 1", counter.display()),
+        );
+        let mut backend = LlamaServerBackend::with_binary(bin);
+        let entry = registry::find("s1-mini-q4km").unwrap();
+        let mut single = opts(dir.path().join("m.gguf"), Duration::from_secs(5));
+        single.single_spawn = true;
+        let r = backend.ensure_loaded(entry, &single);
+        assert!(matches!(r, Err(LocalLlmError::StartFailed(_))), "{r:?}");
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            1,
+            "single_spawn must stop after the first child"
+        );
     }
 
     #[test]

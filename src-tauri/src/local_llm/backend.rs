@@ -18,6 +18,8 @@ pub struct BackendOpts {
     pub start_timeout: Duration,
     /// Set on app exit; a start in progress must abort promptly.
     pub cancel: Arc<AtomicBool>,
+    /// A start-timeout retry: an early exit is final, with no second spawn.
+    pub single_spawn: bool,
 }
 
 /// One chat completion.

@@ -91,6 +91,8 @@ struct Inner {
     last_start_failure: Option<(Instant, LocalLlmError)>,
     /// When a `Failed` state caused by a start timeout may start once more.
     retry_at: Option<Instant>,
+    /// The cooldown has elapsed and its one start has not run yet.
+    retry_probe: bool,
 }
 
 type VerificationResult = Result<bool, LocalLlmError>;
@@ -348,6 +350,7 @@ impl LocalLlmManager {
                 failed_starts: 0,
                 last_start_failure: None,
                 retry_at: None,
+                retry_probe: false,
             }),
             status: Mutex::new(LocalLlmStatus {
                 state: LocalLlmStateKind::Unloaded,
@@ -550,6 +553,7 @@ impl LocalLlmManager {
             inner.failed_starts = 0;
             inner.last_start_failure = None;
             inner.retry_at = None;
+            inner.retry_probe = false;
             if matches!(inner.state, LocalLlmState::Failed { .. }) {
                 self.set_state(&mut inner, LocalLlmState::Unloaded, None);
             }
@@ -704,6 +708,7 @@ impl LocalLlmManager {
                 return Err(LocalLlmError::Failed(reason.clone()));
             }
             inner.retry_at = None;
+            inner.retry_probe = true;
             inner.failed_starts = MAX_FAILED_STARTS - 1;
             self.set_state(inner, LocalLlmState::Unloaded, None);
         }
@@ -757,6 +762,7 @@ impl LocalLlmManager {
             ctx: entry.default_ctx,
             start_timeout,
             cancel: Arc::clone(&self.cancel),
+            single_spawn: std::mem::take(&mut inner.retry_probe),
         };
         let result = inner.backend.ensure_loaded(entry, &opts);
         let result = if self.cancel.load(Ordering::SeqCst) {
@@ -899,6 +905,7 @@ pub(crate) mod tests {
         pub start_delay: Duration,
         pub block_until_cancel: bool,
         pub alive: bool,
+        pub single_spawns: Vec<bool>,
     }
 
     /// Echoes the transcript (the user message after the control line) unless a reply is queued.
@@ -925,6 +932,7 @@ pub(crate) mod tests {
             let (delay, block) = {
                 let mut s = lock(&self.0);
                 s.loads += 1;
+                s.single_spawns.push(opts.single_spawn);
                 (s.start_delay, s.block_until_cancel)
             };
             if block {
@@ -1672,6 +1680,68 @@ pub(crate) mod tests {
         assert!(retry_at(&h).is_none(), "a good start clears the timer");
     }
 
+    #[test]
+    fn retry_marks_only_the_probe_as_a_single_spawn() {
+        let h = harness();
+        fail_starts(&h, &three_timeouts());
+        assert_eq!(
+            lock(&h.fake).single_spawns,
+            [false; 3],
+            "ordinary starts may spawn twice"
+        );
+        expire_cooldown(&h);
+        assert_eq!(h.manager.ensure_started(&h.settings), Ok(()));
+        assert_eq!(
+            lock(&h.fake).single_spawns.last(),
+            Some(&true),
+            "the probe must be limited to one spawn"
+        );
+        h.manager.unload();
+        assert_eq!(h.manager.ensure_started(&h.settings), Ok(()));
+        assert_eq!(
+            lock(&h.fake).single_spawns.last(),
+            Some(&false),
+            "the start after a probe may spawn twice"
+        );
+    }
+
+    #[test]
+    fn retry_probe_limit_outlives_a_failed_check_until_reset() {
+        let mut h = harness();
+        let failing = Arc::new(AtomicBool::new(false));
+        let fail_now = failing.clone();
+        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(move |_, _, _| {
+            if fail_now.load(Ordering::SeqCst) {
+                Err(LocalLlmError::ModelRead("fixture".into()))
+            } else {
+                Ok(true)
+            }
+        });
+        let probe_is_checked_then_started = |h: &Harness, expected: bool, message: &str| {
+            fail_starts(h, &three_timeouts());
+            expire_cooldown(h);
+            failing.store(true, Ordering::SeqCst);
+            invalidate_verification_identity(h);
+            assert!(matches!(
+                h.manager.ensure_started(&h.settings),
+                Err(LocalLlmError::ModelRead(_))
+            ));
+            failing.store(false, Ordering::SeqCst);
+            if !expected {
+                h.manager.reset_failure();
+            }
+            assert_eq!(h.manager.ensure_started(&h.settings), Ok(()));
+            assert_eq!(
+                lock(&h.fake).single_spawns.last(),
+                Some(&expected),
+                "{message}"
+            );
+            h.manager.unload();
+        };
+        probe_is_checked_then_started(&h, true, "a failed check must not spend the probe limit");
+        probe_is_checked_then_started(&h, false, "reset must clear the probe limit");
+    }
+
     /// Manager over the real backend; its fake binary appends a line per spawn to the returned file.
     #[cfg(unix)]
     fn real_backend_harness(script: &str, start_timeout: Duration) -> (Harness, PathBuf) {
@@ -1734,6 +1804,63 @@ pub(crate) mod tests {
             Err(LocalLlmError::Failed(_))
         ));
         assert_eq!(spawn_count(&spawns), 6, "a sticky failure must not spawn");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_probe_that_crashes_spawns_one_child() {
+        let (h, spawns) = real_backend_harness(
+            "if [ \"$run\" -gt 3 ]; then exit 1; fi\nexec sleep 30",
+            Duration::from_secs(2),
+        );
+        for _ in 0..MAX_FAILED_STARTS {
+            assert_eq!(
+                h.manager.ensure_started(&h.settings),
+                Err(LocalLlmError::StartTimeout)
+            );
+        }
+        assert_eq!(spawn_count(&spawns), 3);
+        expire_cooldown(&h);
+        let probe = h.manager.ensure_started(&h.settings);
+        assert!(
+            matches!(probe, Err(LocalLlmError::StartFailed(_))),
+            "a probe crash must report the crash"
+        );
+        assert_eq!(
+            spawn_count(&spawns),
+            4,
+            "a retry must spawn at most one child"
+        );
+        assert_eq!(state(&h), LocalLlmStateKind::Failed);
+        assert!(retry_at(&h).is_none(), "a probe crash must not re-arm");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_probe_that_hangs_spawns_one_child() {
+        let (h, spawns) = real_backend_harness("exec sleep 30", Duration::from_millis(300));
+        for _ in 0..MAX_FAILED_STARTS {
+            assert_eq!(
+                h.manager.ensure_started(&h.settings),
+                Err(LocalLlmError::StartTimeout)
+            );
+        }
+        assert_eq!(
+            spawn_count(&spawns),
+            3,
+            "a timed-out start must not spawn again"
+        );
+        expire_cooldown(&h);
+        assert_eq!(
+            h.manager.ensure_started(&h.settings),
+            Err(LocalLlmError::StartTimeout)
+        );
+        assert_eq!(
+            spawn_count(&spawns),
+            4,
+            "a retry must spawn at most one child"
+        );
+        assert!(retry_at(&h).is_some(), "a probe timeout must re-arm");
     }
 
     #[test]

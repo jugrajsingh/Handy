@@ -304,6 +304,7 @@ mod tests {
                         ctx: 4096,
                         start_timeout: std::time::Duration::from_secs(2),
                         cancel: Arc::default(),
+                        single_spawn: false,
                     },
                 )
                 .unwrap_err()
