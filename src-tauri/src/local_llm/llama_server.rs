@@ -607,6 +607,8 @@ impl TextModelBackend for LlamaServerBackend {
                         break;
                     }
                 }
+                // `last` is still `StartTimeout` unless an earlier attempt crashed, and a crash decides.
+                StartOutcome::Error(LocalLlmError::StartTimeout) => return Err(last),
                 StartOutcome::Error(e) => return Err(e),
             }
         }
@@ -659,7 +661,7 @@ impl Drop for LlamaServerBackend {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::local_llm::prompt::ChatMessage;
     use crate::local_llm::registry;
@@ -722,7 +724,7 @@ mod tests {
         }
     }
 
-    fn fake_binary(dir: &Path, script: &str) -> PathBuf {
+    pub(crate) fn fake_binary(dir: &Path, script: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("fake-llama-server");
         std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
@@ -1386,6 +1388,38 @@ PY"#,
             0,
             "failed starts must remove socket directories"
         );
+    }
+
+    #[test]
+    fn crash_then_hang_reports_the_crash_not_a_timeout() {
+        let dir = tempfile::tempdir().unwrap();
+        let counter = dir.path().join("spawns");
+        let bin = fake_binary(
+            dir.path(),
+            &format!(
+                "echo x >> '{log}'\nif [ \"$(wc -l < '{log}')\" -eq 1 ]; then exit 1; fi\nexec sleep 30",
+                log = counter.display()
+            ),
+        );
+        let mut backend = LlamaServerBackend::with_binary(bin);
+        let entry = registry::find("s1-mini-q4km").unwrap();
+        let budget = Duration::from_secs(2);
+        let t0 = Instant::now();
+        let r = backend.ensure_loaded(entry, &opts(dir.path().join("m.gguf"), budget));
+        assert!(
+            t0.elapsed() >= budget,
+            "the second run must hang to the deadline"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&counter).unwrap().lines().count(),
+            2,
+            "the crash must be followed by a second run"
+        );
+        assert!(
+            matches!(&r, Err(LocalLlmError::StartFailed(m)) if m.contains("exited during start")),
+            "a crash seen in any attempt must decide the outcome"
+        );
+        assert!(!backend.is_alive());
     }
 
     #[test]

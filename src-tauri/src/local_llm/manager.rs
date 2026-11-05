@@ -1,7 +1,8 @@
 //! Lifecycle of the local model: warm-up, serial requests, idle unload,
 //! crash restart and the failed-start policy (three failed starts in a row enter `Failed`;
 //! a third failure that is a start timeout earns one retry per cooldown, any other third
-//! failure lasts till `reset_failure`). Verification runs outside the backend mutex.
+//! failure lasts till `reset_failure` or `unload`, the actions behind selecting a model,
+//! deleting one and the tray's unload). Verification runs outside the backend mutex.
 
 use super::backend::{BackendOpts, GenerateRequest, KillSwitch, TextModelBackend};
 use super::registry::{self, ModelEntry, PromptStyle};
@@ -16,8 +17,8 @@ use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
 /// Consecutive failed starts before the manager stops trying. When the last one is a start
-/// timeout, `ManagerConfig::retry_cooldown` later one more start is allowed; any other last
-/// failure stays failed till `reset_failure`.
+/// timeout, the first call after `ManagerConfig::retry_cooldown` makes one more start; any
+/// other last failure stays failed till `reset_failure` or `unload`.
 pub const MAX_FAILED_STARTS: u32 = 3;
 
 /// Timings, overridable in tests.
@@ -1582,6 +1583,70 @@ pub(crate) mod tests {
         let inner = lock(&h.manager.inner);
         assert_eq!(inner.failed_starts, 0, "a good start resets the strikes");
         assert!(inner.retry_at.is_none(), "a good start clears the timer");
+    }
+
+    /// Manager over the real backend; its fake binary appends a line per spawn to the returned file.
+    #[cfg(unix)]
+    fn real_backend_harness(script: &str, start_timeout: Duration) -> (Harness, PathBuf) {
+        let mut h = harness();
+        let root = h._dir.path().to_path_buf();
+        let spawns = root.join("spawns");
+        let script = format!(
+            "echo x >> '{log}'\nrun=$(wc -l < '{log}')\n{script}",
+            log = spawns.display()
+        );
+        let binary = crate::local_llm::llama_server::tests::fake_binary(&root, &script);
+        let mut manager = LocalLlmManager::new(
+            Box::new(crate::local_llm::llama_server::LlamaServerBackend::with_binary(binary)),
+            Some(root),
+            ManagerHooks {
+                idle_inputs: Box::new(|| IdleInputs {
+                    timeout: ModelUnloadTimeout::Never,
+                    recording: false,
+                }),
+                on_status: Box::new(|_| {}),
+            },
+            ManagerConfig {
+                start_timeout,
+                idle_tick: Duration::from_secs(3600),
+                retry_cooldown: Duration::from_secs(3600),
+            },
+        );
+        manager.verify = Arc::new(|_, _, _| Ok(true));
+        h.manager = Arc::new(manager);
+        (h, spawns)
+    }
+
+    #[cfg(unix)]
+    fn spawn_count(spawns: &Path) -> usize {
+        std::fs::read_to_string(spawns).unwrap().lines().count()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retry_crash_then_hang_streak_is_sticky() {
+        let (h, spawns) = real_backend_harness(
+            "if [ $((run % 2)) -eq 1 ]; then exit 1; fi\nexec sleep 30",
+            Duration::from_secs(2),
+        );
+        for _ in 0..MAX_FAILED_STARTS {
+            let result = h.manager.ensure_started(&h.settings);
+            assert!(
+                matches!(result, Err(LocalLlmError::StartFailed(_))),
+                "a crash then a hang must report the crash"
+            );
+        }
+        assert_eq!(state(&h), LocalLlmStateKind::Failed);
+        assert!(
+            retry_at(&h).is_none(),
+            "a crash streak must not schedule a retry"
+        );
+        assert_eq!(spawn_count(&spawns), 6, "each start exits then hangs");
+        assert!(matches!(
+            h.manager.ensure_started(&h.settings),
+            Err(LocalLlmError::Failed(_))
+        ));
+        assert_eq!(spawn_count(&spawns), 6, "a sticky failure must not spawn");
     }
 
     #[test]
