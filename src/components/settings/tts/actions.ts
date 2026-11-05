@@ -1,3 +1,14 @@
+import type { TFunction } from "i18next";
+
+/** Every shipped TTS model synthesizes English only, so previews are spoken in English. */
+export const PREVIEW_LANGUAGE = "en";
+export function previewVoice<T>(
+  t: TFunction,
+  voice: string,
+  submit: (voice: string, text: string) => Promise<T>,
+): Promise<T> {
+  return submit(voice, t("tts.previewSentence", { lng: PREVIEW_LANGUAGE }));
+}
 export interface TtsSelection {
   model_id: string;
   voice: string;

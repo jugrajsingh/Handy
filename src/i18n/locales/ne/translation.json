@@ -1197,7 +1197,7 @@
       "stopping": "रोकिँदैछ",
       "unloaded": "अनलोड गरिएको"
     },
-    "previewSentence": "स्पष्ट रूपमा, एकपटकमा एउटा वाक्यांश पढ्दै।",
+    "previewSentence": "Reading clearly, one phrase at a time.",
     "description": {
       "pocket-en": "सबैभन्दा उच्च सुनाइ स्कोर भएका अभिव्यक्तिपूर्ण अङ्ग्रेजी आवाजहरू।",
       "supertonic-3": "CPU, GPU र NPU मा चल्ने छिटो अङ्ग्रेजी सिन्थेसिस।",

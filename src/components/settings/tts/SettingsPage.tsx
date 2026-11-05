@@ -4,7 +4,7 @@ import { listen, emit } from "@tauri-apps/api/event";
 import { commands, type Selection, type TtsModelInfo } from "@/bindings";
 import { useSettings } from "@/hooks/useSettings";
 import { unwrapTts } from "./ModelsPage";
-import { selectionEntries } from "./actions";
+import { previewVoice, selectionEntries } from "./actions";
 import { ModelSelect } from "./ModelSelect";
 import { Alert } from "@/components/ui/Alert";
 import { Button } from "@/components/ui/Button";
@@ -91,8 +91,9 @@ export function SettingsPage() {
       change={change}
       openModels={() => void emit("open-tts-models")}
       preview={() =>
-        void commands
-          .previewTtsVoice(selected.voice, t("tts.previewSentence"))
+        void previewVoice(t, selected.voice, (voice, text) =>
+          commands.previewTtsVoice(voice, text),
+        )
           .then(unwrapTts)
           .catch(() => setError("tts.errors.generic"))
       }

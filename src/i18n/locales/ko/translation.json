@@ -1197,7 +1197,7 @@
       "stopping": "중지 중",
       "unloaded": "언로드됨"
     },
-    "previewSentence": "한 번에 한 구절씩 또렷하게 읽습니다.",
+    "previewSentence": "Reading clearly, one phrase at a time.",
     "description": {
       "pocket-en": "청취 점수가 가장 높은 표현력 있는 영어 음성입니다.",
       "supertonic-3": "CPU, GPU, NPU에서 실행되는 빠른 영어 음성 합성입니다.",

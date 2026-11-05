@@ -1197,7 +1197,7 @@
       "stopping": "Stopper",
       "unloaded": "Frigjort"
     },
-    "previewSentence": "Læser tydeligt, én frase ad gangen.",
+    "previewSentence": "Reading clearly, one phrase at a time.",
     "description": {
       "pocket-en": "Udtryksfulde engelske stemmer med den højeste lyttescore.",
       "supertonic-3": "Hurtig engelsk syntese med kørsel på CPU, GPU og NPU.",

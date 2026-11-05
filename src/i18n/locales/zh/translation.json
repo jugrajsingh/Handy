@@ -1197,7 +1197,7 @@
       "stopping": "停止中",
       "unloaded": "已卸载"
     },
-    "previewSentence": "清晰朗读,一次一句。",
+    "previewSentence": "Reading clearly, one phrase at a time.",
     "description": {
       "pocket-en": "富有表现力的英语语音,听感评分最高。",
       "supertonic-3": "快速的英语合成,支持 CPU、GPU 和 NPU 运行。",

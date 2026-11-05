@@ -1197,7 +1197,7 @@
       "stopping": "停止中",
       "unloaded": "アンロード済み"
     },
-    "previewSentence": "ひとつずつ、はっきりと読み上げます。",
+    "previewSentence": "Reading clearly, one phrase at a time.",
     "description": {
       "pocket-en": "最も高い聴感評価を得た、表現豊かな英語の音声。",
       "supertonic-3": "CPU、GPU、NPU で実行できる高速な英語音声合成。",
