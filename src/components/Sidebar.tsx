@@ -1,6 +1,15 @@
 import React from "react";
 import { useTranslation } from "react-i18next";
-import { Cog, FlaskConical, History, Info, Sparkles, Cpu } from "lucide-react";
+import {
+  AudioLines,
+  Cog,
+  Cpu,
+  FlaskConical,
+  History,
+  Info,
+  Sparkles,
+  Volume2,
+} from "lucide-react";
 import HandyTextLogo from "./icons/HandyTextLogo";
 import HandyHand from "./icons/HandyHand";
 import { useSettings } from "../hooks/useSettings";
@@ -66,13 +75,13 @@ export const SECTIONS_CONFIG = {
   },
   tts: {
     labelKey: "tts.settingsTitle",
-    icon: Sparkles,
+    icon: Volume2,
     component: TtsSettingsPage,
     enabled: () => true,
   },
   ttsmodels: {
     labelKey: "tts.modelsTitle",
-    icon: Cpu,
+    icon: AudioLines,
     component: TtsModelsPage,
     enabled: () => true,
   },
