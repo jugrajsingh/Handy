@@ -118,10 +118,36 @@ pub fn build_messages(
     ]
 }
 
-/// Conservative token estimate: one token per 3 characters (English averages about 4).
+/// Thirtieths of a token one character costs, per script.
+///
+/// Latin-script text (ASCII with digits and spaces, Latin-extended, general punctuation,
+/// currency symbols, arrows)
+/// keeps one token per three characters. Fitted to llama-server `/tokenize` counts of
+/// S1-mini and Muesli 2B over the 180 eval samples (the worse model; spaces inside Indic
+/// text count as Latin): Devanagari needs up to 1.18 tokens per char and gets 1.5;
+/// Gurmukhi needs up to 1.91 and gets 2.5. Other Indic scripts (probed on short text:
+/// Bengali 1.06, Tamil 1.14, Telugu 1.49, Gujarati 1.45) share the Gurmukhi weight. Every
+/// other BMP script costs one token per char (probed worst case: Greek 0.84) and
+/// characters beyond the BMP three (emoji probed at 2.18).
+fn char_weight(c: char) -> u32 {
+    match c {
+        '\u{0900}'..='\u{097F}' => 45,
+        '\u{0980}'..='\u{0DFF}' => 75,
+        '\u{0000}'..='\u{024F}'
+        | '\u{0300}'..='\u{036F}'
+        | '\u{1E00}'..='\u{1EFF}'
+        | '\u{2000}'..='\u{206F}'
+        | '\u{20A0}'..='\u{20CF}'
+        | '\u{2190}'..='\u{21FF}' => 10,
+        c if u32::from(c) > 0xFFFF => 90,
+        _ => 30,
+    }
+}
+
+/// Conservative token estimate: characters weighted by script, rounded up in total.
 pub fn est_tokens(text: &str) -> u32 {
-    let chars = u32::try_from(text.chars().count()).unwrap_or(u32::MAX);
-    chars.div_ceil(3)
+    let thirtieths: u64 = text.chars().map(|c| u64::from(char_weight(c))).sum();
+    u32::try_from(thirtieths.div_ceil(30)).unwrap_or(u32::MAX)
 }
 
 /// `min(2 * est_tokens(input) + 64, ctx / 2)`.
@@ -167,14 +193,25 @@ fn sentences(text: &str) -> Vec<&str> {
     out
 }
 
-/// Splits one word longer than the budget at char boundaries.
+/// Splits one word longer than the budget at char boundaries, each piece within the budget.
 fn split_long_word(word: &str, budget: u32) -> Vec<String> {
-    let max_chars = (budget as usize).saturating_mul(3).max(1);
-    let chars: Vec<char> = word.chars().collect();
-    chars
-        .chunks(max_chars)
-        .map(|c| c.iter().collect::<String>())
-        .collect()
+    let limit = u64::from(budget) * 30;
+    let mut pieces = Vec::new();
+    let mut current = String::new();
+    let mut used = 0_u64;
+    for c in word.chars() {
+        let weight = u64::from(char_weight(c));
+        if !current.is_empty() && used + weight > limit {
+            pieces.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(c);
+        used += weight;
+    }
+    if !current.is_empty() {
+        pieces.push(current);
+    }
+    pieces
 }
 
 /// Packs ordered pieces into chunks within the estimated token budget.
@@ -452,11 +489,80 @@ mod tests {
     }
 
     #[test]
-    fn token_estimate_counts_chars_not_bytes() {
+    fn token_estimate_weights_characters_by_script() {
         assert_eq!(est_tokens(""), 0);
         assert_eq!(est_tokens("abc"), 1);
         assert_eq!(est_tokens("abcd"), 2);
-        assert_eq!(est_tokens("\u{1f600}\u{1f600}\u{1f600}"), 1);
+        assert_eq!(est_tokens("abcdef"), 2);
+        assert_eq!(est_tokens("\u{8a9e}\u{8a9e}\u{8a9e}"), 3);
+        assert_eq!(est_tokens("\u{1f600}\u{1f600}\u{1f600}"), 9);
+    }
+
+    #[test]
+    fn latin_script_keeps_one_token_per_three_characters() {
+        let samples = [
+            "so um i need to send the report by friday",
+            "El vuelo IB 3172 sale a las 18:40, no a las 8:40. Ojo con eso.",
+            "1234567890 \t\n x",
+            "caf\u{e9} na\u{ef}ve \u{201c}quoted\u{201d} \u{2014} \u{20ac}5 \u{2192} done",
+            "\u{1ea1}\u{1ebf}n \u{1eef}ng v\u{1ec7}t",
+        ];
+        for text in samples {
+            let chars = u32::try_from(text.chars().count()).unwrap();
+            assert_eq!(
+                est_tokens(text),
+                chars.div_ceil(3),
+                "Latin-script text must stay at one token per three characters: {text}"
+            );
+        }
+    }
+
+    /// Real counts are from llama-server `/tokenize` on S1-mini and Muesli 2B over the
+    /// eval samples. At one token per three characters each of these was under-budgeted.
+    #[test]
+    fn token_estimate_covers_measured_indic_samples() {
+        let cases = [
+            // Gurmukhi (v2-017): 46 chars, 72 S1-mini tokens, 35 Muesli tokens.
+            ("ਉਮ ਬਿੱਲੇ ਤੂੰ ਸ਼ਨੀਵਾਰ ਨੂੰ ਮੈਚ ਖੇਡਣ ਆਉਣਾ ਕਿ ਨਹੀਂ", 96, 72, 35),
+            // Devanagari (v2-009): 51 chars, 51 S1-mini tokens, 23 Muesli tokens.
+            ("उम मेरी शिफ्ट रात नौ बजे नहीं नहीं दस बजे शुरू होगी", 64, 51, 23),
+        ];
+        for (text, expected, s1_mini, muesli) in cases {
+            let estimate = est_tokens(text);
+            assert_eq!(
+                estimate, expected,
+                "script-weighted estimate must match for {text}"
+            );
+            assert!(
+                estimate >= s1_mini.max(muesli),
+                "estimate must cover the measured tokens of {text}"
+            );
+            let one_per_three = u32::try_from(text.chars().count()).unwrap().div_ceil(3);
+            assert!(
+                one_per_three < s1_mini.max(muesli),
+                "one token per three characters was enough for {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_indic_words_split_within_the_budget() {
+        let gurmukhi = "ਸੱਚ".repeat(400);
+        let devanagari = "सत्य".repeat(400);
+        for transcript in [gurmukhi, devanagari] {
+            let chunks = chunk_transcript(&transcript, 64);
+            assert!(
+                chunks.len() > 1,
+                "indic word must be split into several chunks"
+            );
+            for chunk in &chunks {
+                assert!(
+                    est_tokens(chunk) <= 64,
+                    "indic chunk must stay within the budget"
+                );
+            }
+            assert_eq!(chunks.join("").replace(' ', ""), transcript);
+        }
     }
 
     #[test]
