@@ -2026,8 +2026,12 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn plain_harness() -> Harness {
+        plain_harness_for("quill-0.8b-q4km")
+    }
+
+    fn plain_harness_for(model_id: &str) -> Harness {
         let mut h = harness();
-        let entry = registry::find("quill-0.8b-q4km").unwrap();
+        let entry = registry::find(model_id).unwrap();
         let root = h.model_file.parent().unwrap().parent().unwrap();
         let file = registry::model_path(root, entry);
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -2089,6 +2093,168 @@ pub(crate) mod tests {
                 .process("one two three four five", &h.settings)
                 .is_err());
         }
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ParityFixture {
+        ctx: u32,
+        system: String,
+        server_args_without_host: Vec<String>,
+        body_flags: serde_json::Value,
+        cases: Vec<ParityCase>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ParityCase {
+        id: String,
+        input: String,
+        requests: Vec<ParityRequest>,
+        old_chunks: usize,
+        old_max_tokens: Vec<u32>,
+        s1_gold_tokens: u32,
+        muesli_gold_tokens: u32,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct ParityRequest {
+        user: String,
+        max_tokens: u32,
+        timeout_ms: u64,
+    }
+
+    fn request_estimate(request: &GenerateRequest) -> u32 {
+        prompt::est_tokens(&request.messages[1].content)
+    }
+
+    /// `testdata/muesli_parity.json` is what the evaluation's `handy` variant for
+    /// `muesli-2b-q4km` (eval/scripts/cleanup_port.py) sends for every eval sample: system
+    /// prompt, chunks, `max_tokens`, timeout and request flags. The app must send the same.
+    #[test]
+    fn muesli_requests_match_the_evaluated_handy_variant() {
+        let fixture: ParityFixture =
+            serde_json::from_str(include_str!("testdata/muesli_parity.json")).unwrap();
+        let entry = registry::find("muesli-2b-q4km").unwrap();
+        assert_eq!(
+            entry.prompt_style,
+            PromptStyle::PlainSystemPrompt,
+            "muesli must ship with the prompt style it was evaluated with"
+        );
+        assert_eq!(entry.default_ctx, fixture.ctx);
+
+        let mut h = plain_harness_for("muesli-2b-q4km");
+        let defaults = crate::settings::get_default_settings();
+        h.settings.post_process_selected_prompt_id =
+            Some(defaults.post_process_prompts[0].id.clone());
+        h.settings.post_process_prompts = defaults.post_process_prompts;
+        assert_eq!(
+            prompt::system_prompt(entry.prompt_style, &h.settings).unwrap(),
+            fixture.system
+        );
+
+        let args: Vec<String> = crate::local_llm::llama_server::server_args(
+            std::path::Path::new("/m/model.gguf"),
+            std::path::Path::new("/private/llm.sock"),
+            h.settings.local_llm_threads,
+            entry.default_ctx,
+        )
+        .into_iter()
+        .map(|arg| arg.into_string().unwrap())
+        .collect();
+        let host = args.iter().position(|arg| arg == "--host").unwrap();
+        let mut without_host = args.clone();
+        without_host.drain(host..host + 2);
+        assert_eq!(without_host, fixture.server_args_without_host);
+
+        let mut sent = 0;
+        for case in &fixture.cases {
+            let before = h.fake.lock().unwrap().requests.len();
+            assert_eq!(
+                h.manager.process(&case.input, &h.settings).unwrap(),
+                case.requests
+                    .iter()
+                    .map(|r| r.user.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                "{}",
+                case.id
+            );
+            let fake = h.fake.lock().unwrap();
+            let requests = &fake.requests[before..];
+            assert_eq!(requests.len(), case.requests.len(), "{}", case.id);
+            for (request, expected) in requests.iter().zip(&case.requests) {
+                let mut body = fixture.body_flags.clone();
+                body["messages"] = serde_json::json!([
+                    {"role": "system", "content": fixture.system},
+                    {"role": "user", "content": expected.user},
+                ]);
+                body["max_tokens"] = expected.max_tokens.into();
+                assert_eq!(
+                    crate::local_llm::llama_server::chat_body(request),
+                    body,
+                    "{}",
+                    case.id
+                );
+                assert_eq!(
+                    request.timeout,
+                    Duration::from_millis(expected.timeout_ms),
+                    "{}",
+                    case.id
+                );
+                sent += 1;
+            }
+            let replies: u32 = requests.iter().map(|r| r.max_tokens).sum();
+            assert!(
+                replies >= case.s1_gold_tokens.max(case.muesli_gold_tokens),
+                "the reply budget must cover the real gold tokens of {}",
+                case.id
+            );
+            for request in requests {
+                // Measured worst case: real Latin tokens are at most 1.57x the estimate; the
+                // real default system prompt is 232 tokens; the chat template adds 16.
+                let prompt = 232 + 16 + request_estimate(request) * 157 / 100;
+                assert!(
+                    prompt + request.max_tokens <= fixture.ctx,
+                    "prompt plus reply must fit the context for {}",
+                    case.id
+                );
+            }
+            let latin_only = case.input.chars().all(|c| {
+                matches!(c, '\u{0}'..='\u{24F}' | '\u{2000}'..='\u{206F}' | '\u{20A0}'..='\u{21FF}')
+            });
+            if latin_only {
+                assert_eq!(
+                    case.requests.len(),
+                    case.old_chunks,
+                    "Latin-script chunking must match the evaluated request path: {}",
+                    case.id
+                );
+                let tokens: Vec<u32> = case.requests.iter().map(|r| r.max_tokens).collect();
+                assert_eq!(
+                    tokens, case.old_max_tokens,
+                    "Latin-script max_tokens must match the evaluated request path: {}",
+                    case.id
+                );
+            }
+        }
+        assert_eq!(
+            sent,
+            fixture
+                .cases
+                .iter()
+                .map(|c| c.requests.len())
+                .sum::<usize>()
+        );
+        assert!(fixture.cases.iter().any(|c| c.requests.len() > 1));
+        assert_eq!(
+            fixture
+                .cases
+                .iter()
+                .filter(|c| c.requests.len() != c.old_chunks)
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            ["s119", "v2-023", "v2-028"],
+            "only these Indic samples re-chunk against the evaluated request path"
+        );
     }
 
     #[test]

@@ -235,6 +235,17 @@ fn wait_healthy_inner(
     }
 }
 
+/// JSON body of one chat completion request.
+pub(super) fn chat_body(req: &GenerateRequest) -> serde_json::Value {
+    serde_json::json!({
+        "messages": req.messages,
+        "temperature": 0,
+        "stream": false,
+        "max_tokens": req.max_tokens,
+        "chat_template_kwargs": { "enable_thinking": false },
+    })
+}
+
 /// `POST /v1/chat/completions`, returning `choices[0].message.content`.
 pub fn post_chat(
     client: &reqwest::blocking::Client,
@@ -242,13 +253,7 @@ pub fn post_chat(
     api_key: &str,
     req: &GenerateRequest,
 ) -> Result<String, LocalLlmError> {
-    let body = serde_json::json!({
-        "messages": req.messages,
-        "temperature": 0,
-        "stream": false,
-        "max_tokens": req.max_tokens,
-        "chat_template_kwargs": { "enable_thinking": false },
-    });
+    let body = chat_body(req);
     let resp = client
         .post(format!("http://{authority}/v1/chat/completions"))
         .bearer_auth(api_key)

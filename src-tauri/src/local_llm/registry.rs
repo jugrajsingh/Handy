@@ -70,6 +70,15 @@ ModelEntry {
     url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
     sha256: "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597", size_bytes: 2497281120,
     prompt_style: PromptStyle::PlainSystemPrompt, default_ctx: 4096,
+},
+ModelEntry {
+    id: "muesli-2b-q4km", display_name: "Muesli 2B",
+    attribution: "Muesli cleanup v12 by Muesli-HQ, based on Qwen3.5-2B by Alibaba",
+    card_url: "https://huggingface.co/Muesli-HQ/qwen35-2b-muesli-cleanup-v12-gguf",
+    backend: BackendKind::LlamaServer, file_name: "qwen35-2b-muesli-v12-Q4_K_M.gguf",
+    url: "https://huggingface.co/Muesli-HQ/qwen35-2b-muesli-cleanup-v12-gguf/resolve/e35af097be4f17d3673515fb321ce19aa300faf6/qwen35-2b-muesli-v12-Q4_K_M.gguf",
+    sha256: "2d59d2118170e0170fa294d71eba0a701c4f26063f284f68a8bed880322c4143", size_bytes: 1274396096,
+    prompt_style: PromptStyle::PlainSystemPrompt, default_ctx: 4096,
 },];
 
 /// Looks up a registry entry by id.
@@ -136,6 +145,50 @@ mod tests {
     }
 
     #[test]
+    fn muesli_2b_entry_matches_the_verified_file() {
+        let m = find("muesli-2b-q4km").expect("muesli entry");
+        assert_eq!(m.display_name, "Muesli 2B", "muesli display name is pinned");
+        assert_eq!(
+            m.file_name, "qwen35-2b-muesli-v12-Q4_K_M.gguf",
+            "muesli file name must match the verified file"
+        );
+        assert_eq!(
+            m.size_bytes, 1_274_396_096,
+            "muesli size must match the verified file"
+        );
+        assert_eq!(
+            m.sha256, "2d59d2118170e0170fa294d71eba0a701c4f26063f284f68a8bed880322c4143",
+            "muesli sha256 must match the verified file"
+        );
+        assert_eq!(
+            m.url,
+            "https://huggingface.co/Muesli-HQ/qwen35-2b-muesli-cleanup-v12-gguf/resolve/e35af097be4f17d3673515fb321ce19aa300faf6/qwen35-2b-muesli-v12-Q4_K_M.gguf",
+            "muesli url must pin the verified revision"
+        );
+        assert_eq!(
+            m.card_url, "https://huggingface.co/Muesli-HQ/qwen35-2b-muesli-cleanup-v12-gguf",
+            "muesli card url is pinned"
+        );
+        assert_eq!(
+            m.prompt_style,
+            PromptStyle::PlainSystemPrompt,
+            "muesli entry must use the plain system prompt style"
+        );
+        assert_eq!(m.backend, BackendKind::LlamaServer);
+        assert_eq!(m.default_ctx, 4096, "muesli context is pinned");
+        assert_eq!(
+            model_path(Path::new("/data/models/llm"), m),
+            PathBuf::from("/data/models/llm/muesli-2b-q4km/qwen35-2b-muesli-v12-Q4_K_M.gguf")
+        );
+    }
+
+    #[test]
+    fn s1_mini_stays_the_first_entry() {
+        assert_eq!(MODELS[0].id, "s1-mini-q4km");
+        assert_eq!(MODELS.len(), 5);
+    }
+
+    #[test]
     fn unknown_id_is_not_found() {
         assert!(find("nope").is_none());
     }
@@ -162,7 +215,6 @@ mod tests {
                 "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597",
             ),
         ];
-        assert_eq!(MODELS.len(), 4);
         for (id, file, size, hash) in expected {
             let entry = find(id).unwrap();
             assert_eq!(entry.file_name, file);
