@@ -1,21 +1,39 @@
 # Changelog
 
-All notable changes on this branch compared with upstream main are documented here, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+This project is built on [Handy](https://github.com/cjpais/Handy) v0.10.0 and documents its own changes on top of it, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Changes merged in from upstream are documented in upstream's own release notes.
 
 ## [Unreleased]
 
 ### Added
 
+Read aloud (text to speech)
+
+- A Read aloud shortcut (default Super+Alt+R, changeable under General) reads the text you last copied. It takes the clipboard with `wl-paste` on Wayland and `xclip` on X11. A popup opens and starts reading at once. Pressing the shortcut again while the popup is open stops reading and closes it.
+- The popup shows the text with the sentence being read highlighted, and the highlight follows the audio. Click the text, or paste into the popup, to edit it. It shows elapsed and total time with a progress bar, and Play, Pause and Stop buttons. Esc closes the popup and Ctrl+Enter plays or pauses.
+- Errors appear in a banner in the popup. When the chosen model is not downloaded, the banner links to the Text-to-speech Models page. If the chosen output device cannot be opened, reading falls back to the default output device and the popup says so. If a dictation is still pasting when you press the shortcut, a notice asks you to try again, and if the voice worker is not ready a notice says reading is unavailable.
+- Three downloadable voice models: Pocket TTS (English, the default; about 296 MB, 27 voices), Supertonic 3 (about 401 MB, 10 voices) and Kokoro-82M INT8 (about 107 MB, 28 voices). Each file is pinned to a Hugging Face revision with a fixed size and SHA-256, and downloads are verified and resumable.
+- Pocket voices are gated on Hugging Face. Accept the voice terms there, then enter a Hugging Face token in the model card or under Advanced. The token is kept in memory only and is cleared when the app restarts. The `HF_TOKEN` environment variable is also honoured.
+- Each model runs on the CPU through ONNX Runtime, or on an Intel GPU or NPU through OpenVINO. The Run on control on each downloaded model's card offers Auto, CPU, GPU and NPU, listing only devices that model supports on this machine. Auto picks the best available device and falls back when one fails to prepare. The cards show Quality and Speed ratings, a Recommended badge, and a progress line while a device prepares. The ratings ship with the app and were measured on one machine (see Platform support).
+- Speed from 0.5x to 2.0x and pitch from -6 to +6 semitones, applied by time stretching with a single pass over the audio. A speed or pitch change applies from the next sentence. Pause lengths after punctuation scale with the speed.
+- Reading is streamed. Several sentences are synthesized in parallel (up to three, fewer when memory is short), so playback is gapless on long text. Silence at the edges of each sentence is trimmed and replaced with a pause that suits the punctuation. Supertonic on the GPU uses six fixed input sizes that are warmed up when the model loads, and on the NPU every model uses fixed input shapes.
+- Text is prepared as Markdown, so formatting marks are not spoken, and fenced code blocks are replaced by the words "code block skipped" unless Read code blocks is switched on. Text with very long unbroken runs is still read to the end.
+- Dictation and reading never overlap. Starting a dictation stops reading and closes the popup. Pressing Read aloud during a dictation ends the recording, lets the dictation finish, then opens the popup.
+- The voice engine runs as a separate worker process that is started when needed and unloaded after the existing model unload timeout. It refuses to start with less than 1 GiB of available memory. After three failed starts in a row it stays in a Failed state until a model is selected again.
+- A Text-to-speech settings page (model, voice with a Preview voice button, speed, pitch, output device and Read code blocks) and a Text-to-speech Models page, with the same card design as Transcription Models.
+- The tray menu has a Text-to-speech model submenu with a checked list of downloaded models, the worker's status (Unloaded, Starting, Loaded, Stopping or Failed) and an Unload text-to-speech model item that is enabled only while the worker is loaded.
+- The RPM bundles the worker and the OpenVINO libraries at `/usr/lib/Handy/tts`, and recommends `intel-compute-runtime`, `intel-level-zero`, `oneapi-level-zero` and `wl-clipboard`. The `HANDY_TTS_WORKER` environment variable overrides the worker path for development.
+
 In-app local post-processing
 
 - New "Local (in-app)" post-processing provider that runs a small language model on the CPU through a bundled llama.cpp `llama-server`. No external service has to be installed or started, and transcripts never leave the machine.
-- Handy starts `llama-server` as a managed child process that listens on loopback only, on a free port, with a random API key per launch passed through the environment instead of the command line. Handy stops it on exit, and on Linux the kernel terminates it if Handy dies without cleaning up.
+- This build starts `llama-server` as a managed child process. It listens on a private Unix socket inside a directory that only the current user can open (mode 0700) under `XDG_RUNTIME_DIR`, or under the app data directory when that is not set, and it opens no network port. A random API key is generated for each launch and passed through the environment instead of the command line. The app stops the server on exit, and on Linux the kernel terminates it if the app dies without cleaning up.
 - The model loads only when needed: it starts in the background when a post-processing recording begins, so recording is never delayed, and it unloads after the existing model unload timeout (a duration, Immediately, or Never).
-- Local post-processing never blocks a dictation on failure. A start deadline of 10 seconds applies, a server that exits unexpectedly is started again on the next dictation, and after three failed starts in a row the model enters an error state. When the last of them was a start timeout, for example under heavy machine load, the first dictation after 5 minutes tries one more start and recovers on its own; after any other failure the error state lasts till a model is selected or deleted, or Handy restarts. Every failure falls back to the raw transcript.
+- Before a model is loaded, its file is checked against its pinned size and SHA-256. A corrupt file is reported with advice to delete and re-download it, and a check that runs past the start deadline falls back to the raw transcript.
+- Local post-processing never blocks a dictation on failure. A start deadline of 10 seconds applies, a server that exits unexpectedly is started again on the next dictation, and after three failed starts in a row the model enters an error state. When the last of them was a start timeout, for example under heavy machine load, the first dictation after 5 minutes tries one more start and recovers on its own; after any other failure the error state lasts till a model is selected or deleted, or the app restarts. Every failure falls back to the raw transcript.
 - Five downloadable local models, each pinned to a Hugging Face revision with a fixed size and SHA-256: S1-mini by Superwhisper, Quill 0.8B, Quill 2B, Qwen3-4B-Instruct-2507 and Muesli 2B (all Q4_K_M quantizations). Each model shows its attribution and a link to its model card.
 - Models are downloaded and deleted on demand through the verified, resumable downloader. Download progress and errors survive leaving the page, and a stale error is cleared before the next model action.
 - S1-mini is driven by Styling (casual, semi-casual, semi-formal, formal), Structure (prose, lists) and Context (general, email) dropdowns.
-- Quill, Qwen3 and Muesli models use the selected Handy prompt as their system prompt, and the Prompts group is shown for them. S1-mini uses its own fixed prompt, so the prompt editor is hidden for it with a note. If the selected prompt is missing or empty, post-processing is skipped and the raw transcript is kept.
+- Quill, Qwen3 and Muesli models use the selected prompt as their system prompt, and the Prompts group is shown for them. S1-mini uses its own fixed prompt, so the prompt editor is hidden for it with a note. If the selected prompt is missing or empty, post-processing is skipped and the raw transcript is kept.
 - Long transcripts are split at sentence boundaries, processed in order and rejoined. The token budget for each chunk and for the reply is estimated per script, so Gurmukhi, Devanagari and other Indic text gets a larger reply budget. A model that still reaches the limit falls back to the raw transcript. Output that loses more than half of the input words is rejected, and think blocks and invisible characters are stripped from model output.
 - A live status label (Not loaded, Loading, Ready, Error with the reason) is shown next to the model controls.
 - The RPM bundles a static, CPU-only `llama-server` at `/usr/lib/Handy/llm/llama-server`. The `HANDY_LLAMA_SERVER` environment variable overrides the path for development.
@@ -45,9 +63,20 @@ Tray and footer
 - The tray menu shows a Post-processing model submenu with the selected model's status, a checked list of downloaded models, and an Unload post-processing model item that is enabled only while the model is ready. The group appears only when post-processing is enabled with the local provider.
 - The footer has a second picker for the post-processing model, next to the transcription model picker. Each picker shows the same icon as its sidebar page. Choosing a model does not load it. With no model downloaded, the picker reads "No post-processing model" and opens the Post-processing Models page.
 
+Model licences
+
+- Each post-processing model shows its licence with a link to the licence text at the pinned model revision. S1-mini is Apache-2.0 with one added term: it must be named "S1-mini" by "Superwhisper" with that capitalization, and that term is shown under the licence link.
+- Each text-to-speech model card shows its licence (CC-BY-4.0 for Pocket TTS, OpenRAIL-M for Supertonic 3, Apache-2.0 for Kokoro) with a link to the model card. Hovering the licence shows the attribution or use restrictions that apply.
+
+Translations
+
+- All new post-processing and read aloud strings are translated into the 25 other languages. The translations are machine-generated and have not yet been reviewed by native speakers.
+
 ### Changed
 
 - Sidebar entries are renamed to "Transcription Models" and "Post-processing Models". The sidebar is wider and labels wrap instead of being truncated.
+- The new sidebar entries Text-to-speech and Text-to-speech Models have their own icons, and a test keeps every sidebar icon unique.
+- The Cargo project is now a workspace with two new crates, `handy-tts` (the voice worker) and `handy-tts-core` (shared text, scheduling, audio and download logic).
 - The tray item "Unload Model" is renamed "Unload transcription model", and the tray model submenu is labelled "Transcription model".
 - The transcription model dropdown in the footer is wider, shows each model's size, and lets long names wrap.
 - Model buttons in the footer use the available width. A tooltip with the full name appears only when the name is still truncated.
@@ -55,11 +84,13 @@ Tray and footer
 - When post-processing is disabled, a cleared Raw Shortcut is restored to its default, and an assigned Raw Shortcut stays active.
 - Retention cleanup of old history entries now announces each removed entry to the History page.
 - Changing the post-processing provider, the local model or the compare view now saves with a checked write that restores the previous value on failure, and the tray refreshes after a provider or model change. Toggling an entry's saved status runs off the UI thread.
+- Each helper program used to paste dictated text now runs under a deadline that grows with the length of the text, and its leftovers are cleaned up whatever the outcome, so a hung helper cannot hold up dictation, shortcuts or reading.
 
 ### Fixed
 
 - Shortcut changes are applied atomically: a refused or failed change leaves the stored settings and registered shortcuts as they were, and an active dictation shortcut is always preserved.
 - The History list keeps its loaded pages and scroll position when a dictation is added or updated, and when retention removes entries, instead of jumping back to the first page. A list that is already at the top stays at the top.
+- Clear History also cancels any transcription still running for the entries it removes.
 - The tray menu refreshes after post-processing is toggled, after the provider or local model changes, and after a native check click on a model entry.
 - Selecting a model from the tray no longer blocks dictation.
 - Selecting a different local model saves the selection before the running model is unloaded.
@@ -67,12 +98,28 @@ Tray and footer
 - A selected local model whose file is not downloaded no longer shows its name or a checkmark in the tray.
 - The Prompts group is hidden for the local provider until the model list has loaded, so the prompt editor does not flash up for S1-mini.
 
-### Notes for upstream PR
+## Platform support
 
-- Build requirement: a static, CPU-only `llama-server` must be staged as `llm-bin/` for the RPM bundle, which installs it at `/usr/lib/Handy/llm` (`bundle.linux.rpm.files` in `tauri.conf.json`). Bundling and process supervision are implemented for Linux only.
-- New settings keys, all with serde defaults so existing stores load unchanged: `local_llm_model_id`, `local_llm_styling`, `local_llm_structure`, `local_llm_context`, `local_llm_threads` (default 4) and `history_compare_view` (default `diff`). A new post-processing provider with id `local_llm` is added.
-- New events: `local-llm-state-changed` and `local-llm-download-progress`. The `history-updated` payload gains a `cleared` action, and retention cleanup now emits a `deleted` action for each removed entry.
+- Built and tested on Fedora 44 (KDE Plasma, Wayland) on an Intel Core Ultra 7 258V, and packaged as an RPM only.
+- Local post-processing needs Unix sockets and uses the Linux parent-death signal to stop `llama-server` if the app dies. The `llama-server` bundling is Linux-only.
+- Read aloud's worker process, its OpenVINO libraries, the parent-death signal and the 1 GiB free-memory check are Linux-only. On other platforms the memory check is skipped. Clipboard capture uses `wl-paste` or `xclip` on Linux.
+- The device ratings shown on the Text-to-speech Models page were measured on that one machine. Other hardware may rank devices differently.
+- Windows and macOS are not supported by these features yet.
+
+## Relationship to upstream
+
+- Base version: upstream v0.10.0.
+- New settings keys, all with serde defaults so existing stores load unchanged: `local_llm_model_id`, `local_llm_styling`, `local_llm_structure`, `local_llm_context`, `local_llm_threads` (default 4), `history_compare_view` (default `diff`), `tts_model_id` (default `pocket-en`), `tts_voice` (a map of model to voice), `tts_speed` (default 1.0), `tts_pitch_semitones` (default 0), `tts_output_device`, `tts_read_code_blocks` (default off) and `tts_run_on` (a map of model to Auto, CPU, GPU or NPU). A new post-processing provider with id `local_llm` and a new shortcut binding `read_aloud` are added.
+- New events: `local-llm-state-changed`, `local-llm-download-progress`, `read-aloud-state`, `tts-download-progress`, `tts-preview-error` and `open-tts-models`. The `history-updated` payload gains a `cleared` action, and retention cleanup now emits a `deleted` action for each removed entry. Two notice codes (`ReadAloudUnavailable` and `ReadAloudBusyPasting`) and one notice source (`ReadAloud`) are added.
 - `HistoryEntry` gains `post_process_provider` and `post_process_model`, backed by two additive nullable columns in a new history migration.
-- New Tauri commands: `clear_binding`, `clear_history`, `get_history_clear_summary`, `change_history_compare_view_setting`, and the `local_llm` commands for listing, downloading, deleting, selecting and reporting status of models and for the three S1 settings.
-- New dependencies: `thiserror`, and the `blocking` feature of `reqwest`.
-- Upstream files that gain hunks: `actions.rs`, `settings.rs`, `lib.rs`, `tray.rs`, `managers/history.rs`, `commands/history.rs`, `managers/model/download.rs`, `shortcut/mod.rs`, `shortcut/handy_keys.rs`, `shortcut/tauri_impl.rs`, `Cargo.toml`, `tauri.conf.json`, `bindings.ts`, `App.tsx`, `Sidebar.tsx`, the footer and model selector components, the shortcut inputs, the General, History and Post-processing settings, the settings store, and the English translation file. New code lives in `src-tauri/src/local_llm/` and `src-tauri/src/shortcut/policy.rs`.
+- New Tauri commands: `clear_binding`, `clear_history`, `get_history_clear_summary`, `change_history_compare_view_setting`; the `local_llm` commands for listing, downloading, deleting, selecting and reporting status of models and for the three S1 settings; and the text-to-speech commands `get_tts_models`, `get_tts_status`, `get_tts_devices`, `get_read_aloud_state`, `read_aloud_replace_text`, `read_aloud_play`, `read_aloud_pause`, `read_aloud_stop`, `read_aloud_close`, `set_tts_selection`, `set_tts_model`, `set_tts_run_on`, `unload_tts_model`, `download_tts_model`, `cancel_tts_download`, `delete_tts_model`, `set_tts_hf_token` and `preview_tts_voice`.
+- New dependencies: in `src-tauri`, `thiserror` and the `blocking` feature of `reqwest`, plus the two workspace crates. The workspace adds `ort`, `ndarray`, `rand`, `rand_distr`, `regex`, `unicode-normalization`, `sentencepiece-rs`, `misaki-rs`, `signalsmith-stretch`, `openvino` and `openvino-sys` (runtime-linked), and `handy-tts-core` adds `pulldown-cmark` and `sha2`. Workspace-wide lint settings and a `cargo fmt --all` format script were added, and the lockfile moved to the workspace root.
+- Build requirements: a static, CPU-only `llama-server` must be staged as `llm-bin/`, and the text-to-speech worker with its OpenVINO libraries as `tts-bin/`. The RPM bundle installs them at `/usr/lib/Handy/llm` and `/usr/lib/Handy/tts` (`bundle.linux.rpm.files` in `tauri.conf.json`).
+- Upstream files that gain hunks, grouped:
+  - Backend core: `actions.rs`, `settings.rs`, `lib.rs`, `tray.rs`, `notices.rs`, `overlay.rs`, `input.rs`, `utils.rs`, `clipboard.rs` (paste hardening), `transcription_coordinator.rs`, `managers/transcription_jobs.rs`, `commands/mod.rs`, `commands/transcription.rs`.
+  - History and models: `managers/history.rs`, `commands/history.rs`, `managers/model/download.rs`.
+  - Shortcuts: `shortcut/mod.rs`, `shortcut/handler.rs`, `shortcut/handy_keys.rs`, `shortcut/tauri_impl.rs`.
+  - Paste transactions: `paste_tx/mod.rs`, `paste_tx/windows.rs`, `paste_tx/macos.rs`.
+  - Packaging and config: `Cargo.toml`, `tauri.conf.json`, `capabilities/default.json`, `package.json`, `flake.nix`, `BUILD.md`, `.github/workflows/build.yml`, `.github/workflows/test.yml`.
+  - Frontend: `bindings.ts`, `App.tsx`, `Sidebar.tsx`, the footer and model selector components, the shortcut input, the General, History, Post-processing and Advanced settings, the settings store, `lib/notices.ts`, and the English translation file plus the other 25 locale files.
+  - New code lives in `src-tauri/src/local_llm/`, `src-tauri/src/tts/`, `src-tauri/src/shortcut/policy.rs`, `crates/handy-tts/`, `crates/handy-tts-core/`, `src/read-aloud/` and `src/components/settings/tts/`.
