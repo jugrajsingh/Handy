@@ -1838,11 +1838,12 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn retry_probe_that_hangs_spawns_one_child() {
-        let (h, spawns) = real_backend_harness("exec sleep 30", Duration::from_millis(300));
+        let (h, spawns) = real_backend_harness("exec sleep 30", Duration::from_secs(2));
         for _ in 0..MAX_FAILED_STARTS {
             assert_eq!(
                 h.manager.ensure_started(&h.settings),
-                Err(LocalLlmError::StartTimeout)
+                Err(LocalLlmError::StartTimeout),
+                "a hang must report a start timeout"
             );
         }
         assert_eq!(
