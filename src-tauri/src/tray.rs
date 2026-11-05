@@ -2110,9 +2110,49 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_status_label_maps_every_state_and_falls_back_to_english() {
+    fn cleanup_status_label_maps_every_state_in_english_and_a_translated_locale() {
         let english = get_tray_translations(Some("en".into()));
-        let missing = get_tray_translations(Some("de".into()));
+        let german = get_tray_translations(Some("de".into()));
+        let locale: serde_json::Value =
+            serde_json::from_str(include_str!("../../src/i18n/locales/de/translation.json"))
+                .expect("de translation.json parses");
+        let tray = |key: &str| {
+            locale["tray"][key]
+                .as_str()
+                .unwrap_or_else(|| panic!("de tray.{key} is a string"))
+                .to_string()
+        };
+        for (state, english_text, german_key) in [
+            (LocalLlmStateKind::Ready, "ready", "cleanupReady"),
+            (
+                LocalLlmStateKind::Unloaded,
+                "not loaded",
+                "cleanupNotLoaded",
+            ),
+            (LocalLlmStateKind::Starting, "loading", "cleanupLoading"),
+            (LocalLlmStateKind::Stopping, "loading", "cleanupLoading"),
+            (LocalLlmStateKind::Failed, "error", "cleanupError"),
+        ] {
+            assert_eq!(
+                cleanup_status_label(state, "S1-mini", &english, &english),
+                format!("Post-processing model: S1-mini ({english_text})")
+            );
+            assert_eq!(
+                cleanup_status_label(state, "S1-mini", &german, &english),
+                format!("{}: S1-mini ({})", tray("cleanup"), tray(german_key))
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_status_label_falls_back_to_english_for_missing_cleanup_strings() {
+        let english = get_tray_translations(Some("en".into()));
+        let mut missing = get_tray_translations(Some("de".into()));
+        missing.cleanup = String::new();
+        missing.cleanup_ready = String::new();
+        missing.cleanup_not_loaded = String::new();
+        missing.cleanup_loading = String::new();
+        missing.cleanup_error = String::new();
         for (state, text) in [
             (LocalLlmStateKind::Ready, "ready"),
             (LocalLlmStateKind::Unloaded, "not loaded"),
@@ -2120,14 +2160,9 @@ mod tests {
             (LocalLlmStateKind::Stopping, "loading"),
             (LocalLlmStateKind::Failed, "error"),
         ] {
-            let expected = format!("Post-processing model: S1-mini ({text})");
-            assert_eq!(
-                cleanup_status_label(state, "S1-mini", &english, &english),
-                expected
-            );
             assert_eq!(
                 cleanup_status_label(state, "S1-mini", &missing, &english),
-                expected
+                format!("Post-processing model: S1-mini ({text})")
             );
         }
     }
