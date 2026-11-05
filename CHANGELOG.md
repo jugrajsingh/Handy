@@ -98,7 +98,7 @@ Translations
 - A selected local model whose file is not downloaded no longer shows its name or a checkmark in the tray.
 - The Prompts group is hidden for the local provider until the model list has loaded, so the prompt editor does not flash up for S1-mini.
 
-## Platform support
+### Platform support
 
 - Built and tested on Fedora 44 (KDE Plasma, Wayland) on an Intel Core Ultra 7 258V, and packaged as an RPM only.
 - Local post-processing needs Unix sockets and uses the Linux parent-death signal to stop `llama-server` if the app dies. The `llama-server` bundling is Linux-only.
@@ -106,7 +106,7 @@ Translations
 - The device ratings shown on the Text-to-speech Models page were measured on that one machine. Other hardware may rank devices differently.
 - Windows and macOS are not supported by these features yet.
 
-## Relationship to upstream
+### Relationship to upstream
 
 - Base version: upstream v0.10.0.
 - New settings keys, all with serde defaults so existing stores load unchanged: `local_llm_model_id`, `local_llm_styling`, `local_llm_structure`, `local_llm_context`, `local_llm_threads` (default 4), `history_compare_view` (default `diff`), `tts_model_id` (default `pocket-en`), `tts_voice` (a map of model to voice), `tts_speed` (default 1.0), `tts_pitch_semitones` (default 0), `tts_output_device`, `tts_read_code_blocks` (default off) and `tts_run_on` (a map of model to Auto, CPU, GPU or NPU). A new post-processing provider with id `local_llm` and a new shortcut binding `read_aloud` are added.
