@@ -24,6 +24,10 @@ pub struct ModelEntry {
     pub display_name: &'static str,
     pub attribution: &'static str,
     pub card_url: &'static str,
+    pub license: &'static str,
+    pub license_url: &'static str,
+    /// i18n key for an extra licence term shown under the licence link.
+    pub license_note: Option<&'static str>,
     pub backend: BackendKind,
     pub file_name: &'static str,
     pub url: &'static str,
@@ -39,6 +43,9 @@ pub const MODELS: &[ModelEntry] = &[ModelEntry {
     display_name: "S1-mini by Superwhisper",
     attribution: "S1-mini by Superwhisper",
     card_url: "https://huggingface.co/superwhisper/s1-mini-GGUF",
+    license: "Apache-2.0",
+    license_url: "https://huggingface.co/superwhisper/s1-mini-GGUF/blob/34add00a48a2e5d24e5a4ee5405a99620a3a240c/LICENSE",
+    license_note: Some("settings.postProcessing.localLlm.licenseNotes.s1Name"),
     backend: BackendKind::LlamaServer,
     file_name: "s1-mini-q4_k_m.gguf",
     url: "https://huggingface.co/superwhisper/s1-mini-GGUF/resolve/34add00a48a2e5d24e5a4ee5405a99620a3a240c/s1-mini-q4_k_m.gguf",
@@ -50,6 +57,7 @@ pub const MODELS: &[ModelEntry] = &[ModelEntry {
 ModelEntry {
     id: "quill-0.8b-q4km", display_name: "Quill 0.8B",
     attribution: "Quill by Quobi", card_url: "https://huggingface.co/Quobi/Quill",
+    license: "Apache-2.0", license_url: "https://huggingface.co/Quobi/Quill/blob/4cc2cc3c8e7ea9ee69126becd55be23a3a949899/README.md", license_note: None,
     backend: BackendKind::LlamaServer, file_name: "quill-0.8b-Q4_K_M.gguf",
     url: "https://huggingface.co/Quobi/Quill/resolve/4cc2cc3c8e7ea9ee69126becd55be23a3a949899/quill-0.8b-Q4_K_M.gguf",
     sha256: "aa54d6f6108d66e4b60a57bdc04ecca6e84e073504918a64b41ac4a0f816f16d", size_bytes: 529296832,
@@ -58,6 +66,7 @@ ModelEntry {
 ModelEntry {
     id: "quill-2b-q4km", display_name: "Quill 2B",
     attribution: "Quill by Quobi", card_url: "https://huggingface.co/Quobi/Quill",
+    license: "Apache-2.0", license_url: "https://huggingface.co/Quobi/Quill/blob/4cc2cc3c8e7ea9ee69126becd55be23a3a949899/README.md", license_note: None,
     backend: BackendKind::LlamaServer, file_name: "quill-2b-Q4_K_M.gguf",
     url: "https://huggingface.co/Quobi/Quill/resolve/4cc2cc3c8e7ea9ee69126becd55be23a3a949899/quill-2b-Q4_K_M.gguf",
     sha256: "b877a22b773d2aac40b3c642c24f1cbbb0b3f1d42cbd3c6eb936533719317196", size_bytes: 1274396096,
@@ -66,6 +75,7 @@ ModelEntry {
 ModelEntry {
     id: "qwen3-4b-instruct-2507-q4km", display_name: "Qwen3-4B-Instruct-2507",
     attribution: "Qwen by Alibaba, GGUF by Unsloth", card_url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF",
+    license: "Apache-2.0", license_url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/blob/a06e946bb6b655725eafa393f4a9745d460374c9/README.md", license_note: None,
     backend: BackendKind::LlamaServer, file_name: "Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
     url: "https://huggingface.co/unsloth/Qwen3-4B-Instruct-2507-GGUF/resolve/a06e946bb6b655725eafa393f4a9745d460374c9/Qwen3-4B-Instruct-2507-Q4_K_M.gguf",
     sha256: "3605803b982cb64aead44f6c1b2ae36e3acdb41d8e46c8a94c6533bc4c67e597", size_bytes: 2497281120,
@@ -75,6 +85,7 @@ ModelEntry {
     id: "muesli-2b-q4km", display_name: "Muesli 2B",
     attribution: "Muesli cleanup v12 by Muesli-HQ, based on Qwen3.5-2B by Alibaba",
     card_url: "https://huggingface.co/Muesli-HQ/qwen35-2b-muesli-cleanup-v12-gguf",
+    license: "Apache-2.0", license_url: "https://huggingface.co/Muesli-HQ/qwen35-2b-muesli-cleanup-v12-gguf/blob/e35af097be4f17d3673515fb321ce19aa300faf6/README.md", license_note: None,
     backend: BackendKind::LlamaServer, file_name: "qwen35-2b-muesli-v12-Q4_K_M.gguf",
     url: "https://huggingface.co/Muesli-HQ/qwen35-2b-muesli-cleanup-v12-gguf/resolve/e35af097be4f17d3673515fb321ce19aa300faf6/qwen35-2b-muesli-v12-Q4_K_M.gguf",
     sha256: "2d59d2118170e0170fa294d71eba0a701c4f26063f284f68a8bed880322c4143", size_bytes: 1274396096,
@@ -180,6 +191,63 @@ mod tests {
             model_path(Path::new("/data/models/llm"), m),
             PathBuf::from("/data/models/llm/muesli-2b-q4km/qwen35-2b-muesli-v12-Q4_K_M.gguf")
         );
+    }
+
+    fn commit_of(url: &str, marker: &str) -> String {
+        url.split(marker)
+            .nth(1)
+            .and_then(|rest| rest.split('/').next())
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    #[test]
+    fn registry_licenses_are_recorded_and_pinned_to_the_download_commit() {
+        for m in MODELS {
+            assert!(!m.license.is_empty(), "{}: license must be set", m.id);
+            assert!(
+                m.license_url.starts_with("https://huggingface.co/"),
+                "{}: license_url must be a Hugging Face URL",
+                m.id
+            );
+            let license_commit = commit_of(m.license_url, "/blob/");
+            assert_eq!(
+                license_commit.len(),
+                40,
+                "{}: license_url must pin a 40-hex commit",
+                m.id
+            );
+            assert!(license_commit.chars().all(|c| c.is_ascii_hexdigit()));
+            assert_eq!(
+                license_commit,
+                commit_of(m.url, "/resolve/"),
+                "{}: license_url commit must equal the download commit",
+                m.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_license_note_key_exists_in_the_english_locale() {
+        let locale: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../src/i18n/locales/en/translation.json"
+        ))
+        .expect("english locale is valid JSON");
+        let mut notes = 0;
+        for m in MODELS {
+            let Some(key) = m.license_note else { continue };
+            notes += 1;
+            let found = key
+                .split('.')
+                .try_fold(&locale, |node, part| node.get(part))
+                .and_then(|node| node.as_str());
+            assert!(
+                found.is_some_and(|text| !text.is_empty()),
+                "{}: license_note key {key} must exist in the english locale",
+                m.id
+            );
+        }
+        assert!(notes > 0, "at least one entry carries a license note");
     }
 
     #[test]

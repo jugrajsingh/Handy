@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   commands,
   type LocalLlmContext,
@@ -12,6 +11,7 @@ import { Dropdown, SettingContainer } from "@/components/ui";
 import { Alert } from "../../ui/Alert";
 import { useSettings } from "../../../hooks/useSettings";
 import { useLocalLlmStatus } from "../../../hooks/useLocalLlmStatus";
+import { LocalLlmAttribution } from "./LocalLlmAttribution";
 import { LocalLlmModelList } from "./LocalLlmModelList";
 import { createLocalLlmActions } from "./localLlmActions";
 import { isLocalLlmBusy } from "./localLlmRowActions";
@@ -224,21 +224,7 @@ export const LocalLlmSettings: React.FC = () => {
         </>
       )}
 
-      {selected && (
-        <div className="px-4 py-2 text-xs text-mid-gray">
-          <button
-            type="button"
-            className="underline"
-            onClick={() =>
-              void openUrl(selected.card_url).catch((error: unknown) => {
-                console.error("Failed to open local LLM model card:", error);
-              })
-            }
-          >
-            {selected.attribution}
-          </button>
-        </div>
-      )}
+      {selected && <LocalLlmAttribution model={selected} />}
     </>
   );
 };

@@ -767,6 +767,9 @@
             "email": "Email"
           }
         },
+        "licenseNotes": {
+          "s1Name": "Apache-2.0 with one added term: the model must always be named \"S1-mini\" by \"Superwhisper\", with that exact capitalization."
+        },
         "promptRequired": "Select a non-empty Handy prompt in the Prompts group. Until then, post-processing is skipped and the raw transcript is used.",
         "promptHidden": "This model uses its own fixed prompt and the Styling, Structure and Context settings above, so the prompt editor is hidden."
       }

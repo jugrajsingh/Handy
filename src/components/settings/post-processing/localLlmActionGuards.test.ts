@@ -25,6 +25,9 @@ const readyAlternative: LocalLlmModelInfo = {
   downloaded: true,
   attribution: "Test",
   card_url: "https://example.com",
+  license: "Apache-2.0",
+  license_url: "https://example.com/license",
+  license_note: null,
   size_bytes: 1,
   prompt_style: "s1_control_line",
 };

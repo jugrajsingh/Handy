@@ -36,6 +36,10 @@ test("Qwen download remains owned after footer selection changes", async () => {
     downloaded: true,
     attribution: "Superwhisper",
     card_url: "https://huggingface.co/superwhisper/s1-mini-GGUF",
+    license: "Apache-2.0",
+    license_url:
+      "https://huggingface.co/superwhisper/s1-mini-GGUF/blob/34add00a48a2e5d24e5a4ee5405a99620a3a240c/LICENSE",
+    license_note: "settings.postProcessing.localLlm.licenseNotes.s1Name",
     size_bytes: 484219808,
     prompt_style: "s1_control_line",
   };

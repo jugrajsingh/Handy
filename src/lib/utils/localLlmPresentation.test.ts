@@ -20,6 +20,9 @@ const model: LocalLlmModelInfo = {
   downloaded: true,
   attribution: "Superwhisper",
   card_url: "https://superwhisper.com",
+  license: "Apache-2.0",
+  license_url: "https://example.com/license",
+  license_note: null,
   size_bytes: 484219808,
   prompt_style: "s1_control_line",
 };

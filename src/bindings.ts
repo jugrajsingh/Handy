@@ -1557,7 +1557,7 @@ export type LocalLlmContext = "general" | "email"
 /**
  * One registry entry as the UI sees it.
  */
-export type LocalLlmModelInfo = { id: string; display_name: string; attribution: string; card_url: string; size_bytes: number; prompt_style: PromptStyle; downloaded: boolean }
+export type LocalLlmModelInfo = { id: string; display_name: string; attribution: string; card_url: string; license: string; license_url: string; license_note: string | null; size_bytes: number; prompt_style: PromptStyle; downloaded: boolean }
 /**
  * State name as sent to the UI.
  */
