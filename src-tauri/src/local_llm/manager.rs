@@ -1523,7 +1523,11 @@ pub(crate) mod tests {
             lock(&h.fake).start_results.push_back(Err(error.clone()));
         }
         for error in errors {
-            assert_eq!(h.manager.ensure_started(&h.settings), Err(error.clone()));
+            assert_eq!(
+                h.manager.ensure_started(&h.settings),
+                Err(error.clone()),
+                "each scripted start must report its own error"
+            );
         }
     }
 
@@ -1539,9 +1543,40 @@ pub(crate) mod tests {
         lock(&h.manager.inner).retry_at = Some(Instant::now());
     }
 
+    fn count_verifications(h: &mut Harness) -> Arc<std::sync::atomic::AtomicUsize> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = calls.clone();
+        Arc::get_mut(&mut h.manager).unwrap().verify = Arc::new(move |_, _, _| {
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(true)
+        });
+        calls
+    }
+
+    /// Moves the model's mtime so a cached verification no longer answers for it.
+    fn invalidate_verification_identity(h: &Harness) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(&h.model_file)
+            .unwrap();
+        let modified = file.metadata().unwrap().modified().unwrap();
+        file.set_modified(modified + Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[test]
+    fn retry_production_cooldown_is_five_minutes() {
+        assert_eq!(
+            ManagerConfig::default().retry_cooldown,
+            Duration::from_secs(300),
+            "the production retry cooldown must be 5 minutes"
+        );
+    }
+
     #[test]
     fn retry_three_timeouts_wait_for_the_cooldown_without_a_spawn() {
-        let h = harness();
+        let mut h = harness();
+        let hashes = count_verifications(&mut h);
         let before = Instant::now();
         fail_starts(&h, &three_timeouts());
         let after = Instant::now();
@@ -1552,6 +1587,8 @@ pub(crate) mod tests {
             "the retry time must be one cooldown after the third timeout"
         );
         assert_eq!(state(&h), LocalLlmStateKind::Failed);
+        assert_eq!(hashes.load(Ordering::SeqCst), 1, "the streak hashes once");
+        invalidate_verification_identity(&h);
         for _ in 0..2 {
             assert!(
                 matches!(
@@ -1562,9 +1599,41 @@ pub(crate) mod tests {
             );
         }
         assert_eq!(
+            hashes.load(Ordering::SeqCst),
+            1,
+            "no verification before the cooldown"
+        );
+        assert_eq!(
             lock(&h.fake).loads,
             MAX_FAILED_STARTS,
             "no spawn before the cooldown"
+        );
+        expire_cooldown(&h);
+        fail_starts(&h, &[LocalLlmError::StartTimeout]);
+        assert_eq!(
+            hashes.load(Ordering::SeqCst),
+            2,
+            "the cooldown must allow one verification"
+        );
+        assert_eq!(
+            lock(&h.fake).loads,
+            MAX_FAILED_STARTS + 1,
+            "the cooldown must allow one load"
+        );
+        invalidate_verification_identity(&h);
+        assert!(matches!(
+            h.manager.ensure_started(&h.settings),
+            Err(LocalLlmError::Failed(_))
+        ));
+        assert_eq!(
+            hashes.load(Ordering::SeqCst),
+            2,
+            "a re-armed cooldown must not verify again"
+        );
+        assert_eq!(
+            lock(&h.fake).loads,
+            MAX_FAILED_STARTS + 1,
+            "a re-armed cooldown must not load again"
         );
     }
 
@@ -1573,16 +1642,34 @@ pub(crate) mod tests {
         let h = harness();
         fail_starts(&h, &three_timeouts());
         expire_cooldown(&h);
-        assert_eq!(h.manager.ensure_started(&h.settings), Ok(()));
+        assert_eq!(
+            h.manager.ensure_started(&h.settings),
+            Ok(()),
+            "the first call after the cooldown must start again"
+        );
         assert_eq!(
             lock(&h.fake).loads,
             MAX_FAILED_STARTS + 1,
             "exactly one start per cooldown"
         );
         assert_eq!(state(&h), LocalLlmStateKind::Ready);
-        let inner = lock(&h.manager.inner);
-        assert_eq!(inner.failed_starts, 0, "a good start resets the strikes");
-        assert!(inner.retry_at.is_none(), "a good start clears the timer");
+        assert_eq!(
+            lock(&h.manager.inner).failed_starts,
+            0,
+            "a good start resets the strikes"
+        );
+    }
+
+    /// `unload` moves `Failed` to `Unloaded` and leaves the timer: the one real stale timer.
+    #[test]
+    fn retry_good_start_clears_a_timer_left_by_unload() {
+        let h = harness();
+        fail_starts(&h, &three_timeouts());
+        h.manager.unload();
+        assert_eq!(state(&h), LocalLlmStateKind::Unloaded);
+        assert!(retry_at(&h).is_some(), "unload must leave the timer stale");
+        assert_eq!(h.manager.ensure_started(&h.settings), Ok(()));
+        assert!(retry_at(&h).is_none(), "a good start clears the timer");
     }
 
     /// Manager over the real backend; its fake binary appends a line per spawn to the returned file.
