@@ -5,7 +5,10 @@ import i18next from "i18next";
 import { initReactI18next } from "react-i18next";
 import en from "../../../i18n/locales/en/translation.json";
 import type { LocalLlmModelInfo } from "@/bindings";
-import { LocalLlmAttribution } from "./LocalLlmAttribution";
+import {
+  LocalLlmAttribution,
+  LocalLlmAttributionView,
+} from "./LocalLlmAttribution";
 await i18next.use(initReactI18next).init({
   lng: "en",
   resources: { en: { translation: en } },
@@ -38,3 +41,39 @@ const withoutNote = render({ ...s1, license_note: null });
 assert.ok(withoutNote.includes(">Apache-2.0</button>"));
 assert.ok(!withoutNote.includes("<p"));
 assert.ok(!withoutNote.includes("added term"));
+
+const buttons = (node: React.ReactNode): React.ReactElement<ButtonProps>[] => {
+  if (!React.isValidElement<{ children?: React.ReactNode }>(node)) return [];
+  const own =
+    node.type === "button" ? [node as React.ReactElement<ButtonProps>] : [];
+  return [
+    ...own,
+    ...React.Children.toArray(node.props.children).flatMap(buttons),
+  ];
+};
+interface ButtonProps {
+  onClick: () => void;
+  children?: React.ReactNode;
+}
+const press = (label: string) => {
+  const opened: [string, string][] = [];
+  const tree = LocalLlmAttributionView({
+    model: s1,
+    note: null,
+    open: (url, what) => opened.push([url, what]),
+  });
+  const found = buttons(tree).filter(
+    (button) => button.props.children === label,
+  );
+  assert.equal(found.length, 1, `one ${label} button`);
+  found[0].props.onClick();
+  return opened;
+};
+
+assert.notEqual(s1.license_url, s1.card_url);
+assert.deepEqual(press(s1.license), [
+  [s1.license_url, "local LLM model license"],
+]);
+assert.deepEqual(press(s1.attribution), [
+  [s1.card_url, "local LLM model card"],
+]);
