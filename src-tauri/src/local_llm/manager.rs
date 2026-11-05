@@ -1,5 +1,7 @@
 //! Lifecycle of the local model: warm-up, serial requests, idle unload,
-//! crash restart and the failed-start policy. Verification runs outside the backend mutex.
+//! crash restart and the failed-start policy (three failed starts in a row enter `Failed`;
+//! a third failure that is a start timeout earns one retry per cooldown, any other third
+//! failure lasts till `reset_failure`). Verification runs outside the backend mutex.
 
 use super::backend::{BackendOpts, GenerateRequest, KillSwitch, TextModelBackend};
 use super::registry::{self, ModelEntry, PromptStyle};
@@ -13,7 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 
-/// Consecutive failed starts before the manager stops trying.
+/// Consecutive failed starts before the manager stops trying. When the last one is a start
+/// timeout, `ManagerConfig::retry_cooldown` later one more start is allowed; any other last
+/// failure stays failed till `reset_failure`.
 pub const MAX_FAILED_STARTS: u32 = 3;
 
 /// Timings, overridable in tests.
@@ -21,6 +25,8 @@ pub const MAX_FAILED_STARTS: u32 = 3;
 pub struct ManagerConfig {
     pub start_timeout: Duration,
     pub idle_tick: Duration,
+    /// How long `Failed` lasts after a start timeout before one more start is allowed.
+    pub retry_cooldown: Duration,
 }
 
 impl Default for ManagerConfig {
@@ -28,6 +34,7 @@ impl Default for ManagerConfig {
         Self {
             start_timeout: Duration::from_secs(10),
             idle_tick: Duration::from_secs(10),
+            retry_cooldown: Duration::from_secs(5 * 60),
         }
     }
 }
@@ -81,6 +88,8 @@ struct Inner {
     last_used: Instant,
     failed_starts: u32,
     last_start_failure: Option<(Instant, LocalLlmError)>,
+    /// When a `Failed` state caused by a start timeout may start once more.
+    retry_at: Option<Instant>,
 }
 
 type VerificationResult = Result<bool, LocalLlmError>;
@@ -337,6 +346,7 @@ impl LocalLlmManager {
                 last_used: Instant::now(),
                 failed_starts: 0,
                 last_start_failure: None,
+                retry_at: None,
             }),
             status: Mutex::new(LocalLlmStatus {
                 state: LocalLlmStateKind::Unloaded,
@@ -538,6 +548,7 @@ impl LocalLlmManager {
             let mut inner = lock(&self.inner);
             inner.failed_starts = 0;
             inner.last_start_failure = None;
+            inner.retry_at = None;
             if matches!(inner.state, LocalLlmState::Failed { .. }) {
                 self.set_state(&mut inner, LocalLlmState::Unloaded, None);
             }
@@ -686,7 +697,14 @@ impl LocalLlmManager {
             return Err(LocalLlmError::Failed("shutting down".into()));
         }
         if let LocalLlmState::Failed { reason } = &inner.state {
-            return Err(LocalLlmError::Failed(reason.clone()));
+            // A start timeout earns one probe start per cooldown. The probe is the strike that
+            // reaches the limit again: a timeout re-arms the timer, any other error is sticky.
+            if !inner.retry_at.is_some_and(|at| Instant::now() >= at) {
+                return Err(LocalLlmError::Failed(reason.clone()));
+            }
+            inner.retry_at = None;
+            inner.failed_starts = MAX_FAILED_STARTS - 1;
+            self.set_state(inner, LocalLlmState::Unloaded, None);
         }
         // A start that failed while this call waited for the lock answers it too.
         if let Some((at, err)) = &inner.last_start_failure {
@@ -750,6 +768,7 @@ impl LocalLlmManager {
                 inner.loaded = Some(entry);
                 inner.failed_starts = 0;
                 inner.last_start_failure = None;
+                inner.retry_at = None;
                 inner.last_used = Instant::now();
                 self.set_state_for(inner, LocalLlmState::Ready, Some(entry.id), None);
                 Ok(())
@@ -760,6 +779,8 @@ impl LocalLlmManager {
                 inner.failed_starts += 1;
                 inner.last_start_failure = Some((Instant::now(), e.clone()));
                 let next = if inner.failed_starts >= MAX_FAILED_STARTS {
+                    inner.retry_at = (e == LocalLlmError::StartTimeout)
+                        .then(|| Instant::now() + self.config.retry_cooldown);
                     LocalLlmState::Failed {
                         reason: e.to_string(),
                     }
@@ -1019,6 +1040,7 @@ pub(crate) mod tests {
             ManagerConfig {
                 start_timeout: Duration::from_secs(2),
                 idle_tick: Duration::from_secs(3600),
+                retry_cooldown: Duration::from_secs(3600),
             },
         );
         manager.verify = Arc::new(|_, _, _| Ok(true));
@@ -1494,6 +1516,164 @@ pub(crate) mod tests {
         );
     }
 
+    /// Drives `ensure_started` through one failed start per error and returns after the last.
+    fn fail_starts(h: &Harness, errors: &[LocalLlmError]) {
+        for error in errors {
+            lock(&h.fake).start_results.push_back(Err(error.clone()));
+        }
+        for error in errors {
+            assert_eq!(h.manager.ensure_started(&h.settings), Err(error.clone()));
+        }
+    }
+
+    fn three_timeouts() -> Vec<LocalLlmError> {
+        vec![LocalLlmError::StartTimeout; MAX_FAILED_STARTS as usize]
+    }
+
+    fn retry_at(h: &Harness) -> Option<Instant> {
+        lock(&h.manager.inner).retry_at
+    }
+
+    fn expire_cooldown(h: &Harness) {
+        lock(&h.manager.inner).retry_at = Some(Instant::now());
+    }
+
+    #[test]
+    fn retry_three_timeouts_wait_for_the_cooldown_without_a_spawn() {
+        let h = harness();
+        let before = Instant::now();
+        fail_starts(&h, &three_timeouts());
+        let after = Instant::now();
+        let cooldown = h.manager.config.retry_cooldown;
+        let at = retry_at(&h).expect("a timeout streak must schedule a retry");
+        assert!(
+            at >= before + cooldown && at <= after + cooldown,
+            "the retry time must be one cooldown after the third timeout"
+        );
+        assert_eq!(state(&h), LocalLlmStateKind::Failed);
+        for _ in 0..2 {
+            assert!(
+                matches!(
+                    h.manager.ensure_started(&h.settings),
+                    Err(LocalLlmError::Failed(_))
+                ),
+                "Failed must answer before the cooldown"
+            );
+        }
+        assert_eq!(
+            lock(&h.fake).loads,
+            MAX_FAILED_STARTS,
+            "no spawn before the cooldown"
+        );
+    }
+
+    #[test]
+    fn retry_one_spawn_after_the_cooldown_and_success_clears() {
+        let h = harness();
+        fail_starts(&h, &three_timeouts());
+        expire_cooldown(&h);
+        assert_eq!(h.manager.ensure_started(&h.settings), Ok(()));
+        assert_eq!(
+            lock(&h.fake).loads,
+            MAX_FAILED_STARTS + 1,
+            "exactly one start per cooldown"
+        );
+        assert_eq!(state(&h), LocalLlmStateKind::Ready);
+        let inner = lock(&h.manager.inner);
+        assert_eq!(inner.failed_starts, 0, "a good start resets the strikes");
+        assert!(inner.retry_at.is_none(), "a good start clears the timer");
+    }
+
+    #[test]
+    fn retry_probe_timeout_rearms_without_a_second_spawn() {
+        let h = harness();
+        fail_starts(&h, &three_timeouts());
+        expire_cooldown(&h);
+        fail_starts(&h, &[LocalLlmError::StartTimeout]);
+        assert_eq!(lock(&h.fake).loads, MAX_FAILED_STARTS + 1);
+        assert_eq!(
+            state(&h),
+            LocalLlmStateKind::Failed,
+            "a probe timeout must fail the manager again"
+        );
+        let at = retry_at(&h).expect("a probe timeout must schedule a fresh retry");
+        assert!(at > Instant::now(), "the fresh retry time lies ahead");
+        assert!(matches!(
+            h.manager.ensure_started(&h.settings),
+            Err(LocalLlmError::Failed(_))
+        ));
+        assert_eq!(
+            lock(&h.fake).loads,
+            MAX_FAILED_STARTS + 1,
+            "no second spawn in the same cooldown"
+        );
+    }
+
+    #[test]
+    fn retry_three_crashes_never_get_a_retry_time() {
+        let h = harness();
+        fail_starts(&h, &vec![LocalLlmError::StartFailed("boom".into()); 3]);
+        assert_eq!(state(&h), LocalLlmStateKind::Failed);
+        assert!(
+            retry_at(&h).is_none(),
+            "a crash streak must not schedule a retry"
+        );
+        assert!(matches!(
+            h.manager.ensure_started(&h.settings),
+            Err(LocalLlmError::Failed(_))
+        ));
+        assert_eq!(
+            lock(&h.fake).loads,
+            3,
+            "a crash streak must not spawn again"
+        );
+    }
+
+    #[test]
+    fn retry_probe_crash_after_timeouts_is_sticky() {
+        let h = harness();
+        fail_starts(&h, &three_timeouts());
+        expire_cooldown(&h);
+        fail_starts(&h, &[LocalLlmError::StartFailed("boom".into())]);
+        assert_eq!(
+            state(&h),
+            LocalLlmStateKind::Failed,
+            "a probe crash must fail the manager again after one start"
+        );
+        assert!(
+            retry_at(&h).is_none(),
+            "a probe crash must not schedule a retry"
+        );
+        assert!(matches!(
+            h.manager.ensure_started(&h.settings),
+            Err(LocalLlmError::Failed(_))
+        ));
+        assert_eq!(lock(&h.fake).loads, MAX_FAILED_STARTS + 1);
+    }
+
+    #[test]
+    fn retry_the_last_strike_decides_in_a_mixed_streak() {
+        let crash = LocalLlmError::StartFailed("boom".into());
+        let timeout = LocalLlmError::StartTimeout;
+        let h = harness();
+        fail_starts(&h, &[timeout.clone(), timeout.clone(), crash.clone()]);
+        assert!(retry_at(&h).is_none(), "a final crash is sticky");
+        let h = harness();
+        fail_starts(&h, &[crash.clone(), crash, timeout]);
+        assert!(retry_at(&h).is_some(), "a final timeout earns a retry");
+    }
+
+    #[test]
+    fn retry_reset_failure_clears_the_timer() {
+        let h = harness();
+        fail_starts(&h, &three_timeouts());
+        assert!(retry_at(&h).is_some());
+        h.manager.reset_failure();
+        assert!(retry_at(&h).is_none(), "reset must clear the retry timer");
+        assert_eq!(lock(&h.manager.inner).failed_starts, 0);
+        assert_eq!(state(&h), LocalLlmStateKind::Unloaded);
+    }
+
     #[cfg(unix)]
     #[test]
     fn fix2_swap_during_hash_cannot_cache_another_files_result() {
@@ -1565,6 +1745,7 @@ pub(crate) mod tests {
             ManagerConfig {
                 start_timeout: Duration::from_secs(10),
                 idle_tick: Duration::from_secs(10),
+                retry_cooldown: Duration::from_secs(300),
             },
         );
         let root = tempfile::tempdir().unwrap();

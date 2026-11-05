@@ -81,6 +81,7 @@ fn real_server_matches_goldens_and_is_gone_after_unload() {
         ManagerConfig {
             start_timeout: Duration::from_secs(30),
             idle_tick: Duration::from_secs(3600),
+            retry_cooldown: Duration::from_secs(300),
         },
     ));
     let mut settings = get_default_settings();
@@ -193,6 +194,7 @@ fn plain_system_prompt_real_server() {
         ManagerConfig {
             start_timeout: Duration::from_secs(30),
             idle_tick: Duration::from_secs(3600),
+            retry_cooldown: Duration::from_secs(300),
         },
     );
     let mut settings = get_default_settings();
