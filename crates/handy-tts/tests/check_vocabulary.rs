@@ -92,6 +92,22 @@ fn check_vocabulary_rejects_unsafe_replacements() {
         );
         std::fs::remove_file(path).expect("remove the scratch vocabulary");
     }
+
+    let acronym = scratch_file(
+        "unsafe-acronym",
+        r#"{"version":1,"acronyms":["C++"],"examples":[{"text":"C++","spoken":"C + +"}]}"#,
+    );
+    let output = run(&[acronym.to_str().expect("utf-8 path")]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "stdout: {stdout}");
+    assert!(!stdout.contains("PASS C++"), "{stdout}");
+    assert!(
+        stderr.contains("\"C++\""),
+        "must name the acronym: {stderr}"
+    );
+    assert!(stderr.contains("only hold letters and digits"), "{stderr}");
+    std::fs::remove_file(acronym).expect("remove the scratch vocabulary");
 }
 
 #[test]
@@ -114,5 +130,39 @@ fn check_vocabulary_edge_examples_pass() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(output.status.success(), "edge examples failed: {stdout}");
     assert!(stdout.contains("PASS **lib.sh.**"));
+    std::fs::remove_file(path).expect("remove the scratch vocabulary");
+}
+
+#[test]
+fn check_vocabulary_review_examples_pass() {
+    let path = scratch_file(
+        "review-r2",
+        r#"{"version":1,"terms":{"tool":{"say":"utility","match":"prefix"}},"examples":[
+            {"text":"lib.Sh","spoken":"lib dot S H"},
+            {"text":"notes.Md","spoken":"notes dot markdown"},
+            {"text":"dir/lib.Sh","spoken":"dir slash lib dot S H"},
+            {"text":"archive.001","spoken":"archive dot 0 0 1"},
+            {"text":"archive.001:12","spoken":"archive dot 0 0 1 at line 12"},
+            {"text":"end.Next","spoken":"end.Next"},
+            {"text":"1.5x","spoken":"1.5x"},
+            {"text":"tool-name","spoken":"utility dash name"},
+            {"text":"tool@name","spoken":"utility at name"}]}"#,
+    );
+    let output = run(&[path.to_str().expect("utf-8 path")]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "review examples failed: {stdout}");
+    for text in [
+        "lib.Sh",
+        "notes.Md",
+        "dir/lib.Sh",
+        "archive.001",
+        "tool-name",
+        "tool@name",
+    ] {
+        assert!(
+            stdout.contains(&format!("PASS {text}\n")),
+            "{text}: {stdout}"
+        );
+    }
     std::fs::remove_file(path).expect("remove the scratch vocabulary");
 }

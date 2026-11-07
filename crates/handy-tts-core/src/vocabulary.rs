@@ -21,6 +21,17 @@ const SENTENCE_PUNCTUATION: [char; 6] = ['.', ',', ';', ':', '!', '?'];
 const WRAPPERS: [char; 9] = ['(', ')', '[', ']', '{', '}', '\'', '"', '`'];
 const CLOSERS: [char; 5] = [')', ']', '}', '\'', '"'];
 
+/// Words for symbols the vocabulary has no entry for; any other symbol is silent.
+const FALLBACK_SYMBOLS: [(char, &str); 7] = [
+    ('@', "at"),
+    ('+', "plus"),
+    ('#', "hash"),
+    ('&', "and"),
+    ('=', "equals"),
+    (':', "colon"),
+    ('-', "dash"),
+];
+
 static BUILTIN: LazyLock<Vocabulary> = LazyLock::new(|| {
     // The embedded file is validated by `builtin_vocabulary_parses` and
     // `every_builtin_example_passes`; an unparsable one degrades to an empty vocabulary.
@@ -301,28 +312,29 @@ fn validate_spoken(
     }
 }
 
-/// Turns captured source text into speakable words: symbols with a vocabulary word are
-/// spoken, every other character that is not a letter or digit becomes a space.
-fn speakable(text: &str, symbols: &BTreeMap<String, String>) -> String {
-    let mut spaced = String::new();
-    for c in text.chars() {
-        if c.is_alphanumeric() {
+/// The output contract, applied to every token whose spoken form differs from its source: each
+/// remaining symbol becomes its word (vocabulary `symbols`, then `FALLBACK_SYMBOLS`) or is
+/// dropped, and runs of spaces collapse. Only letters, digits, single spaces and a dot between
+/// two digits (`1.5`, `version 1.2.3`) come out.
+fn speakable(raw: &str, vocabulary: &Vocabulary) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut spaced = String::with_capacity(raw.len());
+    for (index, &c) in chars.iter().enumerate() {
+        let digit_dot = c == '.'
+            && index > 0
+            && chars[index - 1].is_ascii_digit()
+            && chars.get(index + 1).is_some_and(char::is_ascii_digit);
+        if c.is_alphanumeric() || digit_dot {
             spaced.push(c);
             continue;
         }
         spaced.push(' ');
-        if let Some(word) = symbols.get(c.to_string().as_str()) {
+        if let Some(word) = vocabulary.symbol_word(c) {
             spaced.push_str(word);
             spaced.push(' ');
         }
     }
-    let mut collapsed = String::new();
-    for c in spaced.chars() {
-        if c != ' ' || !collapsed.ends_with(' ') {
-            collapsed.push(c);
-        }
-    }
-    collapsed
+    spaced.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn json_error(error: &serde_json::Error) -> VocabularyError {
@@ -356,6 +368,16 @@ impl Vocabulary {
         }
         for (key, spoken) in &raw.extensions {
             validate_spoken(key, "extension", spoken, false)?;
+        }
+        for acronym in &raw.acronyms {
+            if acronym.is_empty() || !acronym.chars().all(char::is_alphanumeric) {
+                return Err(VocabularyError::Pattern {
+                    key: acronym.clone(),
+                    message: format!(
+                        "the acronym {acronym:?} is spelled letter by letter, so it may only hold letters and digits"
+                    ),
+                });
+            }
         }
         let mut terms = Vec::with_capacity(raw.terms.len());
         for (key, value) in raw.terms {
@@ -416,8 +438,18 @@ impl Vocabulary {
         }
     }
 
-    fn symbol(&self, symbol: &str) -> Option<&str> {
-        self.symbols.get(symbol).map(String::as_str)
+    /// The word for one symbol: the vocabulary's entry, else the built-in fallback.
+    fn symbol_word(&self, symbol: char) -> Option<&str> {
+        let mut key = [0_u8; 4];
+        self.symbols
+            .get(&*symbol.encode_utf8(&mut key))
+            .map(String::as_str)
+            .or_else(|| {
+                FALLBACK_SYMBOLS
+                    .iter()
+                    .find(|(fallback, _)| *fallback == symbol)
+                    .map(|(_, word)| *word)
+            })
     }
 
     fn whole_term(&self, text: &str) -> Option<&str> {
@@ -441,12 +473,12 @@ impl Vocabulary {
         }
         for (_, term) in &self.terms {
             if term.matching == TermMatch::Anywhere {
-                pieces = rewrite_raw(pieces, |raw| split_matches(raw, term, false, &self.symbols));
+                pieces = rewrite_raw(pieces, |raw| split_matches(raw, term, false));
             }
         }
         for (_, term) in &self.terms {
             if term.matching == TermMatch::Regex {
-                pieces = rewrite_raw(pieces, |raw| split_matches(raw, term, true, &self.symbols));
+                pieces = rewrite_raw(pieces, |raw| split_matches(raw, term, true));
             }
         }
         pieces
@@ -503,12 +535,9 @@ fn rewrite_raw(pieces: Vec<Piece>, rewrite: impl Fn(&str) -> Vec<Piece>) -> Vec<
         .collect()
 }
 
-fn split_matches(
-    raw: &str,
-    term: &Term,
-    expand: bool,
-    symbols: &BTreeMap<String, String>,
-) -> Vec<Piece> {
+/// Splits `raw` around the term's matches. A regex expansion copies captured source text, which
+/// may hold symbols; `speakable` turns them into words before the token is returned.
+fn split_matches(raw: &str, term: &Term, expand: bool) -> Vec<Piece> {
     let mut pieces = Vec::new();
     let mut last = 0;
     for captures in term.pattern.captures_iter(raw) {
@@ -518,14 +547,13 @@ fn split_matches(
         if found.start() > last {
             pieces.push(Piece::Raw(raw[last..found.start()].to_string()));
         }
-        let mut say = String::new();
-        if expand {
+        let say = if expand {
             let mut expanded = String::new();
             captures.expand(&term.say, &mut expanded);
-            say = speakable(&expanded, symbols);
+            expanded
         } else {
-            say.clone_from(&term.say);
-        }
+            term.say.clone()
+        };
         pieces.push(Piece::Spoken(say));
         last = found.end();
     }
@@ -622,32 +650,39 @@ fn is_abbreviation(core: &str, period_follows: bool) -> bool {
         || (period_follows && last_single)
 }
 
-/// Splits `name.ext` when the final dot part is a file extension: in the vocabulary, or 1-5
-/// alphanumerics with at least one letter. A purely numeric name needs a letter-first extension,
-/// so `3.14`, `1.5x` and `v0.10.0` stay numbers.
-fn file_extension<'a>(
-    text: &'a str,
-    vocabulary: Option<&Vocabulary>,
-) -> Option<(&'a str, &'a str)> {
+/// Digits and dots starting with a digit (`3.14`, `192.168.1.1`), optionally a decimal
+/// multiplier (`1.5x`) or a version (`v0.10.0`, `v1.2`): numbers, never file names.
+fn is_number_or_version(text: &str) -> bool {
+    let body = text
+        .strip_prefix(['v', 'V'])
+        .or_else(|| text.strip_suffix(['x', 'X']))
+        .unwrap_or(text);
+    body.starts_with(|c: char| c.is_ascii_digit())
+        && body.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// Splits `name.ext` when the final dot part is a file extension. A known extension (vocabulary
+/// `extensions`, any case) always does, even where `end.Next` style prose would otherwise win;
+/// an unknown one needs 1-5 ASCII alphanumerics after a name holding a letter. Numbers, decimal
+/// multipliers and versions are never file names.
+fn file_extension<'a>(text: &'a str, vocabulary: &Vocabulary) -> Option<(&'a str, &'a str)> {
     let (name, ext) = text.rsplit_once('.')?;
     if ext.is_empty()
         || !ext.chars().all(char::is_alphanumeric)
         || name.ends_with('.')
         || name.contains("..")
+        || is_number_or_version(text)
     {
         return None;
     }
-    let known = vocabulary.is_some_and(|v| v.extensions.contains_key(&ext.to_lowercase()));
-    let plausible = (1..=5).contains(&ext.chars().count()) && ext.chars().any(char::is_alphabetic);
-    let numeric_name = !name.is_empty() && name.chars().all(|c| c.is_ascii_digit() || c == '.');
-    if !(known || plausible)
-        || (name.is_empty() && !known)
-        || (numeric_name && !known && ext.starts_with(|c: char| c.is_ascii_digit()))
-        || is_run_on(name, ext)
-    {
-        return None;
+    if vocabulary.extensions.contains_key(&ext.to_lowercase()) {
+        return Some((name, ext));
     }
-    Some((name, ext))
+    let unknown_ok = (1..=5).contains(&ext.len())
+        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+        && name.chars().any(char::is_alphabetic)
+        && !is_run_on(name, ext);
+    unknown_ok.then_some((name, ext))
 }
 
 fn is_dotted(text: &str) -> bool {
@@ -719,7 +754,7 @@ fn has_camel_boundary(text: &str) -> bool {
 
 /// Decides which technical kind a token core is, if any. `core` has no wrapping punctuation
 /// and no `:line` suffix. Kinds follow the spec table order.
-fn classify(core: &str, vocabulary: Option<&Vocabulary>, period_follows: bool) -> Option<Kind> {
+fn classify(core: &str, vocabulary: &Vocabulary, period_follows: bool) -> Option<Kind> {
     if let Some(open) = core.find('(') {
         return is_call(core, open).then_some(Kind::Call);
     }
@@ -789,7 +824,7 @@ fn parse_line_suffix(core: &str) -> Option<(&str, &str, Option<&str>)> {
 /// Splits a `:684` or `:684:7` suffix off a path or file name. Anything else keeps its colon.
 fn split_line<'a>(
     core: &'a str,
-    vocabulary: Option<&Vocabulary>,
+    vocabulary: &Vocabulary,
 ) -> (&'a str, Option<(&'a str, Option<&'a str>)>) {
     let Some((head, line, column)) = parse_line_suffix(core) else {
         return (core, None);
@@ -804,14 +839,20 @@ fn split_line<'a>(
 }
 
 /// True when `token` is a path, file name, flag, slash command, call or identifier that the
-/// rules read in full. Prose, numbers, links and versions are not technical.
+/// rules read in full. Prose, numbers, links and versions are not technical. File extensions
+/// are judged against the built-in vocabulary.
 pub fn is_technical(token: &str) -> bool {
     let parts = split_token(token);
     if parts.core.is_empty() {
         return false;
     }
-    let (head, line) = split_line(parts.core, None);
-    classify(head, None, line.is_none() && parts.ending.starts_with('.')).is_some()
+    let (head, line) = split_line(parts.core, &BUILTIN);
+    classify(
+        head,
+        &BUILTIN,
+        line.is_none() && parts.ending.starts_with('.'),
+    )
+    .is_some()
 }
 
 fn spell(text: &str) -> String {
@@ -853,8 +894,8 @@ fn speak_run(run: &str, vocabulary: &Vocabulary, words: &mut Vec<String>) {
     }
 }
 
-/// Speaks text without slashes: alphanumeric runs become words, every other character is its
-/// symbol word (or silent when the vocabulary has none). A dot between digits stays a dot.
+/// Speaks text without slashes: alphanumeric runs become words and every other character is
+/// left as its own word for `speakable` to name. A dot between digits stays inside its number.
 fn speak_atoms(text: &str, vocabulary: &Vocabulary, words: &mut Vec<String>) {
     let chars: Vec<char> = text.chars().collect();
     let mut index = 0;
@@ -873,9 +914,7 @@ fn speak_atoms(text: &str, vocabulary: &Vocabulary, words: &mut Vec<String>) {
             let run: String = chars[start..index].iter().collect();
             speak_run(&run, vocabulary, words);
         } else {
-            if let Some(word) = vocabulary.symbol(&chars[index].to_string()) {
-                push_word(words, word);
-            }
+            words.push(chars[index].to_string());
             index += 1;
         }
     }
@@ -883,16 +922,14 @@ fn speak_atoms(text: &str, vocabulary: &Vocabulary, words: &mut Vec<String>) {
 
 fn speak_raw(raw: &str, final_piece: bool, vocabulary: &Vocabulary, words: &mut Vec<String>) {
     let split = if final_piece {
-        file_extension(raw, Some(vocabulary))
+        file_extension(raw, vocabulary)
     } else {
         None
     };
     match split {
         Some((name, ext)) => {
             speak_atoms(name, vocabulary, words);
-            if let Some(dot) = vocabulary.symbol(".") {
-                push_word(words, dot);
-            }
+            words.push(".".to_string());
             push_word(words, &speak_extension(ext, vocabulary));
         }
         None => speak_atoms(raw, vocabulary, words),
@@ -911,10 +948,8 @@ fn speak_path(text: &str, vocabulary: &Vocabulary, words: &mut Vec<String>) {
     let segments: Vec<&str> = text.split('/').collect();
     let last = segments.len() - 1;
     for (index, segment) in segments.iter().enumerate() {
-        if index > 0
-            && let Some(slash) = vocabulary.symbol("/")
-        {
-            push_word(words, slash);
+        if index > 0 {
+            words.push("/".to_string());
         }
         if segment.is_empty() {
             continue;
@@ -948,9 +983,7 @@ fn speak_core(core: &str, vocabulary: &Vocabulary) -> String {
         }
     } else if let Some((flag, value)) = core.split_once('=').filter(|_| core.starts_with('-')) {
         speak_path(flag, vocabulary, &mut words);
-        if let Some(equals) = vocabulary.symbol("=") {
-            push_word(&mut words, equals);
-        }
+        words.push("=".to_string());
         speak_path(value, vocabulary, &mut words);
     } else {
         speak_path(core, vocabulary, &mut words);
@@ -1012,33 +1045,35 @@ fn replace_versions(token: &str) -> Option<String> {
     Some(spoken)
 }
 
-/// Speaks one token the way an engineer reads it aloud. Exact `terms` apply first, then links
-/// and versions keep today's wording, then the kind rules; a token nothing applies to comes back
-/// unchanged. Trailing sentence punctuation is kept, wrapping punctuation is dropped.
-pub fn speak_technical(token: &str, vocabulary: &Vocabulary) -> String {
-    let parts = split_token(token);
-    if parts.core.is_empty() {
-        return token.to_string();
-    }
-    let core = parts.core;
-    let ending = parts.ending.as_str();
+/// What one token becomes before the output contract is applied.
+enum Spoken {
+    /// No rule applies: the token reads exactly as it was written.
+    Unchanged,
+    /// A link keeps today's "link to <host>" wording, host as written.
+    Link(String),
+    /// Words that may still hold symbols; `speakable` finishes them.
+    Words(String),
+}
+
+/// Applies the rules to a token core: exact `terms` first, then links and versions with today's
+/// wording, then the kind rules, then partial terms and acronyms on any other word.
+fn speak_parts(core: &str, period_follows: bool, vocabulary: &Vocabulary) -> Spoken {
     if let Some(say) = vocabulary.whole_term(core) {
-        return format!("{say}{ending}");
+        return Spoken::Words(say.to_string());
     }
     if core.starts_with("https://") || core.starts_with("http://") {
         let host = core.split_once("://").map_or("", |(_, rest)| {
             rest.split(['/', '?', '#']).next().unwrap_or("")
         });
-        return format!("link to {host}{ending}");
+        return Spoken::Link(host.to_string());
     }
     if !core.contains('/')
-        && let Some(versioned) = replace_versions(token)
+        && let Some(versioned) = replace_versions(core)
     {
-        return versioned;
+        return Spoken::Words(versioned);
     }
-    let (head, line) = split_line(core, Some(vocabulary));
-    let period_follows = line.is_none() && ending.starts_with('.');
-    if classify(head, Some(vocabulary), period_follows).is_some() {
+    let (head, line) = split_line(core, vocabulary);
+    if classify(head, vocabulary, line.is_none() && period_follows).is_some() {
         let mut spoken = speak_core(head, vocabulary);
         if let Some((line, column)) = line {
             let _ = write!(spoken, " at line {line}");
@@ -1046,27 +1081,40 @@ pub fn speak_technical(token: &str, vocabulary: &Vocabulary) -> String {
                 let _ = write!(spoken, " column {column}");
             }
         }
-        spoken.push_str(ending);
-        return spoken;
+        return Spoken::Words(spoken);
     }
     let pieces = vocabulary.apply_terms(core);
-    match pieces.as_slice() {
-        [Piece::Raw(raw)] => {
-            if vocabulary.acronyms.contains(raw.as_str()) {
-                format!("{}{ending}", spell(raw))
-            } else {
-                token.to_string()
-            }
+    if let [Piece::Raw(raw)] = pieces.as_slice() {
+        return if vocabulary.acronyms.contains(raw.as_str()) {
+            Spoken::Words(spell(raw))
+        } else {
+            Spoken::Unchanged
+        };
+    }
+    let mut words = Vec::new();
+    for piece in pieces {
+        match piece {
+            Piece::Spoken(spoken) => push_word(&mut words, &spoken),
+            Piece::Raw(raw) => speak_atoms(&raw, vocabulary, &mut words),
         }
-        _ => {
-            let joined: String = pieces
-                .into_iter()
-                .map(|piece| match piece {
-                    Piece::Raw(text) | Piece::Spoken(text) => text,
-                })
-                .collect();
-            format!("{joined}{ending}")
-        }
+    }
+    Spoken::Words(words.join(" "))
+}
+
+/// Speaks one token the way an engineer reads it aloud; a token nothing applies to comes back
+/// unchanged. Every other result passes through `speakable`, so it holds only letters, digits,
+/// single spaces and digit dots, followed by the token's trailing sentence punctuation; the one
+/// exemption is the host in "link to <host>". Wrapping punctuation is dropped.
+pub fn speak_technical(token: &str, vocabulary: &Vocabulary) -> String {
+    let parts = split_token(token);
+    if parts.core.is_empty() {
+        return token.to_string();
+    }
+    let ending = parts.ending.as_str();
+    match speak_parts(parts.core, ending.starts_with('.'), vocabulary) {
+        Spoken::Unchanged => token.to_string(),
+        Spoken::Link(host) => format!("link to {host}{ending}"),
+        Spoken::Words(words) => format!("{}{ending}", speakable(&words, vocabulary)),
     }
 }
 
@@ -1160,10 +1208,51 @@ mod tests {
             assert_eq!(say("2024.csv"), "2024 dot C S V");
             assert_eq!(say("file.q:12"), "file dot Q at line 12");
             assert_eq!(say("backup.7z:3:4"), "backup dot 7 Z at line 3 column 4");
+            assert_eq!(say("lib.Sh"), "lib dot S H");
+            assert_eq!(say("notes.Md"), "notes dot markdown");
+            assert_eq!(say("dir/lib.Sh"), "dir slash lib dot S H");
+            assert_eq!(say("archive.001"), "archive dot 0 0 1");
             assert_eq!(say("file.q:12."), "file dot Q at line 12.");
             assert!(is_technical("file.q"));
             assert!(is_technical("backup.7z"));
             assert!(is_technical("file.q:12"));
+        }
+
+        #[test]
+        fn known_extension_in_any_case_is_a_file_name() {
+            // Review r2 M1: a known extension wins over the `end.Next` run-on heuristic.
+            assert_eq!(say("lib.Sh"), "lib dot S H");
+            assert_eq!(say("notes.Md"), "notes dot markdown");
+            assert_eq!(say("dir/lib.Sh"), "dir slash lib dot S H");
+            assert_eq!(say("data.JSON"), "data dot jason");
+            assert_eq!(say("lib.Sh:12,"), "lib dot S H at line 12,");
+            assert_eq!(say("**notes.Md**."), "notes dot markdown.");
+            assert!(is_technical("lib.Sh"));
+            assert!(is_technical("notes.Md"));
+            assert!(!is_technical("end.Next"));
+            assert_eq!(say("end.Next"), "end.Next");
+        }
+
+        #[test]
+        fn numeric_extension_spells_its_digits() {
+            // Review r2 M2: an alphanumeric extension needs no letter when the name has one.
+            assert_eq!(say("archive.001"), "archive dot 0 0 1");
+            assert_eq!(say("archive.001:12"), "archive dot 0 0 1 at line 12");
+            assert_eq!(say("logs/archive.001,"), "logs slash archive dot 0 0 1,");
+            assert_eq!(say("part.12345"), "part dot 12345");
+            assert!(is_technical("archive.001"));
+            for prose in [
+                "3.14",
+                "1.5x",
+                "2.5X",
+                "v0.10.0",
+                "v1.2",
+                "192.168.1.1",
+                "0.10",
+            ] {
+                assert!(!is_technical(prose), "{prose} must not be technical");
+            }
+            assert_eq!(say("part.123456"), "part.123456");
         }
 
         #[test]
@@ -1426,6 +1515,11 @@ mod tests {
                 "crates slash x slash manager dot R S at line 12,"
             );
             assert!(is_technical("manager.rs:684"));
+            assert_eq!(say("archive.001:12"), "archive dot 0 0 1 at line 12");
+            assert_eq!(
+                say("archive.001:12:3"),
+                "archive dot 0 0 1 at line 12 column 3"
+            );
             assert_eq!(say("10:59"), "10:59");
             assert!(!is_technical("10:59"));
             assert!(!is_technical("localhost:8080"));
@@ -1547,8 +1641,8 @@ mod tests {
             for (token, expected) in [
                 ("customtool", "custom tool"),
                 ("a/b_c.zz", "a over b under score c dot zed zed"),
-                ("id#5/x", "id number 5 over x"),
-                ("id@7", "id number 7"),
+                ("id#5/x", "id number hash 5 over x"),
+                ("id@7", "id number at 7"),
             ] {
                 let spoken = speak_technical(token, &user);
                 assert_eq!(spoken, expected);
@@ -1558,6 +1652,50 @@ mod tests {
                 );
             }
             assert_eq!(speak_technical("customtool?!", &user), "custom tool?!");
+        }
+
+        #[test]
+        fn partial_terms_leave_no_symbols_behind() {
+            // Review r2 M3: the text a partial term leaves unmatched is spoken, not copied.
+            let user = with_user(
+                r#"{"version":1,"terms":{
+                    "tool":{"say":"utility","match":"prefix"},
+                    "name":{"say":"label","match":"suffix"},
+                    "mid":{"say":"middle","match":"anywhere"},
+                    "^id(.+)$":{"say":"id number $1","match":"regex"}}}"#,
+            );
+            for (token, expected) in [
+                ("tool-name", "utility dash label"),
+                ("tool@name", "utility at label"),
+                ("tool@x", "utility at x"),
+                ("tool+x", "utility plus x"),
+                ("tool&x", "utility and x"),
+                ("tool=x", "utility equals x"),
+                ("tool:x", "utility colon x"),
+                ("tool#x", "utility hash x"),
+                ("tool!x", "utility x"),
+                ("x$name", "x label"),
+                ("a@mid@b", "a at middle at b"),
+                ("id@7", "id number at 7"),
+                ("id<7>", "id number 7"),
+                ("tool-name,", "utility dash label,"),
+                ("(tool@x)?!", "utility at x?!"),
+            ] {
+                let spoken = speak_technical(token, &user);
+                assert_eq!(spoken, expected, "{token}");
+            }
+            let tool =
+                with_user(r#"{"version":1,"terms":{"tool":{"say":"utility","match":"prefix"}}}"#);
+            assert_eq!(speak_technical("tool-name", &tool), "utility dash name");
+            assert_eq!(speak_technical("tool@name", &tool), "utility at name");
+            let renamed = with_user(
+                r#"{"version":1,"symbols":{"@":"around"},
+                    "terms":{"tool":{"say":"utility","match":"prefix"}}}"#,
+            );
+            assert_eq!(
+                speak_technical("tool@name", &renamed),
+                "utility around name"
+            );
         }
 
         #[test]
@@ -1593,6 +1731,19 @@ mod tests {
                     other => panic!("{json} must be rejected, got {other:?}"),
                 }
             }
+            for acronym in ["C++", "A.I", "", "TT S"] {
+                let json = format!(r#"{{"version":1,"acronyms":["GPU","{acronym}"]}}"#);
+                match Vocabulary::parse(&json) {
+                    Err(VocabularyError::Pattern { key, message }) => {
+                        assert_eq!(key, acronym, "{json}");
+                        assert!(
+                            message.contains("only hold letters and digits"),
+                            "{message}"
+                        );
+                    }
+                    other => panic!("{json} must be rejected, got {other:?}"),
+                }
+            }
             assert!(
                 Vocabulary::parse(
                     r#"{"version":1,"terms":{"^v(\\d+)$":{"say":"version ${1} x $1","match":"regex"}}}"#
@@ -1605,6 +1756,158 @@ mod tests {
         fn builtin_vocabulary_parses() {
             assert!(Vocabulary::parse(BUILTIN_JSON).is_ok());
             assert_ne!(Vocabulary::builtin(), Vocabulary::default());
+        }
+    }
+
+    mod output_contract {
+        use super::*;
+
+        const BASES: [&str; 12] = [
+            "lib",
+            "Lib",
+            "fooBar",
+            "fixture_base",
+            "x2",
+            "42",
+            "a",
+            "HTTP",
+            "tool",
+            "toolName",
+            "myname",
+            "id7",
+        ];
+        const SEPARATORS: [char; 10] = ['/', '.', '_', '-', '@', '+', '#', ':', '~', '='];
+        const EXTENSIONS: [&str; 13] = [
+            "sh", "Sh", "MD", "Json", "csv", "q", "7z", "001", "Abc", "zz", "ZZ", "abcde", "abcdef",
+        ];
+        const LINES: [&str; 3] = ["", ":12", ":3:4"];
+        const WRAPS: [(&str, &str); 5] =
+            [("", ""), ("**", "**"), ("`", "`"), ("(", ")"), ("\"", "\"")];
+        const ENDINGS: [&str; 6] = ["", ".", ",", "?!", "...", ";"];
+        /// Characters a token may end with around its sentence punctuation.
+        const TRAILING: &str = ")]}'\"`*.,;:!?";
+        const SENTENCE: &str = ".,;:!?";
+
+        /// Deterministic token shapes: identifier pairs joined by every separator, file names
+        /// with known and unknown extensions in mixed case and line suffixes, paths, each also
+        /// wrapped in Markdown or quotes and followed by a punctuation run.
+        fn generated_tokens() -> Vec<String> {
+            let mut cores = Vec::new();
+            for first in BASES {
+                for separator in SEPARATORS {
+                    for second in BASES {
+                        cores.push(format!("{first}{separator}{second}"));
+                    }
+                }
+            }
+            for base in BASES {
+                for extension in EXTENSIONS {
+                    for line in LINES {
+                        cores.push(format!("{base}.{extension}{line}"));
+                    }
+                    cores.push(format!("dir/{base}.{extension}"));
+                }
+            }
+            let mut tokens = Vec::with_capacity(cores.len() * 2);
+            for (index, core) in cores.iter().enumerate() {
+                let (open, close) = WRAPS[index % WRAPS.len()];
+                let ending = ENDINGS[(index / WRAPS.len()) % ENDINGS.len()];
+                tokens.push(core.clone());
+                tokens.push(format!("{open}{core}{close}{ending}"));
+            }
+            tokens
+        }
+
+        /// The sentence punctuation in the run of closing characters the token ends with.
+        fn own_ending(token: &str) -> String {
+            let body = token.trim_end_matches(|c| TRAILING.contains(c));
+            token[body.len()..]
+                .chars()
+                .filter(|c| SENTENCE.contains(*c))
+                .collect()
+        }
+
+        /// Letters, digits, single inner spaces and digit dots, then the token's own ending; a
+        /// link keeps its host as written.
+        fn contract_violation(token: &str, spoken: &str) -> Option<String> {
+            let ending = own_ending(token);
+            let Some(body) = spoken.strip_suffix(ending.as_str()) else {
+                return Some(format!("does not end with {ending:?}"));
+            };
+            if token.contains("://") && body.starts_with("link to ") {
+                return None;
+            }
+            if body.starts_with(' ') || body.ends_with(' ') || body.contains("  ") {
+                return Some("has a stray space".to_string());
+            }
+            let chars: Vec<char> = body.chars().collect();
+            chars.iter().enumerate().find_map(|(index, &c)| {
+                let digit_dot = c == '.'
+                    && index > 0
+                    && chars[index - 1].is_ascii_digit()
+                    && chars.get(index + 1).is_some_and(char::is_ascii_digit);
+                (!(c.is_alphanumeric() || c == ' ' || digit_dot)).then(|| format!("holds {c:?}"))
+            })
+        }
+
+        #[test]
+        fn every_transformed_token_is_speakable() {
+            let user = with_user(
+                r##"{"version":1,
+                    "symbols":{"/":"over","@":"around","#":"number sign"},
+                    "extensions":{"zz":"zed zed","Sh":"shell","abcde":"alphabet"},
+                    "terms":{
+                        "tool":{"say":"utility","match":"prefix"},
+                        "name":{"say":"label","match":"suffix"},
+                        "Out":{"say":"out word","match":"anywhere"},
+                        "ab":{"say":"A B","match":"anywhere","case":false},
+                        "^id(.+)$":{"say":"id number $1","match":"regex"},
+                        "x(.)":{"say":"ex $1","match":"regex"}}}"##,
+            );
+            let tokens = generated_tokens();
+            assert!(tokens.len() >= 500, "only {} tokens", tokens.len());
+            let mut transformed = 0;
+            let mut violations = Vec::new();
+            for vocabulary in [&Vocabulary::builtin(), &user] {
+                for token in &tokens {
+                    let spoken = speak_technical(token, vocabulary);
+                    if spoken == *token {
+                        continue;
+                    }
+                    transformed += 1;
+                    if let Some(problem) = contract_violation(token, &spoken) {
+                        violations.push(format!("{token} -> {spoken:?}: {problem}"));
+                    }
+                }
+            }
+            assert!(
+                transformed >= 500,
+                "only {transformed} tokens were transformed"
+            );
+            assert!(
+                violations.is_empty(),
+                "{} of {transformed} transformed tokens break the contract:\n{}",
+                violations.len(),
+                violations[..violations.len().min(40)].join("\n")
+            );
+        }
+
+        #[test]
+        fn the_contract_checker_rejects_symbols() {
+            assert!(contract_violation("tool-name", "utility-name").is_some());
+            assert!(contract_violation("tool@name", "utility@name").is_some());
+            assert!(contract_violation("lib.sh,", "lib dot S H").is_some());
+            assert!(contract_violation("lib.sh", "lib  dot").is_some());
+            assert!(contract_violation("C++", "C + +").is_some());
+            assert_eq!(contract_violation("**lib.sh.**", "lib dot S H."), None);
+            assert_eq!(
+                contract_violation("--speed=1.5", "dash dash speed equals 1.5"),
+                None
+            );
+            assert_eq!(
+                contract_violation("(https://x.org/a).", "link to x.org."),
+                None
+            );
         }
     }
 }
