@@ -520,6 +520,24 @@ mod tests {
         }
 
         #[test]
+        fn stale_capture_arriving_during_a_newer_capture_is_ignored() {
+            let mut r = open_with("old text");
+            let first = capture(&mut r, Event::ReadShortcut);
+            assert!(r.apply(Event::ReadShortcut).is_empty());
+            let newer = capture(&mut r, Event::ReadShortcut);
+            assert_ne!(first, newer);
+            assert!(clipboard(&mut r, first, "stale text").is_empty());
+            assert!(r.capture_pending && r.popup_open);
+            assert_eq!(r.popup_text, "old text");
+            assert_eq!(
+                clipboard(&mut r, newer, "fresh text"),
+                [Effect::OpenPopup {
+                    text: "fresh text".into()
+                }]
+            );
+        }
+
+        #[test]
         fn read_clipboard_replaces_the_text_even_when_it_is_equal() {
             let mut r = open_with("same words");
             let ticket = capture(&mut r, Event::ReadClipboard);
