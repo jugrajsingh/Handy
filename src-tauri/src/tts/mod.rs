@@ -22,6 +22,8 @@ pub enum TtsError {
     Start,
     #[error("tts.errors.worker")]
     Worker,
+    #[error("tts.errors.busy")]
+    Busy,
     #[error("tts.errors.protocol")]
     Protocol,
     #[error("tts.errors.memory")]

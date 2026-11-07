@@ -20,6 +20,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// How long a request keeps resubmitting while every worker lane is busy.
+const BUSY_RETRY_WINDOW: Duration = Duration::from_secs(10);
+/// Pause between resubmissions of a request the worker reported busy.
+const BUSY_RETRY_DELAY: Duration = Duration::from_millis(25);
+
 #[derive(Clone)]
 pub struct ManagerConfig {
     pub root: PathBuf,
@@ -632,46 +637,57 @@ impl<B: Transport> TtsManager<B> {
                 }
                 return Err(TtsError::Cancelled);
             }
-            let (receive, timeout, generation) = {
-                let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                let cancelled = self.cancelled_ids.lock().unwrap_or_else(|p| p.into_inner());
-                if cancelled.contains(&id)
-                    || !inner.key.as_ref().is_some_and(|key| {
-                        key.model == selection.model_id && key.voice == selection.voice
-                    })
-                {
-                    return Err(TtsError::Cancelled);
-                }
-                inner.lifecycle.touch(self.started.elapsed());
-                let native = handy_tts_core::speed::plan(
-                    selection.speed,
-                    catalog::entry(&selection.model_id)
-                        .map_err(|_| TtsError::Worker)?
-                        .native_speed,
-                )
-                .map_err(|_| TtsError::Worker)?
-                .native;
-                (
-                    inner.backend.submit(id, text, Some(native)),
-                    inner.backend.synthesis_timeout(),
-                    inner.generation,
-                )
-            };
-            let result = match receive {
-                Err(error) => Err(error),
-                Ok(receive) => match receive.recv_timeout(timeout) {
-                    Ok(result) => result,
-                    Err(_) => {
-                        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-                        if inner.generation == generation {
-                            self.stop_backend(&mut inner);
-                            inner.key = None;
-                            inner.lifecycle.stopped();
-                            self.publish(State::Unloaded, Preparation::Idle);
-                        }
-                        Err(TtsError::Worker)
+            let busy_until = std::time::Instant::now() + BUSY_RETRY_WINDOW;
+            let (result, generation) = loop {
+                let (receive, timeout, generation) = {
+                    let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                    let cancelled = self.cancelled_ids.lock().unwrap_or_else(|p| p.into_inner());
+                    if cancelled.contains(&id)
+                        || !inner.key.as_ref().is_some_and(|key| {
+                            key.model == selection.model_id && key.voice == selection.voice
+                        })
+                    {
+                        return Err(TtsError::Cancelled);
                     }
-                },
+                    inner.lifecycle.touch(self.started.elapsed());
+                    let native = handy_tts_core::speed::plan(
+                        selection.speed,
+                        catalog::entry(&selection.model_id)
+                            .map_err(|_| TtsError::Worker)?
+                            .native_speed,
+                    )
+                    .map_err(|_| TtsError::Worker)?
+                    .native;
+                    (
+                        inner.backend.submit(id, text, Some(native)),
+                        inner.backend.synthesis_timeout(),
+                        inner.generation,
+                    )
+                };
+                let result = match receive {
+                    Err(error) => Err(error),
+                    Ok(receive) => match receive.recv_timeout(timeout) {
+                        Ok(result) => result,
+                        Err(_) => {
+                            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+                            if inner.generation == generation {
+                                self.stop_backend(&mut inner);
+                                inner.key = None;
+                                inner.lifecycle.stopped();
+                                self.publish(State::Unloaded, Preparation::Idle);
+                            }
+                            Err(TtsError::Worker)
+                        }
+                    },
+                };
+                if result == Err(TtsError::Busy)
+                    && !self.cancelled(id)
+                    && std::time::Instant::now() < busy_until
+                {
+                    std::thread::sleep(BUSY_RETRY_DELAY);
+                    continue;
+                }
+                break (result, generation);
             };
             self.wake_idle();
             if self.cancelled(id) {
@@ -830,6 +846,7 @@ mod tests {
         fail_npu: bool,
         memory_at_load: bool,
         submit_failures: usize,
+        busy_replies: usize,
         limits: Vec<usize>,
         start_gate: Option<Arc<std::sync::Barrier>>,
         start_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -895,8 +912,13 @@ mod tests {
                 self.control.alive.store(false, Ordering::Release);
                 return Err(TtsError::Protocol);
             }
-            drop(trace);
             let (send, receive) = mpsc::channel();
+            if trace.busy_replies > 0 {
+                trace.busy_replies -= 1;
+                send.send(Err(TtsError::Busy)).unwrap();
+                return Ok(receive);
+            }
+            drop(trace);
             send.send(Ok(Pcm {
                 id,
                 sample_rate: 24000,
@@ -1243,6 +1265,46 @@ mod tests {
         CALLER.with(|slot| slot.borrow_mut().take());
     }
 
+    #[test]
+    fn busy_worker_reply_is_resubmitted_on_the_same_worker() {
+        let trace = Arc::new(Mutex::new(Trace {
+            busy_replies: 2,
+            ..Default::default()
+        }));
+        let model = manager(RunOn::Cpu, trace.clone(), enough);
+        model.ensure(&selection()).unwrap();
+        let result = model.synthesize(&selection(), 42, "Wait for the lane");
+        assert_eq!(result.unwrap().id, 42);
+        assert_eq!(model.status(), State::Ready);
+        let trace = trace.lock().unwrap();
+        assert_eq!(
+            trace.starts.len(),
+            1,
+            "a busy reply must not restart the worker"
+        );
+        assert_eq!(trace.speeds.len(), 3, "two busy replies then one success");
+        assert_eq!(trace.stopped, 0);
+    }
+    #[test]
+    fn cancelled_request_stops_resubmitting_while_busy() {
+        let trace = Arc::new(Mutex::new(Trace {
+            busy_replies: usize::MAX,
+            ..Default::default()
+        }));
+        let model = Arc::new(manager(RunOn::Cpu, trace.clone(), enough));
+        model.ensure(&selection()).unwrap();
+        let canceller = model.clone();
+        let cancel = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            canceller.cancel(43);
+        });
+        let began = Instant::now();
+        let result = model.synthesize(&selection(), 43, "Never gets a lane");
+        cancel.join().unwrap();
+        assert_eq!(result, Err(TtsError::Cancelled));
+        assert!(began.elapsed() < BUSY_RETRY_WINDOW);
+        assert_eq!(trace.lock().unwrap().starts.len(), 1);
+    }
     #[test]
     fn submission_failure_after_worker_exit_retries_once() {
         for failures in [1, 2] {

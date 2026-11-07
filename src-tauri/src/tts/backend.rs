@@ -31,6 +31,24 @@ pub trait Control: Clone + Send + Sync + 'static {
         None
     }
 }
+/// Maps a non-Ok chunk reply to its error; a busy worker is retryable.
+fn reply_error(header: &handy_tts_core::protocol::Header) -> Result<Pcm, TtsError> {
+    let message = header.message.as_deref().unwrap_or("no message");
+    log::warn!(
+        "TTS worker replied {:?} to request {}: {message}",
+        header.status,
+        header.id
+    );
+    if header.status == Status::Error && message == "busy" {
+        Err(TtsError::Busy)
+    } else {
+        Err(TtsError::Worker)
+    }
+}
+/// Returns the worker's own failure line, without its prefix and line ending.
+fn worker_failure_line(line: &str) -> Option<&str> {
+    line.strip_prefix("handy-tts: ").map(str::trim_end)
+}
 fn read_worker_diagnostics(
     mut reader: impl std::io::BufRead,
     preparation: &Arc<Mutex<Option<handy_tts_core::device::Preparation>>>,
@@ -43,6 +61,9 @@ fn read_worker_diagnostics(
             Ok(_) => {}
         }
         let line = String::from_utf8_lossy(&bytes);
+        if let Some(failure) = worker_failure_line(&line) {
+            log::warn!("TTS worker reported: {failure}");
+        }
         if let Some(json) = line.strip_prefix("HANDY_TTS_PROGRESS ") {
             if let Ok(value) = serde_json::from_str(json) {
                 *preparation.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
@@ -232,7 +253,7 @@ impl WorkerBackend {
                                 let result = if reply.header.status == Status::Ok {
                                     reply.pcm.ok_or(TtsError::Protocol)
                                 } else {
-                                    Err(TtsError::Worker)
+                                    reply_error(&reply.header)
                                 };
                                 let _ = sender.send(result);
                             }
@@ -442,6 +463,42 @@ impl Transport for WorkerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn busy_reply_is_retryable_and_other_failures_stop_the_chunk() {
+        let header = |status, message: &str| Header {
+            device: None,
+            placement: None,
+            id: 7,
+            status,
+            sample_rate: None,
+            samples: None,
+            message: Some(message.into()),
+        };
+        assert_eq!(
+            reply_error(&header(Status::Error, "busy")),
+            Err(TtsError::Busy)
+        );
+        assert_eq!(
+            reply_error(&header(Status::Error, "chunk_failed")),
+            Err(TtsError::Worker)
+        );
+        assert_eq!(
+            reply_error(&header(Status::Cancelled, "cancelled")),
+            Err(TtsError::Worker)
+        );
+    }
+    #[test]
+    fn worker_failure_lines_are_kept_and_progress_lines_are_not() {
+        assert_eq!(
+            worker_failure_line("handy-tts: chunk failed: kind=OpenVinoGeneralError\n"),
+            Some("chunk failed: kind=OpenVinoGeneralError")
+        );
+        assert_eq!(
+            worker_failure_line("HANDY_TTS_PROGRESS {\"state\":\"ready\"}\n"),
+            None
+        );
+        assert_eq!(worker_failure_line("SYNTH_START lane=1 id=4\n"), None);
+    }
     #[test]
     fn followup_worker_diagnostics_survive_invalid_utf8() {
         use handy_tts_core::device::{Device, Preparation};
