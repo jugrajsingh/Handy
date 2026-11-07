@@ -134,14 +134,18 @@ impl NoticeStore {
     }
 }
 
-fn insert(active: &mut Vec<Notice>, notice: Notice) {
+pub(crate) fn insert(active: &mut Vec<Notice>, notice: Notice) {
     remove(active, notice.source, None);
     active.insert(0, notice);
 }
 
 /// Removes the source's notice, if it has `code` when one is given. Returns
 /// whether one was removed.
-fn remove(active: &mut Vec<Notice>, source: NoticeSource, code: Option<NoticeCode>) -> bool {
+pub(crate) fn remove(
+    active: &mut Vec<Notice>,
+    source: NoticeSource,
+    code: Option<NoticeCode>,
+) -> bool {
     let before = active.len();
     active.retain(|notice| notice.source != source || code.is_some_and(|code| notice.code != code));
     active.len() != before

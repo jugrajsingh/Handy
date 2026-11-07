@@ -38,6 +38,7 @@ pub struct TtsService {
     pub fence: Arc<PasteFence>,
     pipeline: Mutex<handy_tts_core::handoff::PipelineFence>,
     pub downloader: Downloader,
+    vocabulary: Arc<super::vocabulary::UserVocabulary<super::vocabulary::AppHost>>,
     tray: Mutex<handy_tts_core::tray::TtsMenu>,
     preview: Arc<handy_tts_core::preview::PreviewCoordinator>,
     pub cancellations:
@@ -178,32 +179,14 @@ fn run_tray_refreshes(events: mpsc::Receiver<()>, mut refresh: impl FnMut() -> b
         }
     }
 }
-/// The vocabulary for each document: the built-in one plus the user's file, read again every
-/// time. A file that cannot be used raises one warning per distinct error.
-fn user_vocabulary(app: tauri::AppHandle) -> super::session::VocabularyLoader {
-    let reported = super::vocabulary::Reported::default();
-    Arc::new(move || {
-        let dir = match crate::portable::app_data_dir(&app) {
-            Ok(dir) => dir,
-            Err(error) => {
-                log::warn!(
-                    "Read-aloud vocabulary: no app data dir, using the built-in one: {error}"
-                );
-                return Arc::new(handy_tts_core::vocabulary::Vocabulary::builtin());
-            }
-        };
-        let path = dir.join(super::vocabulary::FILE_NAME);
-        super::vocabulary::load_vocabulary(&dir, &reported, &mut |error| {
-            crate::notices::raise(
-                &app,
-                crate::notices::Notice::new(
-                    crate::notices::NoticeCode::VocabularyInvalid,
-                    crate::notices::NoticeSource::ReadAloud,
-                )
-                .with_detail(format!("{}: {error}", path.display())),
-            )
-        })
-    })
+/// Ends every Read aloud notice and forgets the reported vocabulary errors with them, so a
+/// file that is still broken warns again on the next read.
+fn clear_read_aloud_notices<H: super::vocabulary::Host>(
+    vocabulary: &super::vocabulary::UserVocabulary<H>,
+    clear: impl FnOnce(),
+) {
+    clear();
+    vocabulary.forget();
 }
 impl TtsService {
     pub fn initialize(app: &tauri::AppHandle) -> Arc<Self> {
@@ -219,6 +202,9 @@ impl TtsService {
             fence: Arc::new(PasteFence::default()),
             pipeline: Mutex::new(handy_tts_core::handoff::PipelineFence::default()),
             downloader: Downloader::default(),
+            vocabulary: Arc::new(super::vocabulary::UserVocabulary::new(
+                super::vocabulary::AppHost(app.clone()),
+            )),
             tray: Mutex::new(handy_tts_core::tray::tts_menu(
                 &[],
                 None,
@@ -335,7 +321,10 @@ impl TtsService {
                 let app = self.app.clone();
                 Arc::new(move || crate::settings::get_settings(&app).selected_output_device)
             },
-            user_vocabulary(self.app.clone()),
+            {
+                let vocabulary = self.vocabulary.clone();
+                Arc::new(move || vocabulary.load())
+            },
             Arc::new(move |state| {
                 let _ = app.emit("read-aloud-state", state);
             }),
@@ -616,7 +605,9 @@ impl TtsService {
         let ticket = {
             let mut referee = self.referee.lock().unwrap_or_else(|p| p.into_inner());
             if self.ready().is_ok() {
-                crate::notices::clear(&self.app, crate::notices::NoticeSource::ReadAloud);
+                clear_read_aloud_notices(&self.vocabulary, || {
+                    crate::notices::clear(&self.app, crate::notices::NoticeSource::ReadAloud)
+                });
             }
             let effects = read_shortcut_with(
                 &mut referee,
@@ -778,6 +769,25 @@ impl handy_tts_core::preview::ReadingControl for ReadAloudSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tts::vocabulary::{testing, UserVocabulary};
+    #[test]
+    fn clearing_read_aloud_notices_forgets_reported_vocabulary_errors() {
+        let dir = testing::scratch("service-forget");
+        std::fs::write(dir.join(super::super::vocabulary::FILE_NAME), "{ not json").unwrap();
+        let vocabulary = UserVocabulary::new(testing::LogHost::new(&dir));
+        let _ = vocabulary.load();
+        let _ = vocabulary.load();
+        assert_eq!(vocabulary.host().raised(), 1, "a repeat is deduplicated");
+        let mut cleared = false;
+        clear_read_aloud_notices(&vocabulary, || cleared = true);
+        assert!(cleared);
+        let _ = vocabulary.load();
+        assert_eq!(
+            vocabulary.host().raised(),
+            2,
+            "a file already broken warns again on the first read after the clear"
+        );
+    }
     #[test]
     fn selection_reads_technical_by_default_with_full_paths_and_short_links() {
         let chosen = selection(&crate::settings::get_default_settings());
