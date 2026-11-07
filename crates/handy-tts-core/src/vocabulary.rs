@@ -663,8 +663,9 @@ fn is_number_or_version(text: &str) -> bool {
 
 /// Splits `name.ext` when the final dot part is a file extension. A known extension (vocabulary
 /// `extensions`, any case) always does, even where `end.Next` style prose would otherwise win;
-/// an unknown one needs 1-5 ASCII alphanumerics after a name holding a letter. Numbers, decimal
-/// multipliers and versions are never file names.
+/// an unknown one needs 1-5 ASCII alphanumerics, and a letter first when the name is only digits
+/// (`2024.pdf`, `001.wav`, but not `1.5k`). Numbers, decimal multipliers, versions and IP
+/// addresses are never file names.
 fn file_extension<'a>(text: &'a str, vocabulary: &Vocabulary) -> Option<(&'a str, &'a str)> {
     let (name, ext) = text.rsplit_once('.')?;
     if ext.is_empty()
@@ -678,9 +679,11 @@ fn file_extension<'a>(text: &'a str, vocabulary: &Vocabulary) -> Option<(&'a str
     if vocabulary.extensions.contains_key(&ext.to_lowercase()) {
         return Some((name, ext));
     }
-    let unknown_ok = (1..=5).contains(&ext.len())
+    let digit_name = name.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let unknown_ok = name.chars().any(char::is_alphanumeric)
+        && (1..=5).contains(&ext.len())
         && ext.chars().all(|c| c.is_ascii_alphanumeric())
-        && name.chars().any(char::is_alphabetic)
+        && (!digit_name || ext.starts_with(|c: char| c.is_ascii_alphabetic()))
         && !is_run_on(name, ext);
     unknown_ok.then_some((name, ext))
 }
@@ -1206,6 +1209,9 @@ mod tests {
             assert_eq!(say("backup.7z"), "backup dot 7 Z");
             assert_eq!(say("track.mp3"), "track dot M P 3");
             assert_eq!(say("2024.csv"), "2024 dot C S V");
+            assert_eq!(say("2024.pdf"), "2024 dot P D F");
+            assert_eq!(say("001.wav"), "001 dot W A V");
+            assert_eq!(say("docs/2024.pdf"), "docs slash 2024 dot P D F");
             assert_eq!(say("file.q:12"), "file dot Q at line 12");
             assert_eq!(say("backup.7z:3:4"), "backup dot 7 Z at line 3 column 4");
             assert_eq!(say("lib.Sh"), "lib dot S H");
@@ -1231,6 +1237,27 @@ mod tests {
             assert!(is_technical("notes.Md"));
             assert!(!is_technical("end.Next"));
             assert_eq!(say("end.Next"), "end.Next");
+        }
+
+        #[test]
+        fn digit_only_name_with_a_qualifying_extension_is_a_file_name() {
+            // Review r3 M1: a digit-only name keeps a letter-first extension.
+            assert_eq!(say("2024.pdf"), "2024 dot P D F");
+            assert_eq!(say("001.wav"), "001 dot W A V");
+            assert_eq!(say("2024.pdf:12"), "2024 dot P D F at line 12");
+            assert_eq!(say("docs/2024.pdf"), "docs slash 2024 dot P D F");
+            assert_eq!(say("(2024.pdf),"), "2024 dot P D F,");
+            assert_eq!(say("2024.xyz"), "2024 dot X Y Z");
+            assert_eq!(say("10.c"), "10 dot C");
+            assert!(is_technical("2024.pdf"));
+            assert!(is_technical("001.wav:3:4"));
+            for prose in [
+                "3.14", "1.5x", "1.x", "v1.2", "10.0.0.1", "1.5k", "3.5mm", "2024.",
+            ] {
+                assert!(!is_technical(prose), "{prose} must not be technical");
+                assert_eq!(say(prose), prose, "{prose} must read as today");
+            }
+            assert!(!is_technical("v0.10.0"));
         }
 
         #[test]
@@ -1516,6 +1543,7 @@ mod tests {
             );
             assert!(is_technical("manager.rs:684"));
             assert_eq!(say("archive.001:12"), "archive dot 0 0 1 at line 12");
+            assert_eq!(say("2024.pdf:12"), "2024 dot P D F at line 12");
             assert_eq!(
                 say("archive.001:12:3"),
                 "archive dot 0 0 1 at line 12 column 3"
@@ -1762,7 +1790,8 @@ mod tests {
     mod output_contract {
         use super::*;
 
-        const BASES: [&str; 12] = [
+        const BASES: [&str; 13] = [
+            "2024",
             "lib",
             "Lib",
             "fooBar",
@@ -1777,8 +1806,9 @@ mod tests {
             "id7",
         ];
         const SEPARATORS: [char; 10] = ['/', '.', '_', '-', '@', '+', '#', ':', '~', '='];
-        const EXTENSIONS: [&str; 13] = [
-            "sh", "Sh", "MD", "Json", "csv", "q", "7z", "001", "Abc", "zz", "ZZ", "abcde", "abcdef",
+        const EXTENSIONS: [&str; 15] = [
+            "sh", "Sh", "MD", "Json", "csv", "pdf", "Wav", "q", "7z", "001", "Abc", "zz", "ZZ",
+            "abcde", "abcdef",
         ];
         const LINES: [&str; 3] = ["", ":12", ":3:4"];
         const WRAPS: [(&str, &str); 5] =
