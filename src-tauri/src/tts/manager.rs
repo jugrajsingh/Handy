@@ -1404,14 +1404,14 @@ mod tests {
             let submits = trace.speeds.len();
             let pauses = pauses.lock().unwrap();
             assert!(submits >= 2, "a busy reply is resubmitted");
-            assert!(
-                submits as u128 <= window.as_millis() / delay.as_millis() + 1,
-                "{submits} submissions exceed the window"
-            );
             assert_eq!(pauses.len(), submits - 1, "every resubmission waits first");
             assert!(
                 pauses.iter().all(|pause| *pause == delay),
                 "every wait lasts the configured delay"
+            );
+            assert!(
+                submits as u128 <= window.as_millis() / delay.as_millis() + 1,
+                "{submits} submissions exceed the window"
             );
         }
 
