@@ -1,3 +1,6 @@
+> This is a fork of [Handy](https://github.com/cjpais/Handy) with local post-processing and read aloud (text to speech).
+> It is not affiliated with the upstream project. See [FORK.md](FORK.md) for what it adds and how it differs.
+
 # Handy
 
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/invite/WVBeWsNXK4)
