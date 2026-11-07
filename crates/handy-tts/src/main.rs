@@ -82,6 +82,7 @@ fn main() -> Result<()> {
             "npu" => handy_tts_core::device::Device::Npu,
             _ => anyhow::bail!("unknown device"),
         };
+        let (technical, options) = handy_tts::measure::technical_flags(&args[7..])?;
         let mut speed = None;
         let mut wav = None;
         let mut lanes = None;
@@ -89,10 +90,10 @@ fn main() -> Result<()> {
         let mut require_long_document = false;
         let mut startup_only = false;
         anyhow::ensure!(
-            (args.len() - 7).is_multiple_of(2),
+            options.len().is_multiple_of(2),
             "continuity options need values"
         );
-        for pair in args[7..].as_chunks::<2>().0 {
+        for pair in options.as_chunks::<2>().0 {
             match pair[0].as_str() {
                 "--speed" => speed = Some(pair[1].parse()?),
                 "--wav" => wav = Some(std::path::Path::new(&pair[1])),
@@ -117,6 +118,7 @@ fn main() -> Result<()> {
                 gpu_inputs,
                 require_long_document,
                 startup_only,
+                technical,
             },
         );
     }

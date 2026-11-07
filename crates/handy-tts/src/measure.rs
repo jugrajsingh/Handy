@@ -467,8 +467,17 @@ pub fn continuity(
 ) -> Result<()> {
     let model = catalog::entry(id)?;
     let source = std::fs::read_to_string(corpus).context("read explicit continuity corpus")?;
-    let mut cursor = TextCursor::streaming(&source, false)?;
+    let vocabulary = options
+        .technical
+        .map(|_| std::sync::Arc::new(handy_tts_core::vocabulary::Vocabulary::builtin()));
+    let mut cursor = TextCursor::streaming_with(
+        &source,
+        false,
+        vocabulary.clone(),
+        options.technical.unwrap_or_default(),
+    )?;
     let mut pauses = Vec::new();
+    let mut prepared_texts = Vec::new();
     let long_document = source.split_whitespace().count() >= 2000;
     let mut coverage_words = Vec::new();
     let mut coverage_end = 0;
@@ -478,6 +487,7 @@ pub fn continuity(
             coverage_end = pauses.len();
         }
         pauses.push(chunk.pause_ms);
+        prepared_texts.push(chunk.text);
     }
     if long_document {
         ensure!(
@@ -519,14 +529,15 @@ pub fn continuity(
         pitch: 0.0,
         output_device: None,
         read_code: false,
-        technical: false,
-        full_paths: true,
-        full_links: false,
+        technical: options.technical.is_some(),
+        full_paths: options.technical.unwrap_or_default().full_paths,
+        full_links: options.technical.unwrap_or_default().full_links,
     };
     let capture = CaptureOutput::new(0, Some(options.wav))?;
-    let mut session =
-        handy_tts_core::session::Session::new(&source, selection, worker, capture, None)
-            .map_err(anyhow::Error::msg)?;
+    let mut session = handy_tts_core::session::Session::with_vocabulary(
+        &source, selection, worker, capture, None, vocabulary,
+    )
+    .map_err(anyhow::Error::msg)?;
     session.play().map_err(anyhow::Error::msg)?;
     session
         .queue
@@ -640,6 +651,12 @@ pub fn continuity(
         "median_rtf": median,
         "requests": session.worker.records,
     });
+    if let Some(technical) = options.technical {
+        record["technical"] = serde_json::json!({
+            "full_paths": technical.full_paths, "full_links": technical.full_links,
+            "prepared_texts": prepared_texts,
+        });
+    }
     if let Some(directory) = options.gpu_inputs {
         ensure!(
             id == "supertonic-3" && device == Device::Gpu,
@@ -720,6 +737,38 @@ pub struct ContinuityOptions<'a> {
     pub gpu_inputs: Option<&'a Path>,
     pub require_long_document: bool,
     pub startup_only: bool,
+    /// Technical reading with the built-in vocabulary and these options; `None` reads as before.
+    pub technical: Option<handy_tts_core::vocabulary::TechnicalOptions>,
+}
+
+/// Splits the valueless technical reading flags out of the continuity options: `--technical`
+/// turns it on with the built-in vocabulary, `--short-paths` and `--full-links` change its
+/// options and need `--technical`. Returns the options and the remaining arguments.
+pub fn technical_flags(
+    args: &[String],
+) -> Result<(
+    Option<handy_tts_core::vocabulary::TechnicalOptions>,
+    Vec<String>,
+)> {
+    let (mut technical, mut short_paths, mut full_links) = (false, false, false);
+    let mut rest = Vec::new();
+    for arg in args {
+        match arg.as_str() {
+            "--technical" => technical = true,
+            "--short-paths" => short_paths = true,
+            "--full-links" => full_links = true,
+            _ => rest.push(arg.clone()),
+        }
+    }
+    ensure!(
+        technical || !(short_paths || full_links),
+        "--short-paths and --full-links need --technical"
+    );
+    let options = technical.then_some(handy_tts_core::vocabulary::TechnicalOptions {
+        full_paths: !short_paths,
+        full_links,
+    });
+    Ok((options, rest))
 }
 
 fn gpu_repeat_timings(
@@ -1852,5 +1901,75 @@ mod cleanup_measurement_tests {
         assert_eq!(first["worker_exited"], true);
         assert_eq!(first["parent_before_mib"], serde_json::json!(before));
         assert_eq!(first["parent_after_mib"], serde_json::json!(after));
+    }
+}
+
+#[cfg(test)]
+mod technical_flag_tests {
+    use super::*;
+    use handy_tts_core::vocabulary::{TechnicalOptions, Vocabulary};
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn no_flag_leaves_technical_reading_off() {
+        let (technical, rest) =
+            technical_flags(&args(&["--speed", "1.0", "--wav", "x.wav"])).unwrap();
+        assert_eq!(technical, None);
+        assert_eq!(rest, args(&["--speed", "1.0", "--wav", "x.wav"]));
+    }
+
+    #[test]
+    fn technical_uses_full_paths_and_short_links() {
+        let (technical, rest) =
+            technical_flags(&args(&["--speed", "1.0", "--technical", "--wav", "x.wav"])).unwrap();
+        assert_eq!(technical, Some(TechnicalOptions::default()));
+        assert_eq!(rest, args(&["--speed", "1.0", "--wav", "x.wav"]));
+    }
+
+    #[test]
+    fn short_paths_and_full_links_change_the_options() {
+        let (technical, _) =
+            technical_flags(&args(&["--technical", "--short-paths", "--full-links"])).unwrap();
+        assert_eq!(
+            technical,
+            Some(TechnicalOptions {
+                full_paths: false,
+                full_links: true,
+            })
+        );
+    }
+
+    #[test]
+    fn option_flags_without_technical_are_refused() {
+        assert!(technical_flags(&args(&["--short-paths"])).is_err());
+        assert!(technical_flags(&args(&["--full-links"])).is_err());
+    }
+
+    #[test]
+    fn prepared_text_for_the_owner_line_names_slash_dot_and_underscore() {
+        let source = "Run tests/lib.sh then check fixture_base and /review before .sh files.";
+        let vocabulary = Some(std::sync::Arc::new(Vocabulary::builtin()));
+        let mut cursor =
+            TextCursor::streaming_with(source, false, vocabulary, TechnicalOptions::default())
+                .unwrap();
+        let mut text = String::new();
+        while let Some(chunk) = cursor.next_chunk().unwrap() {
+            text.push_str(&chunk.text);
+            text.push(' ');
+        }
+        for expected in [
+            "tests slash lib dot S H",
+            "fixture underscore base",
+            "slash review",
+            "dot S H",
+        ] {
+            assert!(
+                text.contains(expected),
+                "{expected:?} missing from {text:?}"
+            );
+        }
     }
 }
