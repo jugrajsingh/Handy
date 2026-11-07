@@ -241,6 +241,10 @@ mod tests {
             .chars()
             .map(|c| indexer[c as usize])
             .collect();
-        assert_eq!(token_ids(&indexer, &prepared), expected);
+        assert_eq!(
+            token_ids(&indexer, &prepared),
+            expected,
+            "only characters with a model id reach the model"
+        );
     }
 }
