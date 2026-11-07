@@ -1,10 +1,56 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::io::Write;
+use std::path::Path;
+
+/// Runs every vocabulary example and prints one PASS or FAIL line each; the built-in
+/// vocabulary alone, or merged with the user file at `path`. True only when none failed.
+fn check_vocabulary(path: Option<&Path>, out: &mut impl Write) -> Result<bool> {
+    let vocabulary = match path {
+        None => handy_tts_core::vocabulary::Vocabulary::builtin(),
+        Some(path) => {
+            let json = std::fs::read_to_string(path)
+                .with_context(|| format!("read {}", path.display()))?;
+            let file = handy_tts_core::vocabulary::Vocabulary::parse(&json)
+                .with_context(|| format!("parse {}", path.display()))?;
+            handy_tts_core::vocabulary::Vocabulary::merged(&file)
+        }
+    };
+    let results = handy_tts_core::vocabulary::run_examples(&vocabulary);
+    let mut failed = 0_usize;
+    for result in &results {
+        if result.expected == result.actual {
+            writeln!(out, "PASS {}", result.text)?;
+        } else {
+            failed += 1;
+            writeln!(
+                out,
+                "FAIL {}: expected \"{}\" got \"{}\"",
+                result.text, result.expected, result.actual
+            )?;
+        }
+    }
+    writeln!(
+        out,
+        "vocabulary: {} examples, {failed} failed",
+        results.len()
+    )?;
+    Ok(failed == 0)
+}
+
 fn main() -> Result<()> {
     if std::env::args().skip(1).eq(["--list-devices"]) {
         println!("{}", serde_json::to_string(&handy_tts::devices::list()?)?);
         return Ok(());
     }
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == "--check-vocabulary") {
+        anyhow::ensure!(
+            args.len() <= 2,
+            "--check-vocabulary takes at most one vocabulary file"
+        );
+        let passed = check_vocabulary(args.get(1).map(Path::new), &mut std::io::stdout().lock())?;
+        std::process::exit(i32::from(!passed));
+    }
     if args.first().is_some_and(|a| a == "--measure-lanes") {
         anyhow::ensure!(
             args.len() == 7,

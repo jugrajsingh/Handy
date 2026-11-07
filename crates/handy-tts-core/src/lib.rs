@@ -22,4 +22,5 @@ pub mod session;
 pub mod speed;
 pub mod text;
 pub mod tray;
+pub mod vocabulary;
 pub mod worker_env;
