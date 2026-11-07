@@ -21,8 +21,8 @@
     "go": "go",
     "md": "markdown",
     "json": "jason",
-    "yaml": "yammel",
-    "yml": "yammel",
+    "yaml": "Y A M L",
+    "yml": "Y A M L",
     "toml": "tommel",
     "sql": "sequel",
     "txt": "text",
@@ -38,6 +38,7 @@
     "edu": "edu"
   },
   "terms": {
+    "src": "source",
     "kubectl": "cube control",
     "S1-mini": "S one mini",
     "and/or": "and or",
@@ -100,6 +101,15 @@
     { "text": "kubectl", "spoken": "cube control" },
     { "text": "GPU,", "spoken": "G P U," },
     { "text": "https://github.com/x/y", "spoken": "link to github.com" },
-    { "text": "v1.2.3", "spoken": "version 1.2.3" }
+    { "text": "v1.2.3", "spoken": "version 1 dot 2 dot 3" },
+    { "text": "v0.10.0", "spoken": "version 0 dot 10 dot 0" },
+    { "text": "0.10.0", "spoken": "0 dot 10 dot 0" },
+    { "text": "src", "spoken": "source" },
+    {
+      "text": "src/tts/manager.rs",
+      "spoken": "source slash tts slash manager dot R S"
+    },
+    { "text": "deploy/app.yaml", "spoken": "deploy slash app dot Y A M L" },
+    { "text": "ci.yml", "spoken": "ci dot Y A M L" }
   ]
 }

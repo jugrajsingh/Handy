@@ -1138,7 +1138,13 @@ fn version_len(rest: &str) -> Option<usize> {
     Some(index)
 }
 
-/// Today's version rule: `v1.2.3` at a word boundary becomes `version 1.2.3`; None when the
+/// Reads each dot of a version as "dot": recognisers hear `0.10.0` as "00" but "0 dot 10 dot 0"
+/// as written.
+fn dotted_version(digits: &str) -> String {
+    digits.replace('.', " dot ")
+}
+
+/// The version rule: `v1.2.3` at a word boundary becomes `version 1 dot 2 dot 3`; None when the
 /// token holds no version.
 fn replace_versions(token: &str) -> Option<String> {
     let mut spoken = String::new();
@@ -1158,7 +1164,7 @@ fn replace_versions(token: &str) -> Option<String> {
         if let Some(length) = version_len(&token[offset + 1..]) {
             spoken.push_str(&token[copied..offset]);
             spoken.push_str("version ");
-            spoken.push_str(&token[offset + 1..offset + 1 + length]);
+            spoken.push_str(&dotted_version(&token[offset + 1..offset + 1 + length]));
             copied = offset + 1 + length;
             found = true;
         }
@@ -1240,7 +1246,7 @@ enum Spoken {
 }
 
 /// Applies the rules to a token core: exact `terms` first, then links and versions with today's
-/// wording, then the kind rules, then partial terms and acronyms on any other word. `options`
+/// wording (a bare `0.10.0` reads each dot), then the kind rules, then partial terms and acronyms on any other word. `options`
 /// chooses full or short paths and links.
 fn speak_parts(
     core: &str,
@@ -1265,6 +1271,9 @@ fn speak_parts(
         && let Some(versioned) = replace_versions(core)
     {
         return Spoken::Words(versioned);
+    }
+    if version_len(core) == Some(core.len()) {
+        return Spoken::Words(dotted_version(core));
     }
     let (head, line) = split_line(core, vocabulary);
     if let Some(kind) = classify(head, vocabulary, line.is_none() && period_follows) {
@@ -1582,10 +1591,53 @@ mod tests {
             assert_eq!(say("https://github.com/x/y"), "link to github.com");
             assert_eq!(say("https://github.com/x/y."), "link to github.com.");
             assert_eq!(say("(http://example.org?q=1)"), "link to example.org");
-            assert_eq!(say("v1.2.3"), "version 1.2.3");
-            assert_eq!(say("v0.10.0,"), "version 0.10.0,");
+            assert_eq!(say("v1.2.3"), "version 1 dot 2 dot 3");
+            assert_eq!(say("v0.10.0,"), "version 0 dot 10 dot 0,");
             assert!(!is_technical("https://github.com/x/y"));
             assert!(!is_technical("v1.2.3"));
+        }
+    }
+
+    mod shared_reading {
+        use super::*;
+
+        #[test]
+        fn versions_read_each_dot() {
+            assert_eq!(say("v1.2.3"), "version 1 dot 2 dot 3");
+            assert_eq!(say("v0.10.0"), "version 0 dot 10 dot 0");
+            assert_eq!(say("(v0.10.0)."), "version 0 dot 10 dot 0.");
+            assert_eq!(say("0.10.0"), "0 dot 10 dot 0");
+            assert_eq!(say("0.10.0,"), "0 dot 10 dot 0,");
+            assert_eq!(say("pin-v2.0.1"), "pin dash version 2 dot 0 dot 1");
+            for prose in [
+                "3.14", "1.5x", "v1.2", "10.0.0.1", "1.2.3.4", "2024.", "1.5k",
+            ] {
+                assert_eq!(say(prose), prose, "{prose} reads as written");
+            }
+        }
+
+        #[test]
+        fn source_folder_is_read_as_source() {
+            assert_eq!(say("src"), "source");
+            assert_eq!(
+                say("src/tts/manager.rs"),
+                "source slash tts slash manager dot R S"
+            );
+            assert_eq!(
+                say("crates/handy-tts-core/src/text.rs"),
+                "crates slash handy dash tts dash core slash source slash text dot R S"
+            );
+            for other in ["Src", "srcs", "source"] {
+                assert_eq!(say(other), other, "{other} is not the src term");
+            }
+        }
+
+        #[test]
+        fn yaml_is_spelled_and_json_is_not() {
+            assert_eq!(say("deploy/app.yaml"), "deploy slash app dot Y A M L");
+            assert_eq!(say("ci.yml,"), "ci dot Y A M L,");
+            assert_eq!(say("App.YAML"), "App dot Y A M L");
+            assert_eq!(say("data.json"), "data dot jason");
         }
     }
 
@@ -2373,11 +2425,21 @@ mod tests {
             "id7",
         ];
         const SEPARATORS: [char; 10] = ['/', '.', '_', '-', '@', '+', '#', ':', '~', '='];
-        const EXTENSIONS: [&str; 15] = [
+        const EXTENSIONS: [&str; 17] = [
             "sh", "Sh", "MD", "Json", "csv", "pdf", "Wav", "q", "7z", "001", "Abc", "zz", "ZZ",
-            "abcde", "abcdef",
+            "abcde", "abcdef", "yaml", "yml",
         ];
         const LINES: [&str; 3] = ["", ":12", ":3:4"];
+        const VERSIONS: [&str; 8] = [
+            "v1.2.3",
+            "v0.10.0",
+            "0.10.0",
+            "1.2.3",
+            "pin-v2.0.1",
+            "v1.2.3-rc1",
+            "version=v2.0.1",
+            "src",
+        ];
         const WRAPS: [(&str, &str); 5] =
             [("", ""), ("**", "**"), ("`", "`"), ("(", ")"), ("\"", "\"")];
         const ENDINGS: [&str; 6] = ["", ".", ",", "?!", "...", ";"];
@@ -2405,6 +2467,7 @@ mod tests {
                     cores.push(format!("dir/{base}.{extension}"));
                 }
             }
+            cores.extend(VERSIONS.iter().map(ToString::to_string));
             for base in BASES {
                 cores.push(format!("https://example.com/{base}/{base}.md?x=1#top"));
                 cores.push(format!("http://{base}.org"));

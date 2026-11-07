@@ -1341,7 +1341,7 @@ mod technical {
         );
         assert_eq!(
             technical_text(source),
-            "Edit tests slash lib dot S H and src slash tts slash manager dot R S at line 684 today."
+            "Edit tests slash lib dot S H and source slash tts slash manager dot R S at line 684 today."
         );
         let token = "src/tts/manager.rs:684";
         let alone = technical_chunks(token, short_paths());
