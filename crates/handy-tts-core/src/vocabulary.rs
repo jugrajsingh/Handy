@@ -21,17 +21,18 @@ const SENTENCE_PUNCTUATION: [char; 6] = ['.', ',', ';', ':', '!', '?'];
 const WRAPPERS: [char; 9] = ['(', ')', '[', ']', '{', '}', '\'', '"', '`'];
 const CLOSERS: [char; 5] = [')', ']', '}', '\'', '"'];
 
-static LINE_SUFFIX: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(.+?):([0-9]+)(?::([0-9]+))?$").expect("the line suffix pattern is valid")
-});
-static VERSION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\bv([0-9]+\.[0-9]+\.[0-9]+)").expect("the version pattern is valid")
-});
 static BUILTIN: LazyLock<Vocabulary> = LazyLock::new(|| {
-    let file = Vocabulary::parse(BUILTIN_JSON)
-        .expect("the embedded vocabulary is valid; every_builtin_example_passes guards it");
-    Vocabulary::from_file(&file)
+    // The embedded file is validated by `builtin_vocabulary_parses` and
+    // `every_builtin_example_passes`; an unparsable one degrades to an empty vocabulary.
+    Vocabulary::parse(BUILTIN_JSON)
+        .map(|file| Vocabulary::from_file(&file))
+        .unwrap_or_default()
 });
+
+/// Abbreviations that are prose even without a trailing period.
+const ABBREVIATIONS: [&str; 10] = [
+    "e.g", "i.e", "a.m", "p.m", "c.f", "n.b", "v.s", "a.k.a", "p.s", "ph.d",
+];
 
 /// An error in a vocabulary file; the app shows one notice per distinct value.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -44,7 +45,7 @@ pub enum VocabularyError {
     },
     #[error("vocabulary version {0} is not supported (expected 1)")]
     Version(u32),
-    #[error("vocabulary term {key:?} has an invalid pattern: {message}")]
+    #[error("vocabulary entry {key:?} is invalid: {message}")]
     Pattern { key: String, message: String },
 }
 
@@ -80,6 +81,7 @@ impl PartialEq for Term {
 
 impl Term {
     /// Compiles the matcher for `key`; for `TermMatch::Regex` the key is the pattern itself.
+    /// `say` may only hold letters, digits and spaces (plus `$1` style references for a regex).
     pub fn new(
         key: &str,
         say: impl Into<String>,
@@ -93,6 +95,8 @@ impl Term {
         if key.is_empty() {
             return Err(pattern_error("the key is empty"));
         }
+        let say = say.into();
+        validate_spoken(key, "term", &say, matching == TermMatch::Regex)?;
         let escaped = regex::escape(key);
         let source = match matching {
             TermMatch::Whole => format!("^(?:{escaped})$"),
@@ -106,7 +110,7 @@ impl Term {
             .build()
             .map_err(|error| pattern_error(&error.to_string()))?;
         Ok(Term {
-            say: say.into(),
+            say,
             matching,
             case,
             pattern,
@@ -133,7 +137,7 @@ pub struct VocabularyFile {
 }
 
 /// The vocabulary the rules run against: built-in entries plus the user's, user winning.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Vocabulary {
     symbols: BTreeMap<String, String>,
     extensions: BTreeMap<String, String>,
@@ -230,6 +234,97 @@ fn ordered_terms<'de, D: de::Deserializer<'de>>(
     deserializer.deserialize_map(OrderedVisitor)
 }
 
+/// Removes `$1`, `$name` and `${name}` references from a regex replacement, leaving the literal
+/// text; a `$` that starts no reference (such as `$$`) stays and is rejected as a literal.
+fn without_references(text: &str) -> String {
+    let mut literal = String::new();
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            literal.push(c);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('{') => {
+                chars.next();
+                let mut name = String::new();
+                let mut closed = false;
+                for inner in chars.by_ref() {
+                    if inner == '}' {
+                        closed = true;
+                        break;
+                    }
+                    name.push(inner);
+                }
+                if !closed {
+                    literal.push_str("${");
+                    literal.push_str(&name);
+                }
+            }
+            Some(next) if next.is_ascii_alphanumeric() || next == '_' => {
+                while chars
+                    .peek()
+                    .is_some_and(|n| n.is_ascii_alphanumeric() || *n == '_')
+                {
+                    chars.next();
+                }
+            }
+            _ => literal.push('$'),
+        }
+    }
+    literal
+}
+
+/// Enforces the output contract on text a vocabulary entry says: letters, digits and spaces.
+fn validate_spoken(
+    key: &str,
+    section: &str,
+    spoken: &str,
+    references: bool,
+) -> Result<(), VocabularyError> {
+    let literal = if references {
+        without_references(spoken)
+    } else {
+        spoken.to_string()
+    };
+    match literal
+        .chars()
+        .find(|c| !(c.is_alphanumeric() || *c == ' '))
+    {
+        Some(bad) => Err(VocabularyError::Pattern {
+            key: key.to_string(),
+            message: format!(
+                "the {section} says {spoken:?}, which contains {bad:?}; only letters, digits and spaces are allowed"
+            ),
+        }),
+        None => Ok(()),
+    }
+}
+
+/// Turns captured source text into speakable words: symbols with a vocabulary word are
+/// spoken, every other character that is not a letter or digit becomes a space.
+fn speakable(text: &str, symbols: &BTreeMap<String, String>) -> String {
+    let mut spaced = String::new();
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            spaced.push(c);
+            continue;
+        }
+        spaced.push(' ');
+        if let Some(word) = symbols.get(c.to_string().as_str()) {
+            spaced.push_str(word);
+            spaced.push(' ');
+        }
+    }
+    let mut collapsed = String::new();
+    for c in spaced.chars() {
+        if c != ' ' || !collapsed.ends_with(' ') {
+            collapsed.push(c);
+        }
+    }
+    collapsed
+}
+
 fn json_error(error: &serde_json::Error) -> VocabularyError {
     let text = error.to_string();
     let message = text
@@ -256,6 +351,12 @@ impl Vocabulary {
             return Err(VocabularyError::Version(probe.version));
         }
         let raw: RawFile = serde_json::from_str(json).map_err(|error| json_error(&error))?;
+        for (key, spoken) in &raw.symbols {
+            validate_spoken(key, "symbol", spoken, false)?;
+        }
+        for (key, spoken) in &raw.extensions {
+            validate_spoken(key, "extension", spoken, false)?;
+        }
         let mut terms = Vec::with_capacity(raw.terms.len());
         for (key, value) in raw.terms {
             let term = match value {
@@ -340,12 +441,12 @@ impl Vocabulary {
         }
         for (_, term) in &self.terms {
             if term.matching == TermMatch::Anywhere {
-                pieces = rewrite_raw(pieces, |raw| split_matches(raw, term, false));
+                pieces = rewrite_raw(pieces, |raw| split_matches(raw, term, false, &self.symbols));
             }
         }
         for (_, term) in &self.terms {
             if term.matching == TermMatch::Regex {
-                pieces = rewrite_raw(pieces, |raw| split_matches(raw, term, true));
+                pieces = rewrite_raw(pieces, |raw| split_matches(raw, term, true, &self.symbols));
             }
         }
         pieces
@@ -402,7 +503,12 @@ fn rewrite_raw(pieces: Vec<Piece>, rewrite: impl Fn(&str) -> Vec<Piece>) -> Vec<
         .collect()
 }
 
-fn split_matches(raw: &str, term: &Term, expand: bool) -> Vec<Piece> {
+fn split_matches(
+    raw: &str,
+    term: &Term,
+    expand: bool,
+    symbols: &BTreeMap<String, String>,
+) -> Vec<Piece> {
     let mut pieces = Vec::new();
     let mut last = 0;
     for captures in term.pattern.captures_iter(raw) {
@@ -414,7 +520,9 @@ fn split_matches(raw: &str, term: &Term, expand: bool) -> Vec<Piece> {
         }
         let mut say = String::new();
         if expand {
-            captures.expand(&term.say, &mut say);
+            let mut expanded = String::new();
+            captures.expand(&term.say, &mut expanded);
+            say = speakable(&expanded, symbols);
         } else {
             say.clone_from(&term.say);
         }
@@ -429,26 +537,36 @@ fn split_matches(raw: &str, term: &Term, expand: bool) -> Vec<Piece> {
 
 struct Parts<'a> {
     core: &'a str,
-    ending: Option<char>,
+    /// The whole trailing run of sentence punctuation, including any inside quotes or emphasis.
+    ending: String,
+}
+
+fn is_trailing(c: char, emphasis: bool) -> bool {
+    CLOSERS.contains(&c) || c == '`' || SENTENCE_PUNCTUATION.contains(&c) || (emphasis && c == '*')
 }
 
 /// Separates the wrapping punctuation: `core` is the token without wrappers and sentence
-/// punctuation, `ending` is the sentence punctuation the token ended with (kept when speaking).
+/// punctuation, `ending` is every sentence-punctuation character the token ended with, in order
+/// (kept when speaking). Emphasis stars are wrappers only when they open and close the token.
 fn split_token(token: &str) -> Parts<'_> {
-    let inner = token.trim_end_matches(|c| CLOSERS.contains(&c) || c == '`');
-    let ending = inner
+    let lead_len = token.len()
+        - token
+            .trim_start_matches(|c| WRAPPERS.contains(&c) || c == '*')
+            .len();
+    let lead_has_star = token[..lead_len].contains('*');
+    let starred_end = token.trim_end_matches(|c| is_trailing(c, true)).len();
+    let emphasis = lead_has_star && token[starred_end..].contains('*');
+    let body_end = token.trim_end_matches(|c| is_trailing(c, emphasis)).len();
+    let lead_len = if emphasis {
+        lead_len
+    } else {
+        token.len() - token.trim_start_matches(WRAPPERS).len()
+    };
+    let core = token.get(lead_len..body_end).unwrap_or("");
+    let ending = token[body_end..]
         .chars()
-        .last()
-        .filter(|c| SENTENCE_PUNCTUATION.contains(c));
-    let unpunctuated = token.trim_end_matches(|c| {
-        SENTENCE_PUNCTUATION.contains(&c) || CLOSERS.contains(&c) || c == '`'
-    });
-    let emphasis =
-        unpunctuated.len() > 1 && unpunctuated.starts_with('*') && unpunctuated.ends_with('*');
-    let wrapper = |c: char| WRAPPERS.contains(&c) || (emphasis && c == '*');
-    let core = token.trim_matches(wrapper);
-    let core = core.trim_end_matches(|c| SENTENCE_PUNCTUATION.contains(&c));
-    let core = core.trim_matches(wrapper);
+        .filter(|c| SENTENCE_PUNCTUATION.contains(c))
+        .collect();
     Parts { core, ending }
 }
 
@@ -480,9 +598,33 @@ fn is_run_on(first: &str, second: &str) -> bool {
     !first.is_empty() && first.chars().all(char::is_lowercase) && is_capitalized_word(second)
 }
 
-/// Splits `name.ext` when the final dot part is a file extension: in the vocabulary, or 2-5
-/// alphanumerics starting with a letter. The name needs two characters unless the extension is
-/// in the vocabulary, so `e.g`, `U.S`, `3.14` and `1.5x` never qualify.
+/// `e.g`, `U.S`, `p.m.`, `Ph.D.`: abbreviations stay prose. Single-letter segments that are all
+/// capitals, a listed abbreviation, or a trailing period after a one-letter last segment.
+fn is_abbreviation(core: &str, period_follows: bool) -> bool {
+    if core.contains('/') || !core.contains('.') {
+        return false;
+    }
+    if ABBREVIATIONS.contains(&core.to_lowercase().as_str()) {
+        return true;
+    }
+    let single = |segment: &&str| {
+        let mut chars = segment.chars();
+        chars.next().is_some_and(char::is_alphabetic) && chars.next().is_none()
+    };
+    let segments: Vec<&str> = core.split('.').collect();
+    let last_single = segments.last().is_some_and(single);
+    let all_single = segments.iter().all(single);
+    (all_single
+        && core
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .all(char::is_uppercase))
+        || (period_follows && last_single)
+}
+
+/// Splits `name.ext` when the final dot part is a file extension: in the vocabulary, or 1-5
+/// alphanumerics with at least one letter. A purely numeric name needs a letter-first extension,
+/// so `3.14`, `1.5x` and `v0.10.0` stay numbers.
 fn file_extension<'a>(
     text: &'a str,
     vocabulary: Option<&Vocabulary>,
@@ -496,9 +638,13 @@ fn file_extension<'a>(
         return None;
     }
     let known = vocabulary.is_some_and(|v| v.extensions.contains_key(&ext.to_lowercase()));
-    let plausible = (2..=5).contains(&ext.chars().count())
-        && ext.chars().next().is_some_and(char::is_alphabetic);
-    if !(known || plausible) || (name.chars().count() < 2 && !known) || is_run_on(name, ext) {
+    let plausible = (1..=5).contains(&ext.chars().count()) && ext.chars().any(char::is_alphabetic);
+    let numeric_name = !name.is_empty() && name.chars().all(|c| c.is_ascii_digit() || c == '.');
+    if !(known || plausible)
+        || (name.is_empty() && !known)
+        || (numeric_name && !known && ext.starts_with(|c: char| c.is_ascii_digit()))
+        || is_run_on(name, ext)
+    {
         return None;
     }
     Some((name, ext))
@@ -508,11 +654,10 @@ fn is_dotted(text: &str) -> bool {
     let segments: Vec<&str> = text.split('.').collect();
     segments.len() >= 2
         && segments.iter().all(|segment| {
-            segment.chars().count() >= 2
-                && segment
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_alphabetic() || c == '_')
+            segment
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_alphabetic() || c == '_')
                 && segment
                     .chars()
                     .all(|c| c.is_alphanumeric() || c == '_' || c == '-')
@@ -574,7 +719,7 @@ fn has_camel_boundary(text: &str) -> bool {
 
 /// Decides which technical kind a token core is, if any. `core` has no wrapping punctuation
 /// and no `:line` suffix. Kinds follow the spec table order.
-fn classify(core: &str, vocabulary: Option<&Vocabulary>) -> Option<Kind> {
+fn classify(core: &str, vocabulary: Option<&Vocabulary>, period_follows: bool) -> Option<Kind> {
     if let Some(open) = core.find('(') {
         return is_call(core, open).then_some(Kind::Call);
     }
@@ -591,6 +736,9 @@ fn classify(core: &str, vocabulary: Option<&Vocabulary>) -> Option<Kind> {
         return None;
     }
     if body.contains('~') && !body.starts_with("~/") {
+        return None;
+    }
+    if is_abbreviation(body, period_follows) {
         return None;
     }
     if body.contains('/') {
@@ -622,21 +770,34 @@ fn classify(core: &str, vocabulary: Option<&Vocabulary>) -> Option<Kind> {
     is_dotted(body).then_some(Kind::Dotted)
 }
 
+/// Splits `head:line[:column]` into its parts; the digits-only trailing parts are the suffix.
+fn parse_line_suffix(core: &str) -> Option<(&str, &str, Option<&str>)> {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    let (rest, last) = core.rsplit_once(':')?;
+    if !digits(last) {
+        return None;
+    }
+    if let Some((head, line)) = rest.rsplit_once(':')
+        && digits(line)
+        && !head.is_empty()
+    {
+        return Some((head, line, Some(last)));
+    }
+    (!rest.is_empty()).then_some((rest, last, None))
+}
+
 /// Splits a `:684` or `:684:7` suffix off a path or file name. Anything else keeps its colon.
 fn split_line<'a>(
     core: &'a str,
     vocabulary: Option<&Vocabulary>,
 ) -> (&'a str, Option<(&'a str, Option<&'a str>)>) {
-    let Some(captures) = LINE_SUFFIX.captures(core) else {
+    let Some((head, line, column)) = parse_line_suffix(core) else {
         return (core, None);
     };
-    let head = captures.get(1).map_or("", |m| m.as_str());
     if matches!(
-        classify(head, vocabulary),
+        classify(head, vocabulary, false),
         Some(Kind::Path | Kind::FileName)
     ) {
-        let line = captures.get(2).map_or("", |m| m.as_str());
-        let column = captures.get(3).map(|m| m.as_str());
         return (head, Some((line, column)));
     }
     (core, None)
@@ -649,8 +810,8 @@ pub fn is_technical(token: &str) -> bool {
     if parts.core.is_empty() {
         return false;
     }
-    let (head, _) = split_line(parts.core, None);
-    classify(head, None).is_some()
+    let (head, line) = split_line(parts.core, None);
+    classify(head, None, line.is_none() && parts.ending.starts_with('.')).is_some()
 }
 
 fn spell(text: &str) -> String {
@@ -664,7 +825,7 @@ fn speak_extension(ext: &str, vocabulary: &Vocabulary) -> String {
     if let Some(spoken) = vocabulary.extensions.get(&ext.to_lowercase()) {
         return spoken.clone();
     }
-    if ext.chars().count() <= 3 && ext.chars().all(char::is_alphabetic) {
+    if ext.chars().count() <= 3 && ext.chars().all(char::is_alphanumeric) {
         return spell(ext);
     }
     ext.to_string()
@@ -797,6 +958,60 @@ fn speak_core(core: &str, vocabulary: &Vocabulary) -> String {
     words.join(" ")
 }
 
+/// Byte length of `1.2.3` style digits at the start of `rest` (three dot-joined digit runs).
+fn version_len(rest: &str) -> Option<usize> {
+    let bytes = rest.as_bytes();
+    let mut index = 0;
+    for part in 0..3 {
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index += 1;
+        }
+        if index == start {
+            return None;
+        }
+        if part < 2 {
+            if bytes.get(index) != Some(&b'.') {
+                return None;
+            }
+            index += 1;
+        }
+    }
+    Some(index)
+}
+
+/// Today's version rule: `v1.2.3` at a word boundary becomes `version 1.2.3`; None when the
+/// token holds no version.
+fn replace_versions(token: &str) -> Option<String> {
+    let mut spoken = String::new();
+    let mut copied = 0;
+    let mut found = false;
+    for (offset, c) in token.char_indices() {
+        if c != 'v' || offset < copied {
+            continue;
+        }
+        let boundary = token[..offset]
+            .chars()
+            .next_back()
+            .is_none_or(|previous| !(previous.is_alphanumeric() || previous == '_'));
+        if !boundary {
+            continue;
+        }
+        if let Some(length) = version_len(&token[offset + 1..]) {
+            spoken.push_str(&token[copied..offset]);
+            spoken.push_str("version ");
+            spoken.push_str(&token[offset + 1..offset + 1 + length]);
+            copied = offset + 1 + length;
+            found = true;
+        }
+    }
+    if !found {
+        return None;
+    }
+    spoken.push_str(&token[copied..]);
+    Some(spoken)
+}
+
 /// Speaks one token the way an engineer reads it aloud. Exact `terms` apply first, then links
 /// and versions keep today's wording, then the kind rules; a token nothing applies to comes back
 /// unchanged. Trailing sentence punctuation is kept, wrapping punctuation is dropped.
@@ -806,7 +1021,7 @@ pub fn speak_technical(token: &str, vocabulary: &Vocabulary) -> String {
         return token.to_string();
     }
     let core = parts.core;
-    let ending: String = parts.ending.map(String::from).unwrap_or_default();
+    let ending = parts.ending.as_str();
     if let Some(say) = vocabulary.whole_term(core) {
         return format!("{say}{ending}");
     }
@@ -816,11 +1031,14 @@ pub fn speak_technical(token: &str, vocabulary: &Vocabulary) -> String {
         });
         return format!("link to {host}{ending}");
     }
-    if !core.contains('/') && VERSION.is_match(token) {
-        return VERSION.replace_all(token, "version $1").into_owned();
+    if !core.contains('/')
+        && let Some(versioned) = replace_versions(token)
+    {
+        return versioned;
     }
     let (head, line) = split_line(core, Some(vocabulary));
-    if classify(head, Some(vocabulary)).is_some() {
+    let period_follows = line.is_none() && ending.starts_with('.');
+    if classify(head, Some(vocabulary), period_follows).is_some() {
         let mut spoken = speak_core(head, vocabulary);
         if let Some((line, column)) = line {
             let _ = write!(spoken, " at line {line}");
@@ -828,7 +1046,7 @@ pub fn speak_technical(token: &str, vocabulary: &Vocabulary) -> String {
                 let _ = write!(spoken, " column {column}");
             }
         }
-        spoken.push_str(&ending);
+        spoken.push_str(ending);
         return spoken;
     }
     let pieces = vocabulary.apply_terms(core);
@@ -936,6 +1154,16 @@ mod tests {
             assert_eq!(say("config.lock"), "config dot lock");
             assert_eq!(say("fixture_base.sh"), "fixture underscore base dot S H");
             assert_eq!(say("archive.tar.gz"), "archive dot tar dot G Z");
+            assert_eq!(say("file.q"), "file dot Q");
+            assert_eq!(say("backup.7z"), "backup dot 7 Z");
+            assert_eq!(say("track.mp3"), "track dot M P 3");
+            assert_eq!(say("2024.csv"), "2024 dot C S V");
+            assert_eq!(say("file.q:12"), "file dot Q at line 12");
+            assert_eq!(say("backup.7z:3:4"), "backup dot 7 Z at line 3 column 4");
+            assert_eq!(say("file.q:12."), "file dot Q at line 12.");
+            assert!(is_technical("file.q"));
+            assert!(is_technical("backup.7z"));
+            assert!(is_technical("file.q:12"));
         }
 
         #[test]
@@ -988,6 +1216,12 @@ mod tests {
             assert_eq!(say("self.assertEqual"), "self dot assert equal");
             assert_eq!(say("os.environment"), "os dot environment");
             assert_eq!(say("a.long.chain"), "a dot long dot chain");
+            assert_eq!(say("a.b"), "a dot B");
+            assert_eq!(say("x.y.z"), "x dot y dot Z");
+            assert_eq!(say("a.b:5"), "a dot B at line 5");
+            assert_eq!(say("a.b:5:2,"), "a dot B at line 5 column 2,");
+            assert!(is_technical("a.b"));
+            assert!(is_technical("a.b:5"));
         }
 
         #[test]
@@ -1017,9 +1251,19 @@ mod tests {
         fn prose_tokens_are_not_technical() {
             for token in [
                 "e.g.",
+                "e.g",
+                "e.g.,",
+                "p.m",
+                "p.m.",
+                "a.k.a",
+                "Ph.D.",
+                "U.S",
                 "U.S.",
                 "U.S.A.",
+                "etc.)",
                 "3.14",
+                "0.10",
+                "v1.2",
                 "10:59",
                 "done.",
                 "i.e.,",
@@ -1047,6 +1291,30 @@ mod tests {
             assert_eq!(say("\"lib.sh\"?"), "lib dot S H?");
             assert_eq!(say("`fixture_base`;"), "fixture underscore base;");
             assert_eq!(say("(manager.rs:684)!"), "manager dot R S at line 684!");
+            assert_eq!(say("lib.sh..."), "lib dot S H...");
+            assert_eq!(say("lib.sh?!"), "lib dot S H?!");
+            assert_eq!(say("**lib.sh.**"), "lib dot S H.");
+        }
+
+        #[test]
+        fn the_whole_trailing_punctuation_run_is_kept() {
+            assert_eq!(say("lib.sh?!"), "lib dot S H?!");
+            assert_eq!(say("**lib.sh.**"), "lib dot S H.");
+            assert_eq!(say("\"lib.sh?\","), "lib dot S H?,");
+            assert_eq!(say("(lib.sh)..."), "lib dot S H...");
+            assert_eq!(say("`fixture_base`?!"), "fixture underscore base?!");
+            assert_eq!(say("https://github.com/x/y..."), "link to github.com...");
+            assert_eq!(say("GPU?!"), "G P U?!");
+            assert_eq!(say("kubectl;;"), "cube control;;");
+            assert!(is_technical("lib.sh..."));
+            assert!(is_technical("**lib.sh.**"));
+        }
+
+        #[test]
+        fn prose_with_punctuation_and_quotes_is_unchanged() {
+            for token in ["don't", "well-known", "1,000", "\"done.\"", "*.rs", "foo*"] {
+                assert_eq!(say(token), token);
+            }
         }
 
         #[test]
@@ -1265,6 +1533,78 @@ mod tests {
                     "{token} -> {spoken}"
                 );
             }
+        }
+
+        #[test]
+        fn user_replacements_keep_the_output_contract() {
+            let user = with_user(
+                r#"{"version":1,
+                    "symbols":{"/":"over","_":"under score"},
+                    "extensions":{"zz":"zed zed"},
+                    "terms":{"customtool":"custom tool",
+                             "^id(.+)$":{"say":"id number $1","match":"regex"}}}"#,
+            );
+            for (token, expected) in [
+                ("customtool", "custom tool"),
+                ("a/b_c.zz", "a over b under score c dot zed zed"),
+                ("id#5/x", "id number 5 over x"),
+                ("id@7", "id number 7"),
+            ] {
+                let spoken = speak_technical(token, &user);
+                assert_eq!(spoken, expected);
+                assert!(
+                    spoken.chars().all(|c| c.is_alphanumeric() || c == ' '),
+                    "{token} -> {spoken}"
+                );
+            }
+            assert_eq!(speak_technical("customtool?!", &user), "custom tool?!");
+        }
+
+        #[test]
+        fn unsafe_user_replacements_are_file_errors_naming_the_key() {
+            for (json, key) in [
+                (
+                    r#"{"version":1,"terms":{"customtool":"custom/tool"}}"#,
+                    "customtool",
+                ),
+                (
+                    r#"{"version":1,"terms":{"x":{"say":"a.b","match":"anywhere"}}}"#,
+                    "x",
+                ),
+                (r#"{"version":1,"symbols":{"/":"a/b"}}"#, "/"),
+                (r#"{"version":1,"extensions":{"sh":"S-H"}}"#, "sh"),
+                (
+                    r#"{"version":1,"terms":{"^v(.+)$":{"say":"v/$1","match":"regex"}}}"#,
+                    "^v(.+)$",
+                ),
+                (
+                    r#"{"version":1,"terms":{"^v(.+)$":{"say":"cost $$","match":"regex"}}}"#,
+                    "^v(.+)$",
+                ),
+            ] {
+                match Vocabulary::parse(json) {
+                    Err(VocabularyError::Pattern {
+                        key: found,
+                        message,
+                    }) => {
+                        assert_eq!(found, key, "{json}");
+                        assert!(message.contains("letters, digits and spaces"), "{message}");
+                    }
+                    other => panic!("{json} must be rejected, got {other:?}"),
+                }
+            }
+            assert!(
+                Vocabulary::parse(
+                    r#"{"version":1,"terms":{"^v(\\d+)$":{"say":"version ${1} x $1","match":"regex"}}}"#
+                )
+                .is_ok()
+            );
+        }
+
+        #[test]
+        fn builtin_vocabulary_parses() {
+            assert!(Vocabulary::parse(BUILTIN_JSON).is_ok());
+            assert_ne!(Vocabulary::builtin(), Vocabulary::default());
         }
     }
 }
