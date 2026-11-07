@@ -35,6 +35,9 @@ const actions = createPopupActions(
     close: async () => {
       calls.push("close");
     },
+    readClipboard: async () => {
+      calls.push("readClipboard");
+    },
     error: (key) => {
       calls.push(key);
     },
@@ -57,7 +60,20 @@ assert.equal(calls.includes("replace:older"), false);
 assert.equal(calls[calls.length - 1], "replace:newer");
 actions.event({ ...snapshot, epoch: 2, text: "stale" });
 assert.equal(snapshot.text, "read this");
+const beforeClipboard = calls.length;
+await actions.readClipboard();
+assert.deepEqual(
+  calls.slice(beforeClipboard),
+  ["readClipboard"],
+  "Read clipboard calls its command once, in any state",
+);
 await actions.close();
+await actions.readClipboard();
+assert.equal(
+  calls[calls.length - 1],
+  "close",
+  "a closed popup never reads the clipboard",
+);
 actions.event({ ...snapshot, epoch: 99, text: "late" });
 assert.equal(snapshot.text, "read this");
 console.log(
@@ -87,6 +103,7 @@ for (const [state, playCount, stopCount] of [
       },
       replaceText: async () => {},
       close: async () => {},
+      readClipboard: async () => {},
       error: () => {},
     },
   );
@@ -110,6 +127,7 @@ const empty = createPopupActions(
     },
     replaceText: async () => {},
     close: async () => {},
+    readClipboard: async () => {},
     error: () => {},
   },
 );
@@ -152,3 +170,72 @@ assert.deepEqual(
   ["prevent", "toggle", "prevent", "close"],
   "Textarea Space and Enter stay text; Ctrl+Enter and Escape route",
 );
+
+{
+  const trace: string[] = [];
+  let finishReplace: () => void = () => {};
+  const view: PopupSnapshot = {
+    ...snapshot,
+    text: "typed",
+    state: "finished",
+  };
+  const reader = createPopupActions(
+    () => view,
+    () => {},
+    {
+      play: async () => {},
+      pause: async () => {},
+      stop: async () => {
+        trace.push("stop");
+      },
+      replaceText: async (text) => {
+        await new Promise<void>((resolve) => {
+          finishReplace = resolve;
+        });
+        trace.push(`replace:${text}`);
+      },
+      close: async () => {},
+      readClipboard: async () => {
+        trace.push("readClipboard");
+      },
+      error: (key) => {
+        trace.push(key);
+      },
+    },
+  );
+  const editing = reader.edit("typed more");
+  const reading = reader.readClipboard();
+  await Promise.resolve();
+  assert.equal(
+    trace.includes("readClipboard"),
+    false,
+    "Read clipboard waits for the edit in flight",
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  finishReplace();
+  await Promise.all([editing, reading]);
+  assert.deepEqual(trace, ["stop", "replace:typed more", "readClipboard"]);
+  let reported = "";
+  const failing = createPopupActions(
+    () => view,
+    () => {},
+    {
+      play: async () => {},
+      pause: async () => {},
+      stop: async () => {},
+      replaceText: async () => {},
+      close: async () => {},
+      readClipboard: async () => {
+        throw new Error("clipboard command failed");
+      },
+      error: (key) => {
+        reported = key;
+      },
+    },
+  );
+  await failing.readClipboard();
+  assert.equal(reported, "tts.errors.generic");
+  console.log(
+    "popup Read clipboard: command, ordering and error assertions passed",
+  );
+}

@@ -1149,6 +1149,7 @@
     "pause": "일시 정지",
     "stop": "중지",
     "close": "닫기",
+    "readClipboard": "클립보드 읽기",
     "progress": "진행률",
     "time": "{{elapsed}}초 경과, {{remaining}}초 남음",
     "openModels": "텍스트 음성 변환 모델",

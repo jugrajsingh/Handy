@@ -1149,6 +1149,7 @@
     "pause": "रोकें",
     "stop": "बंद करें",
     "close": "बंद करें",
+    "readClipboard": "क्लिपबोर्ड पढ़ें",
     "progress": "प्रगति",
     "time": "{{elapsed}} सेकंड बीते, {{remaining}} सेकंड शेष",
     "openModels": "टेक्स्ट-टू-स्पीच मॉडल",

@@ -1149,6 +1149,7 @@
     "pause": "一時停止",
     "stop": "停止",
     "close": "閉じる",
+    "readClipboard": "クリップボードを読み上げる",
     "progress": "進行状況",
     "time": "経過 {{elapsed}} 秒、残り {{remaining}} 秒",
     "openModels": "音声合成モデル",

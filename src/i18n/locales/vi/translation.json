@@ -1149,6 +1149,7 @@
     "pause": "Tạm dừng",
     "stop": "Dừng",
     "close": "Đóng",
+    "readClipboard": "Đọc khay nhớ tạm",
     "progress": "Tiến độ",
     "time": "Đã qua {{elapsed}} giây, còn {{remaining}} giây",
     "openModels": "Mô hình chuyển văn bản thành giọng nói",

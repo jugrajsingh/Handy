@@ -1149,6 +1149,7 @@
     "pause": "إيقاف مؤقت",
     "stop": "إيقاف",
     "close": "إغلاق",
+    "readClipboard": "قراءة الحافظة",
     "progress": "التقدم",
     "time": "مرّت {{elapsed}} ث، تبقّت {{remaining}} ث",
     "openModels": "نماذج تحويل النص إلى كلام",

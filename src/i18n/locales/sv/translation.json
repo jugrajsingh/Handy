@@ -1149,6 +1149,7 @@
     "pause": "Pausa",
     "stop": "Stoppa",
     "close": "Stäng",
+    "readClipboard": "Läs upp urklipp",
     "progress": "Förlopp",
     "time": "{{elapsed}} s förflutet, {{remaining}} s kvar",
     "openModels": "Text-till-tal-modeller",

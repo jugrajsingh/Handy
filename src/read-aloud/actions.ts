@@ -19,6 +19,7 @@ export interface PopupDependencies {
   stop: () => Promise<void>;
   replaceText: (text: string) => Promise<void>;
   close: () => Promise<void>;
+  readClipboard: () => Promise<void>;
   error: (key: string) => void;
 }
 export function controls(snapshot: PopupSnapshot) {
@@ -114,6 +115,13 @@ export function createPopupActions(
       cancelIntent();
       if (closed || !controls(snapshot()).canStop) return;
       await attempt(dependencies.stop);
+    },
+    async readClipboard() {
+      if (closed) return;
+      cancelIntent();
+      if (editing) await writes;
+      if (closed) return;
+      await attempt(dependencies.readClipboard);
     },
     async close() {
       closed = true;

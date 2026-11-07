@@ -1149,6 +1149,7 @@
     "pause": "Pauzeren",
     "stop": "Stoppen",
     "close": "Sluiten",
+    "readClipboard": "Klembord voorlezen",
     "progress": "Voortgang",
     "time": "{{elapsed}} s verstreken, {{remaining}} s resterend",
     "openModels": "Tekst-naar-spraakmodellen",

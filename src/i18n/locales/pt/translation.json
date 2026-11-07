@@ -1149,6 +1149,7 @@
     "pause": "Pausar",
     "stop": "Parar",
     "close": "Fechar",
+    "readClipboard": "Ler a área de transferência",
     "progress": "Progresso",
     "time": "{{elapsed}} s decorridos, {{remaining}} s restantes",
     "openModels": "Modelos de conversão de texto em fala",

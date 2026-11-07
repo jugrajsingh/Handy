@@ -1149,6 +1149,7 @@
     "pause": "Pausa",
     "stop": "Stop",
     "close": "Chiudi",
+    "readClipboard": "Leggi gli appunti",
     "progress": "Avanzamento",
     "time": "{{elapsed}} s trascorsi, {{remaining}} s rimanenti",
     "openModels": "Modelli di sintesi vocale",

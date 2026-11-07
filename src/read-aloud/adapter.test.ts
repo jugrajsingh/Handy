@@ -57,6 +57,9 @@ function fixture(
       close: async () => {
         calls.push("close");
       },
+      readClipboard: async () => {
+        calls.push("readClipboard");
+      },
       error: (key) => {
         calls.push(key);
       },
@@ -347,6 +350,47 @@ if (!process.argv[2] || process.argv[2] === "draft")
   await draftAcknowledgements();
 if (!process.argv[2] || process.argv[2] === "ordering") await editBeforePlay();
 
+async function readClipboardReplacesTheDocument() {
+  const f = fixture();
+  const finished = {
+    ...initial,
+    state: "finished" as const,
+    progress: 1,
+    source_start: 3,
+    source_end: 9,
+  };
+  f.adapter.event({
+    text: "original",
+    visible: true,
+    snapshot: finished,
+    client_revision: null,
+    document_id: 1,
+  });
+  await f.adapter.edit("edited by the owner");
+  await f.adapter.readClipboard();
+  assert.deepEqual(f.calls, [
+    "stop",
+    "replace:edited by the owner",
+    "readClipboard",
+  ]);
+  f.adapter.event({
+    text: "from the clipboard",
+    visible: true,
+    snapshot: { ...initial, epoch: 2, state: "starting" },
+    client_revision: null,
+    document_id: 2,
+  });
+  const next = f.view();
+  assert.equal(next.text, "from the clipboard");
+  assert.equal(next.state, "starting");
+  assert.equal(next.progress, 0);
+  assert.equal(next.source_start, 0);
+  assert.equal(next.source_end, 0);
+  console.log("popup adapter Read clipboard document replacement passed");
+}
+if (!process.argv[2] || process.argv[2] === "clipboard")
+  await readClipboardReplacesTheDocument();
+
 // Window and field handlers share the adapter actions and consume each key once.
 {
   const { routePopupKey } = await import("./actions");
@@ -372,6 +416,7 @@ if (!process.argv[2] || process.argv[2] === "ordering") await editBeforePlay();
       close: async () => {
         calls.push("close");
       },
+      readClipboard: async () => {},
       error: () => {},
     },
   );

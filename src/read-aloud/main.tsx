@@ -62,6 +62,9 @@ function PopupApp() {
           close: async () => {
             unwrap(await commands.readAloudClose());
           },
+          readClipboard: async () => {
+            unwrap(await commands.readAloudReadClipboard());
+          },
           error: (key) => setSnapshot((old) => ({ ...old, error: key })),
         },
       ),
@@ -156,6 +159,9 @@ function PopupApp() {
       }}
       close={() => {
         void actions.close();
+      }}
+      readClipboard={() => {
+        void actions.readClipboard();
       }}
       models={() => {
         void emit("open-tts-models");

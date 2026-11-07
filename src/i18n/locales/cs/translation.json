@@ -1149,6 +1149,7 @@
     "pause": "Pozastavit",
     "stop": "Zastavit",
     "close": "Zavřít",
+    "readClipboard": "Přečíst schránku",
     "progress": "Průběh",
     "time": "Uplynulo {{elapsed}} s, zbývá {{remaining}} s",
     "openModels": "Modely převodu textu na řeč",

@@ -1149,6 +1149,7 @@
     "pause": "Pausar",
     "stop": "Detener",
     "close": "Cerrar",
+    "readClipboard": "Leer el portapapeles",
     "progress": "Progreso",
     "time": "{{elapsed}} s transcurridos, {{remaining}} s restantes",
     "openModels": "Modelos de texto a voz",

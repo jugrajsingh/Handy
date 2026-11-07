@@ -1149,6 +1149,7 @@
     "pause": "暫停",
     "stop": "停止",
     "close": "關閉",
+    "readClipboard": "朗讀剪貼簿",
     "progress": "進度",
     "time": "已經過 {{elapsed}} 秒,剩餘 {{remaining}} 秒",
     "openModels": "文字轉語音模型",

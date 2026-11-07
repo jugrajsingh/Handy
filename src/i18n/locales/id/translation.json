@@ -1149,6 +1149,7 @@
     "pause": "Jeda",
     "stop": "Berhenti",
     "close": "Tutup",
+    "readClipboard": "Baca papan klip",
     "progress": "Kemajuan",
     "time": "{{elapsed}} dtk berlalu, {{remaining}} dtk tersisa",
     "openModels": "Model Teks ke Ucapan",

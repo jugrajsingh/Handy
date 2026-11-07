@@ -805,6 +805,7 @@ pub fn run(cli_args: CliArgs) {
             tts::commands::read_aloud_play,
             tts::commands::read_aloud_pause,
             tts::commands::read_aloud_stop,
+            tts::commands::read_aloud_read_clipboard,
             tts::commands::read_aloud_close,
             tts::commands::set_tts_selection,
             tts::commands::set_tts_model,

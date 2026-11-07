@@ -102,6 +102,7 @@ pub(crate) fn dictation_start_with(
 }
 fn read_shortcut_with(
     referee: &mut Referee,
+    event: Event,
     ready: Result<(), String>,
     refused: &AtomicBool,
     log: impl FnOnce(&str),
@@ -113,7 +114,13 @@ fn read_shortcut_with(
         return Vec::new();
     }
     refused.store(false, Ordering::Release);
-    referee.apply(Event::ReadShortcut)
+    referee.apply(event)
+}
+/// Remembers the popup text after an owner edit so a later capture compares against it.
+fn record_popup_text(referee: &mut Referee, command: &SessionCommand) {
+    if let SessionCommand::Replace { text, .. } = command {
+        referee.popup_text.clone_from(text);
+    }
 }
 fn unavailable_with(error: &str, log: impl FnOnce(&str), notify: impl FnOnce()) {
     log(error);
@@ -376,7 +383,7 @@ impl TtsService {
             });
         }
         self.preview.reading_command(|| {
-            let referee = self.referee.lock().unwrap_or_else(|p| p.into_inner());
+            let mut referee = self.referee.lock().unwrap_or_else(|p| p.into_inner());
             if referee.activity == Activity::Dictating
                 && matches!(
                     command,
@@ -385,10 +392,9 @@ impl TtsService {
             {
                 return Err("tts.errors.busy".into());
             }
-            self.ready()?
-                .session
-                .send(command)
-                .map_err(|e| e.to_string())
+            let session = self.ready()?.session;
+            record_popup_text(&mut referee, &command);
+            session.send(command).map_err(|e| e.to_string())
         })
     }
     pub fn preview(&self, chosen: Selection, text: String) -> Result<(), String> {
@@ -601,6 +607,12 @@ impl TtsService {
         }
     }
     pub fn read_shortcut(self: &Arc<Self>) {
+        self.start_read(Event::ReadShortcut);
+    }
+    pub fn read_clipboard(self: &Arc<Self>) {
+        self.start_read(Event::ReadClipboard);
+    }
+    fn start_read(self: &Arc<Self>, event: Event) {
         let revision = self.fence.revision();
         let ticket = {
             let mut referee = self.referee.lock().unwrap_or_else(|p| p.into_inner());
@@ -611,6 +623,7 @@ impl TtsService {
             }
             let effects = read_shortcut_with(
                 &mut referee,
+                event,
                 self.ready().map(|_| ()),
                 &self.refused_shortcut,
                 |error| {
@@ -1027,6 +1040,86 @@ mod tests {
         drop(refresh);
         worker.join().unwrap();
     }
+    fn open_popup_referee(text: &str) -> Referee {
+        let mut referee = Referee::default();
+        referee.apply(Event::ReadShortcut);
+        let ticket = referee.ticket;
+        referee.apply(Event::Clipboard {
+            ticket,
+            text: text.into(),
+        });
+        referee
+    }
+    fn shortcut_capture(referee: &mut Referee) -> u64 {
+        let Effect::Capture { ticket } = referee.apply(Event::ReadShortcut)[0] else {
+            panic!("expected a capture")
+        };
+        ticket
+    }
+    #[test]
+    fn owner_edits_become_the_text_a_later_capture_is_compared_with() {
+        let mut referee = open_popup_referee("copied");
+        record_popup_text(
+            &mut referee,
+            &SessionCommand::Replace {
+                client_revision: Some(1),
+                text: "copied, then edited".into(),
+                autoplay: false,
+            },
+        );
+        let ticket = shortcut_capture(&mut referee);
+        assert_eq!(
+            referee.apply(Event::Clipboard {
+                ticket,
+                text: "copied, then edited".into()
+            }),
+            [Effect::StopReading, Effect::ClosePopup]
+        );
+        let mut referee = open_popup_referee("copied");
+        record_popup_text(
+            &mut referee,
+            &SessionCommand::Replace {
+                client_revision: Some(1),
+                text: "copied, then edited".into(),
+                autoplay: false,
+            },
+        );
+        let ticket = shortcut_capture(&mut referee);
+        assert_eq!(
+            referee.apply(Event::Clipboard {
+                ticket,
+                text: "copied".into()
+            }),
+            [Effect::OpenPopup {
+                text: "copied".into()
+            }]
+        );
+    }
+    #[test]
+    fn commands_other_than_a_replacement_leave_the_remembered_popup_text() {
+        let mut referee = open_popup_referee("copied");
+        record_popup_text(&mut referee, &SessionCommand::Play);
+        assert_eq!(referee.popup_text, "copied");
+    }
+    #[test]
+    fn capture_finishing_after_the_popup_closed_opens_nothing_through_the_ordered_path() {
+        let referee = Mutex::new(open_popup_referee("old"));
+        let ticket = shortcut_capture(&mut referee.lock().unwrap());
+        apply_ordered(&referee, Event::Close, |_, _| {});
+        let mut dispatched = Vec::new();
+        apply_ordered(
+            &referee,
+            Event::Clipboard {
+                ticket,
+                text: "late".into(),
+            },
+            |state, effects| {
+                assert!(!state.popup_open);
+                dispatched = effects;
+            },
+        );
+        assert!(dispatched.is_empty());
+    }
     #[test]
     fn early_shortcut_leaves_referee_unchanged_and_logs_once_until_ready() {
         for dictating in [false, true] {
@@ -1040,6 +1133,7 @@ mod tests {
             for _ in 0..2 {
                 assert!(read_shortcut_with(
                     &mut referee,
+                    Event::ReadShortcut,
                     Err("tts.errors.starting".into()),
                     &refused,
                     |_| logs += 1
@@ -1049,7 +1143,10 @@ mod tests {
             }
             assert_eq!(logs, 1);
             assert!(matches!(
-                read_shortcut_with(&mut referee, Ok(()), &refused, |_| logs += 1).as_slice(),
+                read_shortcut_with(&mut referee, Event::ReadShortcut, Ok(()), &refused, |_| {
+                    logs += 1
+                })
+                .as_slice(),
                 [Effect::Capture { .. }]
             ));
             assert!(!refused.load(Ordering::Acquire));

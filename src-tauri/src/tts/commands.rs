@@ -147,6 +147,17 @@ session_command!(read_aloud_pause, SessionCommand::Pause);
 session_command!(read_aloud_stop, SessionCommand::Stop);
 #[tauri::command]
 #[specta::specta]
+pub async fn read_aloud_read_clipboard(service: State<'_, Arc<TtsService>>) -> Result<(), String> {
+    let service = service.inner().clone();
+    blocking(move || {
+        service.ready()?;
+        service.read_clipboard();
+        Ok(())
+    })
+    .await
+}
+#[tauri::command]
+#[specta::specta]
 pub async fn read_aloud_close(service: State<'_, Arc<TtsService>>) -> Result<(), String> {
     let service = service.inner().clone();
     blocking(move || {

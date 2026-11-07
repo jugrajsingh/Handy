@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { Pause, Play, Square, X } from "lucide-react";
+import { ClipboardPaste, Pause, Play, Square, X } from "lucide-react";
 import type { SessionSnapshot } from "@/bindings";
 import { Alert } from "@/components/ui/Alert";
 import { Button } from "@/components/ui/Button";
@@ -24,6 +24,7 @@ export interface PopupProps {
   toggle: () => void;
   stop: () => void;
   close: () => void;
+  readClipboard: () => void;
   models: () => void;
 }
 export function ReadAloudPopup({
@@ -36,6 +37,7 @@ export function ReadAloudPopup({
   toggle,
   stop,
   close,
+  readClipboard,
   models,
 }: PopupProps) {
   const { t } = useTranslation();
@@ -181,6 +183,14 @@ export function ReadAloudPopup({
           ) : (
             <Play className="h-4 w-4" aria-hidden="true" />
           )}
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={readClipboard}
+          aria-label={t("tts.readClipboard")}
+        >
+          <ClipboardPaste className="h-4 w-4" aria-hidden="true" />
         </Button>
         <Button
           variant="ghost"

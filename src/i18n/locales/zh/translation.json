@@ -1149,6 +1149,7 @@
     "pause": "暂停",
     "stop": "停止",
     "close": "关闭",
+    "readClipboard": "朗读剪贴板",
     "progress": "进度",
     "time": "已用 {{elapsed}} 秒,剩余 {{remaining}} 秒",
     "openModels": "文本转语音模型",

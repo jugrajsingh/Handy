@@ -1149,6 +1149,7 @@
     "pause": "Pause",
     "stop": "Stopp",
     "close": "Schließen",
+    "readClipboard": "Zwischenablage vorlesen",
     "progress": "Fortschritt",
     "time": "{{elapsed}} s vergangen, {{remaining}} s verbleibend",
     "openModels": "Sprachausgabemodelle",

@@ -54,6 +54,7 @@ const render = (state: SessionSnapshot, editing = false) =>
         toggle={() => {}}
         stop={() => {}}
         close={() => {}}
+        readClipboard={() => {}}
         models={() => {}}
       />
     </I18nextProvider>,
@@ -122,6 +123,39 @@ assert.ok(
     progressBar.includes('aria-valuenow="20"'),
   progressBar,
 );
+for (const state of [
+  "waiting",
+  "starting",
+  "buffering",
+  "playing",
+  "paused",
+  "finished",
+  "error",
+] as const) {
+  const controlsRow = render({ ...snapshot, state }).match(
+    /<div class="flex shrink-0 items-center gap-2 border-t[^>]*>(.*?)<div role="progressbar"/s,
+  )?.[1];
+  const buttons = [
+    ...(controlsRow?.matchAll(/<button[^>]*aria-label="([^"]*)"/g) ?? []),
+  ];
+  assert.deepEqual(
+    buttons.map((match) => match[1]),
+    [
+      state === "playing" || state === "buffering" ? "Pause" : "Play",
+      en.tts.readClipboard,
+      "Stop",
+    ],
+    `${state}: Read clipboard sits next to Play`,
+  );
+  const readButton = controlsRow?.match(
+    /<button[^>]*aria-label="Read clipboard"[^>]*>(.*?)<\/button>/s,
+  );
+  assert.ok(readButton, state);
+  assert.equal(/\sdisabled(=|\s|>)/.test(readButton[0]), false, state);
+  assert.ok(readButton?.[1].includes("<svg"), `${state}: Read clipboard icon`);
+  assert.ok(readButton?.[1].includes('aria-hidden="true"'), state);
+}
+assert.equal(en.tts.readClipboard, "Read clipboard");
 const header = buffering.match(/<header[^>]*>(.*?)<\/header>/s)?.[1];
 assert.ok(
   header?.includes("Supertonic 3") && header.includes('aria-label="Close"'),
@@ -211,6 +245,7 @@ const adapter = createPopupAdapter(
       replacements.push({ text, revision });
     },
     close: async () => {},
+    readClipboard: async () => {},
     error: () => assert.fail("unexpected paste error"),
   },
 );
