@@ -153,7 +153,7 @@ impl Referee {
                 self.invalidate();
                 if !force && (is_blank(&text) || same_text(&text, &self.popup_text)) {
                     self.close_popup(&mut effects);
-                } else {
+                } else if !is_blank(&text) {
                     self.show(text, &mut effects);
                 }
             }
@@ -551,16 +551,16 @@ mod tests {
         }
 
         #[test]
-        fn read_clipboard_with_an_empty_clipboard_opens_the_empty_popup() {
-            let mut r = open_with("old text");
-            let ticket = capture(&mut r, Event::ReadClipboard);
-            assert_eq!(
-                clipboard(&mut r, ticket, ""),
-                [Effect::OpenPopup {
-                    text: String::new()
-                }]
-            );
-            assert!(r.popup_open);
+        fn read_clipboard_with_an_empty_or_blank_clipboard_keeps_the_popup_text() {
+            for blank in ["", "  \n\t"] {
+                let mut r = open_with("old text");
+                let ticket = capture(&mut r, Event::ReadClipboard);
+                assert!(clipboard(&mut r, ticket, blank).is_empty(), "{blank:?}");
+                assert!(r.popup_open && !r.capture_pending && !r.force_replace);
+                assert_eq!(r.activity, Activity::Reading);
+                assert_eq!(r.popup_text, "old text");
+                assert!(clipboard(&mut r, ticket, "late").is_empty());
+            }
         }
 
         #[test]
