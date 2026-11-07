@@ -3,7 +3,9 @@ use std::io::Write;
 use std::path::Path;
 
 /// Runs every vocabulary example and prints one PASS or FAIL line each; the built-in
-/// vocabulary alone, or merged with the user file at `path`. True only when none failed.
+/// vocabulary alone, or merged with the user file at `path`. An example runs against the shared
+/// vocabulary and each model with overrides (a model-tagged one against its model only), and a
+/// model's line ends in `[model]`. True only when none failed.
 fn check_vocabulary(path: Option<&Path>, out: &mut impl Write) -> Result<bool> {
     let vocabulary = match path {
         None => handy_tts_core::vocabulary::Vocabulary::builtin(),
@@ -18,14 +20,18 @@ fn check_vocabulary(path: Option<&Path>, out: &mut impl Write) -> Result<bool> {
     let results = handy_tts_core::vocabulary::run_examples(&vocabulary);
     let mut failed = 0_usize;
     for result in &results {
+        let label = result.model.as_ref().map_or_else(
+            || result.text.clone(),
+            |model| format!("{} [{model}]", result.text),
+        );
         if result.expected == result.actual {
-            writeln!(out, "PASS {}", result.text)?;
+            writeln!(out, "PASS {label}")?;
         } else {
             failed += 1;
             writeln!(
                 out,
-                "FAIL {}: expected \"{}\" got \"{}\"",
-                result.text, result.expected, result.actual
+                "FAIL {label}: expected \"{}\" got \"{}\"",
+                result.expected, result.actual
             )?;
         }
     }
@@ -83,6 +89,8 @@ fn main() -> Result<()> {
             _ => anyhow::bail!("unknown device"),
         };
         let (technical, options) = handy_tts::measure::technical_flags(&args[7..])?;
+        let (vocabulary, options) =
+            handy_tts::measure::vocabulary_flag(technical.is_some(), &options)?;
         let mut speed = None;
         let mut wav = None;
         let mut lanes = None;
@@ -119,6 +127,7 @@ fn main() -> Result<()> {
                 require_long_document,
                 startup_only,
                 technical,
+                vocabulary: vocabulary.as_deref(),
             },
         );
     }

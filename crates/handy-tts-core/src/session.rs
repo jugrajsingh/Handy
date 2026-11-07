@@ -30,12 +30,21 @@ fn text_cursor(
         .map_err(|_| "tts.errors.text".to_string())
 }
 
-/// The vocabulary a selection reads with: the session's, and only when technical reading is on.
+/// The vocabulary a selection reads with: the session's resolved for the selection's model, and
+/// only when technical reading is on. A model without overrides shares the session's vocabulary.
 fn reading_vocabulary(
     selection: &Selection,
     vocabulary: Option<&Arc<Vocabulary>>,
 ) -> Option<Arc<Vocabulary>> {
-    vocabulary.filter(|_| selection.technical).cloned()
+    vocabulary
+        .filter(|_| selection.technical)
+        .map(|vocabulary| {
+            if vocabulary.has_model(&selection.model_id) {
+                Arc::new(vocabulary.for_model(&selection.model_id))
+            } else {
+                vocabulary.clone()
+            }
+        })
 }
 
 fn dsp_clock() -> Box<dyn Fn() -> f64 + Send> {
@@ -3262,12 +3271,29 @@ mod tests {
         next: &str,
         earlier: &str,
     ) {
+        assert_text_change_resumes_with(
+            Vocabulary::builtin(),
+            source,
+            before,
+            after,
+            next,
+            earlier,
+        );
+    }
+    fn assert_text_change_resumes_with(
+        vocabulary: Vocabulary,
+        source: &str,
+        before: Selection,
+        after: Selection,
+        next: &str,
+        earlier: &str,
+    ) {
         let worker = FakeWorker {
             rtf: 0.01,
             seconds: 1.0,
             ..FakeWorker::default()
         };
-        let vocabulary = Some(Arc::new(Vocabulary::builtin()));
+        let vocabulary = Some(Arc::new(vocabulary));
         let mut s = Session::with_vocabulary(
             source,
             before,
@@ -3340,6 +3366,74 @@ mod tests {
             "c dot S H",
         );
         assert_eq!(source.find("tests/d.sh"), Some(33));
+    }
+    #[test]
+    fn model_change_re_resolves_the_vocabulary_and_keeps_position() {
+        let user = Vocabulary::parse(
+            r#"{"version":1,"models":{"pocket-en":{"extensions":{"sh":"ess aitch"}}}}"#,
+        )
+        .unwrap();
+        let vocabulary = Arc::new(Vocabulary::merged(&user));
+        let source = "tests/a.sh tests/b.sh tests/c.sh tests/d.sh tests/e.sh tests/f.sh tests/g.sh tests/h.sh";
+        let supertonic = Selection {
+            technical: true,
+            full_paths: false,
+            ..selection()
+        };
+        let pocket = Selection {
+            model_id: "pocket-en".into(),
+            voice: "alba".into(),
+            ..supertonic.clone()
+        };
+        let worker = FakeWorker {
+            rtf: 0.01,
+            seconds: 1.0,
+            ..FakeWorker::default()
+        };
+        let mut s = Session::with_vocabulary(
+            source,
+            supertonic,
+            worker,
+            FakeOutput::default(),
+            None,
+            Some(vocabulary),
+        )
+        .unwrap();
+        s.play().unwrap();
+        let mut now = 0.0;
+        for _ in 0..100 {
+            step(&mut s, now);
+            now += 0.1;
+            if s.snapshot().source_start > 0 {
+                break;
+            }
+        }
+        let resume = s.snapshot().source_start;
+        assert!(resume > 0, "the second chunk never became audible");
+        let before = s.worker.texts.join(" ");
+        assert!(
+            before.contains("dot S H") && !before.contains("ess aitch"),
+            "{before}"
+        );
+        let requested = s.worker.texts.len();
+        s.select(pocket, true, |_| Ok(())).unwrap();
+        for _ in 0..50 {
+            step(&mut s, now);
+            now += 0.1;
+            if s.worker.texts.len() > requested {
+                break;
+            }
+        }
+        let after = &s.worker.texts[requested..];
+        assert!(!after.is_empty(), "no request followed the model change");
+        assert!(
+            after[0].starts_with("h dot ess aitch"),
+            "the next chunk reads with the new model's vocabulary: {after:?}"
+        );
+        for text in after {
+            assert!(!text.contains("S H") && !text.contains("g dot"), "{text:?}");
+        }
+        assert_eq!(s.snapshot().source_start, resume);
     }
     #[test]
     fn technical_and_link_toggles_preserve_position_after_completed_chunk() {

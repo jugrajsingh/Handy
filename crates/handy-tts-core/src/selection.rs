@@ -8,10 +8,12 @@ pub struct SelectionChange {
     pub missing_download: bool,
 }
 /// True when the two selections prepare the source into different spoken text, so the cursor
-/// must be rebuilt: code blocks, technical reading, or full paths and links changed.
+/// must be rebuilt: code blocks, technical reading, or full paths and links changed, or the
+/// model changed with technical reading on (the vocabulary can differ per model).
 pub fn text_changed(current: &Selection, next: &Selection) -> bool {
     current.read_code != next.read_code
         || current.technical != next.technical
+        || (next.technical && current.model_id != next.model_id)
         || current.full_paths != next.full_paths
         || current.full_links != next.full_links
 }
@@ -84,6 +86,23 @@ mod tests {
             full_paths: true,
             full_links: false,
         }
+    }
+    #[test]
+    fn model_change_changes_the_text_only_with_technical_reading_on() {
+        let other = |technical: bool| Selection {
+            model_id: "supertonic-3".into(),
+            voice: "F1".into(),
+            technical,
+            ..selection()
+        };
+        let current = |technical: bool| Selection {
+            technical,
+            ..selection()
+        };
+        assert!(text_changed(&current(true), &other(true)));
+        assert!(!text_changed(&current(false), &other(false)));
+        assert!(!text_changed(&current(true), &current(true)));
+        assert!(!speed_pitch_only(&current(true), &other(true)));
     }
     #[test]
     fn settings_and_tray_transactions_replay_current_sentence_and_preserve_missing_position() {

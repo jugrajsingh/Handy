@@ -467,15 +467,7 @@ pub fn continuity(
 ) -> Result<()> {
     let model = catalog::entry(id)?;
     let source = std::fs::read_to_string(corpus).context("read explicit continuity corpus")?;
-    let vocabulary = options
-        .technical
-        .map(|_| std::sync::Arc::new(handy_tts_core::vocabulary::Vocabulary::builtin()));
-    let mut cursor = TextCursor::streaming_with(
-        &source,
-        false,
-        vocabulary.clone(),
-        options.technical.unwrap_or_default(),
-    )?;
+    let (vocabulary, mut cursor) = continuity_preview(&source, id, &options)?;
     let mut pauses = Vec::new();
     let mut prepared_texts = Vec::new();
     let long_document = source.split_whitespace().count() >= 2000;
@@ -729,6 +721,51 @@ fn write_coverage_prefix(source: &Path, samples: u64) -> Result<std::path::PathB
     Ok(path)
 }
 
+/// The vocabulary a technical continuity run reads with: the built-in one, with the user
+/// vocabulary file at `path` merged over it when given, exactly as a real read merges the file
+/// in the app data directory. The session resolves it for the model.
+pub fn technical_vocabulary(
+    path: Option<&Path>,
+) -> Result<std::sync::Arc<handy_tts_core::vocabulary::Vocabulary>> {
+    use handy_tts_core::vocabulary::Vocabulary;
+    let vocabulary = match path {
+        None => Vocabulary::builtin(),
+        Some(path) => {
+            let json = std::fs::read_to_string(path)
+                .with_context(|| format!("read vocabulary {}", path.display()))?;
+            let file = Vocabulary::parse(&json)
+                .with_context(|| format!("parse vocabulary {}", path.display()))?;
+            Vocabulary::merged(&file)
+        }
+    };
+    Ok(std::sync::Arc::new(vocabulary))
+}
+
+/// The session vocabulary and the text cursor that predicts what the session will request for
+/// model `id`: the same preparation, with the vocabulary resolved for the model as a read does.
+fn continuity_preview<'a>(
+    source: &'a str,
+    id: &str,
+    options: &ContinuityOptions<'_>,
+) -> Result<(
+    Option<std::sync::Arc<handy_tts_core::vocabulary::Vocabulary>>,
+    TextCursor<'a>,
+)> {
+    let vocabulary = options
+        .technical
+        .map(|_| technical_vocabulary(options.vocabulary))
+        .transpose()?;
+    let cursor = TextCursor::streaming_with(
+        source,
+        false,
+        vocabulary
+            .as_ref()
+            .map(|vocabulary| std::sync::Arc::new(vocabulary.for_model(id))),
+        options.technical.unwrap_or_default(),
+    )?;
+    Ok((vocabulary, cursor))
+}
+
 /// Explicit output and concurrency controls for a continuity measurement.
 pub struct ContinuityOptions<'a> {
     pub speed: f32,
@@ -739,6 +776,31 @@ pub struct ContinuityOptions<'a> {
     pub startup_only: bool,
     /// Technical reading with the built-in vocabulary and these options; `None` reads as before.
     pub technical: Option<handy_tts_core::vocabulary::TechnicalOptions>,
+    /// A user vocabulary file merged over the built-in one; needs `technical`.
+    pub vocabulary: Option<&'a Path>,
+}
+
+/// Takes `--vocabulary <path>` out of the continuity options. It only applies to technical
+/// reading, so it is refused without `--technical`. Returns the path and the remaining arguments.
+pub fn vocabulary_flag(
+    technical: bool,
+    args: &[String],
+) -> Result<(Option<std::path::PathBuf>, Vec<String>)> {
+    let mut rest = args.to_vec();
+    let path = match rest.iter().position(|arg| arg == "--vocabulary") {
+        Some(index) => {
+            ensure!(index + 1 < rest.len(), "--vocabulary needs a file path");
+            let value = rest.remove(index + 1);
+            rest.remove(index);
+            Some(std::path::PathBuf::from(value))
+        }
+        None => None,
+    };
+    ensure!(
+        technical || path.is_none(),
+        "--vocabulary needs --technical"
+    );
+    Ok((path, rest))
 }
 
 /// Splits the valueless technical reading flags out of the continuity options: `--technical`
@@ -1946,6 +2008,63 @@ mod technical_flag_tests {
     fn option_flags_without_technical_are_refused() {
         assert!(technical_flags(&args(&["--short-paths"])).is_err());
         assert!(technical_flags(&args(&["--full-links"])).is_err());
+    }
+
+    #[test]
+    fn vocabulary_flag_takes_the_path_and_needs_technical() {
+        let (path, rest) = vocabulary_flag(
+            true,
+            &args(&["--speed", "1.0", "--vocabulary", "v.json", "--wav", "x.wav"]),
+        )
+        .unwrap();
+        assert_eq!(path, Some(std::path::PathBuf::from("v.json")));
+        assert_eq!(rest, args(&["--speed", "1.0", "--wav", "x.wav"]));
+        let (path, rest) = vocabulary_flag(false, &args(&["--speed", "1.0"])).unwrap();
+        assert_eq!((path, rest), (None, args(&["--speed", "1.0"])));
+        assert!(vocabulary_flag(false, &args(&["--vocabulary", "v.json"])).is_err());
+        assert!(vocabulary_flag(true, &args(&["--vocabulary"])).is_err());
+    }
+
+    #[test]
+    fn vocabulary_file_changes_the_prepared_text_for_its_model_only() {
+        let scratch = std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap();
+        let directory = std::path::PathBuf::from(scratch)
+            .join(format!("tr4-vocabulary-flag-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("vocabulary.json");
+        std::fs::write(
+            &path,
+            r#"{"version":1,"models":{"pocket-en":{"extensions":{"sh":"ess aitch"}}}}"#,
+        )
+        .unwrap();
+        let source = "Run tests/lib.sh now.";
+        let prepared = |id: &str, file: Option<&Path>| {
+            let options = ContinuityOptions {
+                speed: 1.0,
+                wav: Path::new("unused.wav"),
+                lanes: None,
+                gpu_inputs: None,
+                require_long_document: false,
+                startup_only: false,
+                technical: Some(TechnicalOptions::default()),
+                vocabulary: file,
+            };
+            let (_, mut cursor) = continuity_preview(source, id, &options).unwrap();
+            cursor.next_chunk().unwrap().unwrap().text
+        };
+        assert_eq!(
+            prepared("pocket-en", Some(&path)),
+            "Run tests slash lib dot ess aitch now."
+        );
+        assert_eq!(
+            prepared("supertonic-3", Some(&path)),
+            "Run tests slash lib dot S H now."
+        );
+        assert_eq!(
+            prepared("pocket-en", None),
+            "Run tests slash lib dot S H now."
+        );
+        std::fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]

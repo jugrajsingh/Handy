@@ -6,6 +6,7 @@
 //! trailing sentence punctuation kept. A token that no rule applies to is returned unchanged,
 //! so callers may pass every word through it.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::sync::LazyLock;
@@ -135,6 +136,39 @@ impl Term {
 pub struct Example {
     pub text: String,
     pub spoken: String,
+    /// The catalog model id this example is checked against; without one it is checked against
+    /// the shared vocabulary and every model that has overrides.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// The sections a per-model override can hold: the top-level sections except `examples`.
+#[derive(Debug, Clone, PartialEq, Default)]
+struct Sections {
+    symbols: BTreeMap<String, String>,
+    extensions: BTreeMap<String, String>,
+    terms: Vec<(String, Term)>,
+    acronyms: BTreeSet<String>,
+}
+
+/// Puts `over` in front of `base`: an entry of `over` replaces the `base` entry with the same
+/// key and every `over` term applies before the `base` terms.
+fn overlay_terms(base: &mut Vec<(String, Term)>, over: &[(String, Term)]) {
+    let mut terms = over.to_vec();
+    terms.extend(
+        base.drain(..)
+            .filter(|(key, _)| !over.iter().any(|(over_key, _)| over_key == key)),
+    );
+    *base = terms;
+}
+
+impl Sections {
+    fn overlay(&mut self, over: &Sections) {
+        self.symbols.extend(over.symbols.clone());
+        self.extensions.extend(over.extensions.clone());
+        overlay_terms(&mut self.terms, &over.terms);
+        self.acronyms.extend(over.acronyms.iter().cloned());
+    }
 }
 
 /// A parsed and validated vocabulary file (version 1); every section is optional.
@@ -145,6 +179,7 @@ pub struct VocabularyFile {
     terms: Vec<(String, Term)>,
     acronyms: Vec<String>,
     examples: Vec<Example>,
+    models: BTreeMap<String, Sections>,
 }
 
 /// The vocabulary the rules run against: built-in entries plus the user's, user winning.
@@ -155,6 +190,8 @@ pub struct Vocabulary {
     terms: Vec<(String, Term)>,
     acronyms: BTreeSet<String>,
     examples: Vec<Example>,
+    /// Per-model overrides, already merged user over built-in; `for_model` applies one.
+    models: BTreeMap<String, Sections>,
 }
 
 #[derive(Deserialize)]
@@ -180,6 +217,22 @@ struct RawFile {
     acronyms: Vec<String>,
     #[serde(default)]
     examples: Vec<Example>,
+    #[serde(default)]
+    models: BTreeMap<String, RawModel>,
+}
+
+/// One `models` entry: the top-level sections except `examples`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawModel {
+    #[serde(default)]
+    symbols: BTreeMap<String, String>,
+    #[serde(default)]
+    extensions: BTreeMap<String, String>,
+    #[serde(default, deserialize_with = "ordered_terms")]
+    terms: Vec<(String, RawTerm)>,
+    #[serde(default)]
+    acronyms: Vec<String>,
 }
 
 enum RawTerm {
@@ -350,6 +403,59 @@ fn json_error(error: &serde_json::Error) -> VocabularyError {
     }
 }
 
+/// Validates one set of sections (the top level or one model) and compiles its terms.
+fn build_sections(
+    symbols: BTreeMap<String, String>,
+    extensions: BTreeMap<String, String>,
+    raw_terms: Vec<(String, RawTerm)>,
+    acronyms: Vec<String>,
+) -> Result<Sections, VocabularyError> {
+    for (key, spoken) in &symbols {
+        validate_spoken(key, "symbol", spoken, false)?;
+    }
+    for (key, spoken) in &extensions {
+        validate_spoken(key, "extension", spoken, false)?;
+    }
+    for acronym in &acronyms {
+        if acronym.is_empty() || !acronym.chars().all(char::is_alphanumeric) {
+            return Err(VocabularyError::Pattern {
+                key: acronym.clone(),
+                message: format!(
+                    "the acronym {acronym:?} is spelled letter by letter, so it may only hold letters and digits"
+                ),
+            });
+        }
+    }
+    let mut terms = Vec::with_capacity(raw_terms.len());
+    for (key, value) in raw_terms {
+        let term = match value {
+            RawTerm::Plain(say) => Term::new(&key, say, TermMatch::Whole, true)?,
+            RawTerm::Full(full) => Term::new(&key, full.say, full.matching, full.case)?,
+        };
+        terms.push((key, term));
+    }
+    Ok(Sections {
+        symbols,
+        extensions: extensions
+            .into_iter()
+            .map(|(key, spoken)| (key.to_lowercase(), spoken))
+            .collect(),
+        terms,
+        acronyms: acronyms.into_iter().collect(),
+    })
+}
+
+/// Names the model an entry error came from.
+fn in_model(id: &str, error: VocabularyError) -> VocabularyError {
+    match error {
+        VocabularyError::Pattern { key, message } => VocabularyError::Pattern {
+            key,
+            message: format!("in models.{id}: {message}"),
+        },
+        other => other,
+    }
+}
+
 impl Vocabulary {
     /// The vocabulary compiled into the crate.
     pub fn builtin() -> Vocabulary {
@@ -363,64 +469,79 @@ impl Vocabulary {
             return Err(VocabularyError::Version(probe.version));
         }
         let raw: RawFile = serde_json::from_str(json).map_err(|error| json_error(&error))?;
-        for (key, spoken) in &raw.symbols {
-            validate_spoken(key, "symbol", spoken, false)?;
-        }
-        for (key, spoken) in &raw.extensions {
-            validate_spoken(key, "extension", spoken, false)?;
-        }
-        for acronym in &raw.acronyms {
-            if acronym.is_empty() || !acronym.chars().all(char::is_alphanumeric) {
-                return Err(VocabularyError::Pattern {
-                    key: acronym.clone(),
-                    message: format!(
-                        "the acronym {acronym:?} is spelled letter by letter, so it may only hold letters and digits"
-                    ),
-                });
-            }
-        }
-        let mut terms = Vec::with_capacity(raw.terms.len());
-        for (key, value) in raw.terms {
-            let term = match value {
-                RawTerm::Plain(say) => Term::new(&key, say, TermMatch::Whole, true)?,
-                RawTerm::Full(full) => Term::new(&key, full.say, full.matching, full.case)?,
-            };
-            terms.push((key, term));
+        let top = build_sections(raw.symbols, raw.extensions, raw.terms, raw.acronyms)?;
+        let mut models = BTreeMap::new();
+        for (id, model) in raw.models {
+            let sections =
+                build_sections(model.symbols, model.extensions, model.terms, model.acronyms)
+                    .map_err(|error| in_model(&id, error))?;
+            models.insert(id, sections);
         }
         Ok(VocabularyFile {
-            symbols: raw.symbols,
-            extensions: raw
-                .extensions
-                .into_iter()
-                .map(|(key, spoken)| (key.to_lowercase(), spoken))
-                .collect(),
-            terms,
-            acronyms: raw.acronyms,
+            symbols: top.symbols,
+            extensions: top.extensions,
+            terms: top.terms,
+            acronyms: top.acronyms.into_iter().collect(),
             examples: raw.examples,
+            models,
         })
     }
 
     /// The built-in vocabulary with the user's entries on top: a user entry replaces a
     /// built-in one with the same key, user terms apply first, acronyms and examples are unioned.
     pub fn merged(user: &VocabularyFile) -> Vocabulary {
-        let mut merged = BUILTIN.clone();
-        merged.symbols.extend(user.symbols.clone());
-        merged.extensions.extend(user.extensions.clone());
-        let mut terms = user.terms.clone();
-        terms.extend(
-            merged
-                .terms
-                .drain(..)
-                .filter(|(key, _)| !user.terms.iter().any(|(user_key, _)| user_key == key)),
-        );
-        merged.terms = terms;
-        merged.acronyms.extend(user.acronyms.iter().cloned());
+        Self::merge_onto(BUILTIN.clone(), user)
+    }
+
+    /// `merged` over any base vocabulary: the user's top-level sections go over the base's, the
+    /// user's `models.M` over the base's `models.M`.
+    fn merge_onto(mut base: Vocabulary, user: &VocabularyFile) -> Vocabulary {
+        base.apply(&Sections {
+            symbols: user.symbols.clone(),
+            extensions: user.extensions.clone(),
+            terms: user.terms.clone(),
+            acronyms: user.acronyms.iter().cloned().collect(),
+        });
         for example in &user.examples {
-            if !merged.examples.contains(example) {
-                merged.examples.push(example.clone());
+            if !base.examples.contains(example) {
+                base.examples.push(example.clone());
             }
         }
-        merged
+        for (id, sections) in &user.models {
+            base.models.entry(id.clone()).or_default().overlay(sections);
+        }
+        base
+    }
+
+    /// Puts `over` on top of the top-level sections.
+    fn apply(&mut self, over: &Sections) {
+        self.symbols.extend(over.symbols.clone());
+        self.extensions.extend(over.extensions.clone());
+        overlay_terms(&mut self.terms, &over.terms);
+        self.acronyms.extend(over.acronyms.iter().cloned());
+    }
+
+    /// The vocabulary for a read on `model_id`. The sections resolve in this order: the user's
+    /// `models.<id>`, the built-in `models.<id>`, the user's top level, the built-in top level.
+    /// A model without overrides resolves to the shared vocabulary. The result holds no model
+    /// sections of its own, so resolving it again changes nothing.
+    pub fn for_model(&self, model_id: &str) -> Vocabulary {
+        let mut resolved = self.clone();
+        if let Some(over) = self.models.get(model_id) {
+            resolved.apply(over);
+        }
+        resolved.models.clear();
+        resolved
+    }
+
+    /// True when the vocabulary has a `models` section for `model_id`.
+    pub fn has_model(&self, model_id: &str) -> bool {
+        self.models.contains_key(model_id)
+    }
+
+    /// The model ids that have overrides, in order.
+    pub fn model_ids(&self) -> impl Iterator<Item = &str> {
+        self.models.keys().map(String::as_str)
     }
 
     /// The examples every check runs, built-in first.
@@ -435,6 +556,7 @@ impl Vocabulary {
             terms: file.terms.clone(),
             acronyms: file.acronyms.iter().cloned().collect(),
             examples: file.examples.clone(),
+            models: file.models.clone(),
         }
     }
 
@@ -1200,22 +1322,41 @@ pub fn speak_technical(token: &str, vocabulary: &Vocabulary, options: &Technical
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExampleResult {
     pub text: String,
+    /// The model the example ran against; `None` is the shared vocabulary.
+    pub model: Option<String>,
     pub expected: String,
     pub actual: String,
 }
 
 /// Runs every example and returns all outcomes in order; an outcome passes when
-/// `expected == actual`.
+/// `expected == actual`. An example with a `model` runs against that model's resolved
+/// vocabulary only; one without runs against the shared vocabulary and then each model that has
+/// overrides, so a model entry that changes a shared example's reading fails it.
 pub fn run_examples(vocabulary: &Vocabulary) -> Vec<ExampleResult> {
-    vocabulary
-        .examples
-        .iter()
-        .map(|example| ExampleResult {
+    let options = TechnicalOptions::default();
+    let run = |example: &Example, model: Option<&str>| {
+        let resolved = match model {
+            Some(id) => Cow::Owned(vocabulary.for_model(id)),
+            None => Cow::Borrowed(vocabulary),
+        };
+        ExampleResult {
             text: example.text.clone(),
+            model: model.map(str::to_owned),
             expected: example.spoken.clone(),
-            actual: speak_technical(&example.text, vocabulary, &TechnicalOptions::default()),
-        })
-        .collect()
+            actual: speak_technical(&example.text, &resolved, &options),
+        }
+    };
+    let mut results = Vec::new();
+    for example in &vocabulary.examples {
+        match example.model.as_deref() {
+            Some(id) => results.push(run(example, Some(id))),
+            None => {
+                results.push(run(example, None));
+                results.extend(vocabulary.model_ids().map(|id| run(example, Some(id))));
+            }
+        }
+    }
+    results
 }
 
 /// The examples that do not produce their expected spoken text; empty means the check passes.
@@ -1236,6 +1377,19 @@ mod tests {
 
     fn with_user(json: &str) -> Vocabulary {
         Vocabulary::merged(&Vocabulary::parse(json).expect("test vocabulary parses"))
+    }
+
+    /// A vocabulary of only `json`: no built-in entries, so every entry is the test's own.
+    fn bare(json: &str) -> Vocabulary {
+        Vocabulary::from_file(&Vocabulary::parse(json).expect("test vocabulary parses"))
+    }
+
+    fn say_for(vocabulary: &Vocabulary, model: &str, token: &str) -> String {
+        speak_technical(
+            token,
+            &vocabulary.for_model(model),
+            &TechnicalOptions::default(),
+        )
     }
 
     mod table_rows {
@@ -1432,6 +1586,191 @@ mod tests {
             assert_eq!(say("v0.10.0,"), "version 0.10.0,");
             assert!(!is_technical("https://github.com/x/y"));
             assert!(!is_technical("v1.2.3"));
+        }
+    }
+
+    mod per_model {
+        use super::*;
+
+        const POCKET_SH: &str =
+            r#"{"version":1,"models":{"pocket-en":{"extensions":{"sh":"ess aitch"}}}}"#;
+
+        #[test]
+        fn model_override_wins_for_that_model_only() {
+            let vocabulary = with_user(POCKET_SH);
+            assert_eq!(
+                say_for(&vocabulary, "pocket-en", "tests/lib.sh"),
+                "tests slash lib dot ess aitch"
+            );
+            assert_eq!(
+                say_for(&vocabulary, "supertonic-3", "tests/lib.sh"),
+                "tests slash lib dot S H"
+            );
+            assert_eq!(
+                say_for(&vocabulary, "kokoro-82m-int8", ".sh"),
+                "dot S H",
+                "a model without overrides reads the shared vocabulary"
+            );
+            assert_eq!(
+                speak_technical("lib.sh", &vocabulary, &TechnicalOptions::default()),
+                "lib dot S H",
+                "an unresolved vocabulary reads the shared sections"
+            );
+        }
+
+        #[test]
+        fn model_sections_cover_symbols_terms_and_acronyms() {
+            let vocabulary = with_user(
+                r#"{"version":1,"models":{"pocket-en":{
+                    "symbols":{"/":"stroke"},
+                    "terms":{"fooBar":"foo bahr"},
+                    "acronyms":["XYZ"]}}}"#,
+            );
+            assert_eq!(say_for(&vocabulary, "pocket-en", "a/b"), "a stroke b");
+            assert_eq!(say_for(&vocabulary, "pocket-en", "fooBar"), "foo bahr");
+            assert_eq!(say_for(&vocabulary, "pocket-en", "XYZ"), "X Y Z");
+            assert_eq!(say_for(&vocabulary, "supertonic-3", "a/b"), "a slash b");
+            assert_eq!(say_for(&vocabulary, "supertonic-3", "fooBar"), "foo bar");
+            assert_eq!(say_for(&vocabulary, "supertonic-3", "XYZ"), "XYZ");
+        }
+
+        #[test]
+        fn resolution_order_user_model_then_builtin_model_then_user_then_builtin() {
+            let builtin = |models: bool| {
+                bare(&format!(
+                    r#"{{"version":1,"symbols":{{".":"dot"}},"extensions":{{"sh":"top builtin"}}{}}}"#,
+                    if models {
+                        r#","models":{"m":{"extensions":{"sh":"model builtin"}}}"#
+                    } else {
+                        ""
+                    }
+                ))
+            };
+            let user = |top: bool, model: bool| {
+                let top = if top {
+                    r#","extensions":{"sh":"top user"}"#
+                } else {
+                    ""
+                };
+                let model = if model {
+                    r#","models":{"m":{"extensions":{"sh":"model user"}}}"#
+                } else {
+                    ""
+                };
+                Vocabulary::parse(&format!(r#"{{"version":1{top}{model}}}"#))
+                    .expect("test user file parses")
+            };
+            let read = |base: Vocabulary, file: &VocabularyFile| {
+                say_for(&Vocabulary::merge_onto(base, file), "m", "a.sh")
+            };
+            assert_eq!(read(builtin(true), &user(true, true)), "a dot model user");
+            assert_eq!(
+                read(builtin(true), &user(true, false)),
+                "a dot model builtin"
+            );
+            assert_eq!(read(builtin(false), &user(true, false)), "a dot top user");
+            assert_eq!(
+                read(builtin(false), &user(false, false)),
+                "a dot top builtin"
+            );
+        }
+
+        #[test]
+        fn terms_resolve_in_the_same_order() {
+            let base = bare(
+                r#"{"version":1,"terms":{"foo":"top builtin","bar":"bar builtin"},
+                    "models":{"m":{"terms":{"foo":"model builtin"}}}}"#,
+            );
+            let user = Vocabulary::parse(
+                r#"{"version":1,"terms":{"foo":"top user"},"models":{"m":{"terms":{"bar":"bar user"}}}}"#,
+            )
+            .expect("test user file parses");
+            let merged = Vocabulary::merge_onto(base, &user);
+            assert_eq!(say_for(&merged, "m", "foo"), "model builtin");
+            assert_eq!(say_for(&merged, "m", "bar"), "bar user");
+            assert_eq!(say_for(&merged, "other", "foo"), "top user");
+            assert_eq!(say_for(&merged, "other", "bar"), "bar builtin");
+        }
+
+        #[test]
+        fn resolved_vocabulary_holds_no_model_sections() {
+            let vocabulary = with_user(POCKET_SH);
+            let resolved = vocabulary.for_model("pocket-en");
+            assert_eq!(resolved.for_model("pocket-en"), resolved);
+            assert!(!resolved.has_model("pocket-en"));
+            assert!(vocabulary.has_model("pocket-en"));
+            assert_eq!(vocabulary.model_ids().collect::<Vec<_>>(), ["pocket-en"]);
+        }
+
+        #[test]
+        fn model_sections_are_validated_like_the_top_level() {
+            let error = Vocabulary::parse(
+                r#"{"version":1,"models":{"pocket-en":{"extensions":{"sh":"ess/aitch"}}}}"#,
+            )
+            .unwrap_err();
+            match error {
+                VocabularyError::Pattern { key, message } => {
+                    assert_eq!(key, "sh");
+                    assert!(message.contains("models.pocket-en"), "{message}");
+                }
+                other => panic!("expected a pattern error, got {other:?}"),
+            }
+            let invalid_regex =
+                r#"{"version":1,"models":{"m":{"terms":{"(":{"say":"x","match":"regex"}}}}}"#;
+            assert!(matches!(
+                Vocabulary::parse(invalid_regex),
+                Err(VocabularyError::Pattern { .. })
+            ));
+            for unknown in [
+                r#"{"version":1,"models":{"m":{"examples":[]}}}"#,
+                r#"{"version":1,"models":{"m":{"models":{}}}}"#,
+                r#"{"version":1,"models":{"m":{"colour":{}}}}"#,
+            ] {
+                assert!(
+                    matches!(
+                        Vocabulary::parse(unknown),
+                        Err(VocabularyError::Json { .. })
+                    ),
+                    "{unknown} must be a file error"
+                );
+            }
+        }
+
+        #[test]
+        fn model_tagged_example_checks_only_its_model() {
+            let vocabulary = bare(
+                r#"{"version":1,"symbols":{".":"dot"},"extensions":{"sh":"S H"},
+                    "models":{"pocket-en":{"extensions":{"sh":"ess aitch"}}},
+                    "examples":[
+                        {"text":"a.sh","spoken":"a dot ess aitch","model":"pocket-en"}]}"#,
+            );
+            let results = run_examples(&vocabulary);
+            assert_eq!(results.len(), 1, "a tagged example runs for its model only");
+            assert_eq!(results[0].model.as_deref(), Some("pocket-en"));
+            assert!(check_examples(&vocabulary).is_empty());
+            let wrong = bare(
+                r#"{"version":1,"symbols":{".":"dot"},"extensions":{"sh":"S H"},
+                    "models":{"pocket-en":{"extensions":{"sh":"ess aitch"}}},
+                    "examples":[
+                        {"text":"a.sh","spoken":"a dot ess aitch","model":"supertonic-3"}]}"#,
+            );
+            let failed = check_examples(&wrong);
+            assert_eq!(failed.len(), 1, "{failed:?}");
+            assert_eq!(failed[0].model.as_deref(), Some("supertonic-3"));
+            assert_eq!(failed[0].actual, "a dot S H");
+        }
+
+        #[test]
+        fn untagged_example_is_checked_for_every_model_with_overrides() {
+            let vocabulary = bare(
+                r#"{"version":1,"symbols":{".":"dot"},"extensions":{"sh":"S H"},
+                    "models":{"pocket-en":{"extensions":{"sh":"ess aitch"}}},
+                    "examples":[{"text":"a.sh","spoken":"a dot S H"}]}"#,
+            );
+            let failed = check_examples(&vocabulary);
+            assert_eq!(failed.len(), 1, "{failed:?}");
+            assert_eq!(failed[0].model.as_deref(), Some("pocket-en"));
+            assert_eq!(run_examples(&vocabulary).len(), 2);
         }
     }
 
@@ -1766,6 +2105,7 @@ mod tests {
                 failures,
                 vec![ExampleResult {
                     text: "lib.sh".into(),
+                    model: None,
                     expected: "lib shush".into(),
                     actual: "lib dot S H".into(),
                 }]

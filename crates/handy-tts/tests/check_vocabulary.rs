@@ -166,3 +166,51 @@ fn check_vocabulary_review_examples_pass() {
     }
     std::fs::remove_file(path).expect("remove the scratch vocabulary");
 }
+
+#[test]
+fn check_vocabulary_checks_model_examples_against_their_model() {
+    let good = scratch_file(
+        "model-good",
+        r#"{"version":1,"models":{"pocket-en":{"extensions":{"toml":"tom ell"}}},"examples":[
+            {"text":"a.toml","spoken":"a dot tom ell","model":"pocket-en"}]}"#,
+    );
+    let output = run(&[good.to_str().expect("utf-8 path")]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "model example failed: {stdout}");
+    assert!(stdout.contains("PASS a.toml [pocket-en]\n"), "{stdout}");
+    assert!(
+        !stdout.contains("PASS a.toml\n"),
+        "a tagged example must not run against the shared vocabulary: {stdout}"
+    );
+
+    let wrong = scratch_file(
+        "model-wrong",
+        r#"{"version":1,"models":{"pocket-en":{"extensions":{"toml":"tom ell"}}},"examples":[
+            {"text":"a.toml","spoken":"a dot tom ell","model":"supertonic-3"}]}"#,
+    );
+    let failed = run(&[wrong.to_str().expect("utf-8 path")]);
+    let failed_out = String::from_utf8_lossy(&failed.stdout);
+    assert_eq!(failed.status.code(), Some(1), "output: {failed_out}");
+    assert!(
+        failed_out.contains(
+            "FAIL a.toml [supertonic-3]: expected \"a dot tom ell\" got \"a dot tommel\""
+        ),
+        "{failed_out}"
+    );
+
+    let collides = scratch_file(
+        "model-collides",
+        r#"{"version":1,"models":{"pocket-en":{"extensions":{"sh":"ess aitch"}}}}"#,
+    );
+    let collided = run(&[collides.to_str().expect("utf-8 path")]);
+    let collided_out = String::from_utf8_lossy(&collided.stdout);
+    assert_eq!(collided.status.code(), Some(1), "output: {collided_out}");
+    assert!(
+        collided_out.contains("FAIL tests/lib.sh [pocket-en]"),
+        "a model entry that changes a shared example must fail it: {collided_out}"
+    );
+
+    for path in [good, wrong, collides] {
+        std::fs::remove_file(path).expect("remove the scratch vocabulary");
+    }
+}
