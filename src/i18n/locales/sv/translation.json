@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Transkriberat utan efterbearbetning",
     "filePostProcessFailed": "Efterbearbetningen slutfördes inte, så transkriptionen sparades som den är.",
     "fileTranscriptionFailedTitle": "Transkriptionen av filen misslyckades",
-    "transcriptionFailedTitle": "Transkriptionen misslyckades"
+    "transcriptionFailedTitle": "Transkriptionen misslyckades",
+    "vocabularyInvalidTitle": "Ordlistefilen innehåller ett fel",
+    "vocabularyInvalid": "Uppläsningen använde den inbyggda ordlistan eftersom din ordlistefil inte gick att använda. Rätta filen som anges nedan för att använda dina egna poster."
   },
   "notices": {
     "errorOne": "{{n}} fel",
@@ -1187,6 +1189,9 @@
     "output": "Utenhet",
     "sameAsHandy": "Samma som Handy",
     "readCode": "Läs upp kodblock",
+    "technicalReading": "Teknisk uppläsning",
+    "fullPaths": "Läs hela sökvägar",
+    "fullLinks": "Läs hela länkar",
     "pocketAttribution": "Pocket TTS-röster är licensierade under CC-BY-4.0. Följ varje rösts villkor för attribution och samtycke på modellkortet.",
     "supertonicRestrictions": "Supertonic 3 använder OpenRAIL-M. Läs igenom användningsbegränsningarna på modellkortet.",
     "kokoroAttribution": "Kokoro-modellens vikter använder licensen Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "Justera hur snabbt texten läses upp.",
       "pitch": "Justera röstens tonhöjd i halvtoner.",
       "output": "Välj var uppläsningsljudet spelas upp.",
-      "readCode": "Ta med inhägnade kodblock vid uppläsning."
+      "readCode": "Ta med inhägnade kodblock vid uppläsning.",
+      "technicalReading": "Läser upp sökvägar, filnamn, flaggor och kodnamn i sin helhet med hjälp av din ordlistefil.",
+      "fullPaths": "Läser varje mapp i en sökväg. Avstängt läses bara filnamnet.",
+      "fullLinks": "Läser hela webbadressen. Avstängt sägs bara webbplatsens namn."
     }
   }
 }

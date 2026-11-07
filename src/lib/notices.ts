@@ -53,6 +53,11 @@ const NOTICE_DISPLAY: Record<NoticeCode, NoticeDisplay> = {
     title: "errors.filePostProcessFailedTitle",
     explanation: (t) => t("errors.filePostProcessFailed"),
   },
+  // The notice's detail names the vocabulary file and the line and column of the error.
+  VocabularyInvalid: {
+    title: "errors.vocabularyInvalidTitle",
+    explanation: (t) => t("errors.vocabularyInvalid"),
+  },
 };
 
 export const noticeDisplay = (code: NoticeCode) => NOTICE_DISPLAY[code];

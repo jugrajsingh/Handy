@@ -1322,7 +1322,19 @@ transcriptionJob: "transcription-job"
  * object, so a partial store can never fail the whole load (#1619).
  * Field-level defaults below take precedence where present.
  */
-export type AppSettings = { tts_model_id?: string; tts_voice?: Partial<{ [key in string]: string }>; tts_speed?: number; tts_pitch_semitones?: number; tts_output_device?: string | null; tts_read_code_blocks?: boolean; tts_run_on?: Partial<{ [key in string]: RunOn }>; 
+export type AppSettings = { tts_model_id?: string; tts_voice?: Partial<{ [key in string]: string }>; tts_speed?: number; tts_pitch_semitones?: number; tts_output_device?: string | null; tts_read_code_blocks?: boolean; 
+/**
+ * Read paths, file names, flags and code names in full, using the vocabulary.
+ */
+tts_technical_reading?: boolean; 
+/**
+ * With technical reading, read every folder of a path; off reads the file name.
+ */
+tts_full_paths?: boolean; 
+/**
+ * With technical reading, read the whole web address; off says only the site.
+ */
+tts_full_links?: boolean; tts_run_on?: Partial<{ [key in string]: RunOn }>; 
 /**
  * Internal settings schema marker for one-time migrations. Fresh installs
  * start at the current version; existing stores missing this key are
@@ -1612,7 +1624,7 @@ detail: string | null }
 /**
  * The frontend maps each code to its text in `src/lib/notices.ts`.
  */
-export type NoticeCode = "TranscriptionFailed" | "PasteFailed" | "NoMicrophone" | "MicPermissionDenied" | "RecordingFailed" | "ModelLoadFailed" | "ReadAloudUnavailable" | "ReadAloudBusyPasting" | "PostProcessFailed" | "FileTranscriptionFailed" | "FilePostProcessFailed"
+export type NoticeCode = "TranscriptionFailed" | "PasteFailed" | "NoMicrophone" | "MicPermissionDenied" | "RecordingFailed" | "ModelLoadFailed" | "ReadAloudUnavailable" | "ReadAloudBusyPasting" | "PostProcessFailed" | "FileTranscriptionFailed" | "FilePostProcessFailed" | "VocabularyInvalid"
 export type NoticeLevel = 
 /**
  * Nothing came out, or Handy can't do its job.
@@ -1736,7 +1748,20 @@ uncovered_bindings: string[];
  * warning banner appears and explains why recording refused.
  */
 recorder_blocked: boolean }
-export type Selection = { model_id: string; voice: string; speed: number; pitch: number; output_device: string | null; read_code: boolean }
+export type Selection = { model_id: string; voice: string; speed: number; pitch: number; output_device: string | null; read_code: boolean; 
+/**
+ * Paths, file names, flags and identifiers are read with the vocabulary. Older payloads
+ * lack it and read with it off.
+ */
+technical?: boolean; 
+/**
+ * With technical reading, every path segment is read; off reads the last one.
+ */
+full_paths?: boolean; 
+/**
+ * With technical reading, a link's host and path are read; off keeps "link to <host>".
+ */
+full_links?: boolean }
 /**
  * Playback progress and errors suitable for frontend events.
  */

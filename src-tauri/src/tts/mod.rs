@@ -78,4 +78,5 @@ pub mod clipboard;
 pub mod commands;
 pub mod preparation;
 pub mod service;
+pub mod vocabulary;
 pub mod window;

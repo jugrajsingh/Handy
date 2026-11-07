@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Getranscribeerd zonder naverwerking",
     "filePostProcessFailed": "De naverwerking is niet voltooid, dus de transcriptie is ongewijzigd opgeslagen.",
     "fileTranscriptionFailedTitle": "Transcriptie van bestand mislukt",
-    "transcriptionFailedTitle": "Transcriptie mislukt"
+    "transcriptionFailedTitle": "Transcriptie mislukt",
+    "vocabularyInvalidTitle": "Woordenlijstbestand bevat een fout",
+    "vocabularyInvalid": "Voorlezen gebruikte de ingebouwde woordenlijst omdat je woordenlijstbestand niet bruikbaar was. Herstel het hieronder genoemde bestand om je eigen vermeldingen te gebruiken."
   },
   "notices": {
     "errorOne": "{{n}} fout",
@@ -1187,6 +1189,9 @@
     "output": "Uitvoerapparaat",
     "sameAsHandy": "Hetzelfde als Handy",
     "readCode": "Codeblokken voorlezen",
+    "technicalReading": "Technisch voorlezen",
+    "fullPaths": "Volledige paden voorlezen",
+    "fullLinks": "Volledige links voorlezen",
     "pocketAttribution": "Pocket TTS-stemmen vallen onder de licentie CC-BY-4.0. Volg de naamsvermelding en toestemmingsvoorwaarden van elke stem op de modelkaart.",
     "supertonicRestrictions": "Supertonic 3 gebruikt OpenRAIL-M. Bekijk de gebruiksbeperkingen op de modelkaart.",
     "kokoroAttribution": "De modelgewichten van Kokoro vallen onder de Apache-2.0-licentie.",
@@ -1214,7 +1219,10 @@
       "speed": "Pas aan hoe snel de tekst wordt voorgelezen.",
       "pitch": "Pas de toonhoogte van de stem aan in halve tonen.",
       "output": "Kies waar de audio van het voorlezen wordt afgespeeld.",
-      "readCode": "Neem omheinde codeblokken mee bij het voorlezen."
+      "readCode": "Neem omheinde codeblokken mee bij het voorlezen.",
+      "technicalReading": "Spreekt paden, bestandsnamen, opties en codenamen volledig uit met behulp van je woordenlijstbestand.",
+      "fullPaths": "Leest elke map in een pad voor. Uit leest alleen de bestandsnaam voor.",
+      "fullLinks": "Leest het hele webadres voor. Uit noemt alleen de sitenaam."
     }
   }
 }

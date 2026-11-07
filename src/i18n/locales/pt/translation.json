@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Transcrito sem pós-processamento",
     "filePostProcessFailed": "O pós-processamento não terminou, então a transcrição foi salva como está.",
     "fileTranscriptionFailedTitle": "Falha na transcrição do arquivo",
-    "transcriptionFailedTitle": "Falha na transcrição"
+    "transcriptionFailedTitle": "Falha na transcrição",
+    "vocabularyInvalidTitle": "O arquivo de vocabulário tem um erro",
+    "vocabularyInvalid": "A leitura em voz alta usou o vocabulário integrado porque não foi possível usar o seu arquivo de vocabulário. Corrija o arquivo indicado abaixo para usar as suas próprias entradas."
   },
   "notices": {
     "errorOne": "{{n}} erro",
@@ -1187,6 +1189,9 @@
     "output": "Dispositivo de saída",
     "sameAsHandy": "Igual ao Handy",
     "readCode": "Ler blocos de código",
+    "technicalReading": "Leitura técnica",
+    "fullPaths": "Ler caminhos completos",
+    "fullLinks": "Ler links completos",
     "pocketAttribution": "As vozes do Pocket TTS são licenciadas sob CC-BY-4.0. Siga a atribuição e os termos de consentimento de cada voz no cartão do modelo.",
     "supertonicRestrictions": "O Supertonic 3 usa OpenRAIL-M. Consulte as restrições de uso no cartão do modelo.",
     "kokoroAttribution": "Os pesos do modelo Kokoro usam a licença Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "Ajuste a velocidade de leitura do texto.",
       "pitch": "Ajuste o tom da voz em semitons.",
       "output": "Escolha onde o áudio da leitura em voz alta é reproduzido.",
-      "readCode": "Inclui blocos de código delimitados na leitura."
+      "readCode": "Inclui blocos de código delimitados na leitura.",
+      "technicalReading": "Pronuncia caminhos, nomes de arquivo, opções e nomes de código por inteiro, usando o seu arquivo de vocabulário.",
+      "fullPaths": "Lê cada pasta de um caminho. Desativado, lê apenas o nome do arquivo.",
+      "fullLinks": "Lê o endereço web inteiro. Desativado, diz apenas o nome do site."
     }
   }
 }

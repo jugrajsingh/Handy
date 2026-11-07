@@ -16,6 +16,9 @@ export interface TtsSelection {
   pitch: number;
   output_device: string | null;
   read_code: boolean;
+  technical?: boolean;
+  full_paths?: boolean;
+  full_links?: boolean;
 }
 export interface SelectionDependencies {
   select: (selection: TtsSelection) => Promise<void>;

@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "후처리 없이 받아씀",
     "filePostProcessFailed": "후처리가 완료되지 않아 받아쓰기 결과를 그대로 저장했습니다.",
     "fileTranscriptionFailedTitle": "파일 음성 인식 실패",
-    "transcriptionFailedTitle": "음성 인식 실패"
+    "transcriptionFailedTitle": "음성 인식 실패",
+    "vocabularyInvalidTitle": "어휘 파일에 오류가 있습니다",
+    "vocabularyInvalid": "어휘 파일을 사용할 수 없어 소리 내어 읽기에 기본 제공 어휘를 사용했습니다. 직접 만든 항목을 사용하려면 아래에 표시된 파일을 수정하세요."
   },
   "notices": {
     "errorOne": "오류 {{n}}개",
@@ -1187,6 +1189,9 @@
     "output": "출력 장치",
     "sameAsHandy": "Handy와 동일",
     "readCode": "코드 블록 읽기",
+    "technicalReading": "기술 용어 읽기",
+    "fullPaths": "전체 경로 읽기",
+    "fullLinks": "전체 링크 읽기",
     "pocketAttribution": "Pocket TTS 음성은 CC-BY-4.0 라이선스로 제공됩니다. 모델 카드에 안내된 각 음성의 출처 표시 및 동의 조건을 따르세요.",
     "supertonicRestrictions": "Supertonic 3은 OpenRAIL-M을 사용합니다. 모델 카드에서 사용 제한을 확인하세요.",
     "kokoroAttribution": "Kokoro 모델 가중치는 Apache-2.0 라이선스를 사용합니다.",
@@ -1214,7 +1219,10 @@
       "speed": "텍스트를 읽는 속도를 조정합니다.",
       "pitch": "음성 피치를 반음 단위로 조정합니다.",
       "output": "소리 내어 읽기 오디오를 재생할 위치를 선택합니다.",
-      "readCode": "읽을 때 코드 블록을 포함합니다."
+      "readCode": "읽을 때 코드 블록을 포함합니다.",
+      "technicalReading": "어휘 파일을 사용해 경로, 파일 이름, 플래그, 코드 이름을 생략 없이 읽습니다.",
+      "fullPaths": "경로의 모든 폴더를 읽습니다. 끄면 파일 이름만 읽습니다.",
+      "fullLinks": "웹 주소 전체를 읽습니다. 끄면 사이트 이름만 말합니다."
     }
   }
 }

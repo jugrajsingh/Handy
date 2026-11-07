@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Transcribed Without Post-Processing",
     "filePostProcessFailed": "Post Process didn't finish, so the transcript was saved as is.",
     "fileTranscriptionFailedTitle": "File Transcription Failed",
-    "transcriptionFailedTitle": "Transcription Failed"
+    "transcriptionFailedTitle": "Transcription Failed",
+    "vocabularyInvalidTitle": "Vocabulary File Has an Error",
+    "vocabularyInvalid": "Read aloud used the built-in vocabulary because your vocabulary file could not be used. Fix the file named below to use your own entries."
   },
   "notices": {
     "errorOne": "{{n}} error",
@@ -1187,6 +1189,9 @@
     "output": "Output device",
     "sameAsHandy": "Same as Handy",
     "readCode": "Read code blocks",
+    "technicalReading": "Technical reading",
+    "fullPaths": "Read full paths",
+    "fullLinks": "Read full links",
     "pocketAttribution": "Pocket TTS voices are licensed under CC-BY-4.0. Follow each voice attribution and consent terms on the model card.",
     "supertonicRestrictions": "Supertonic 3 uses OpenRAIL-M. Review its use restrictions on the model card.",
     "kokoroAttribution": "Kokoro model weights use the Apache-2.0 licence.",
@@ -1214,7 +1219,10 @@
       "speed": "Adjust how fast the text is read.",
       "pitch": "Adjust the voice pitch in semitones.",
       "output": "Choose where read-aloud audio plays.",
-      "readCode": "Include fenced code blocks when reading."
+      "readCode": "Include fenced code blocks when reading.",
+      "technicalReading": "Speak paths, file names, flags and code names in full, using your vocabulary file.",
+      "fullPaths": "Read every folder in a path. Off reads only the file name.",
+      "fullLinks": "Read the whole web address. Off says only the site name."
     }
   }
 }

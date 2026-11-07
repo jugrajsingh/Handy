@@ -73,6 +73,9 @@ export function SettingsPage() {
       pitch: settings.tts_pitch_semitones ?? 0,
       output_device: settings.tts_output_device ?? null,
       read_code: settings.tts_read_code_blocks ?? false,
+      technical: settings.tts_technical_reading ?? true,
+      full_paths: settings.tts_full_paths ?? true,
+      full_links: settings.tts_full_links ?? false,
     };
   }, [settings, models]);
   useEffect(() => {
@@ -218,6 +221,29 @@ export function SettingsControls({
           grouped
           checked={selected.read_code}
           onChange={(read_code) => change({ read_code })}
+        />
+        <ToggleSwitch
+          label={t("tts.technicalReading")}
+          description={t("tts.help.technicalReading")}
+          grouped
+          checked={selected.technical ?? false}
+          onChange={(technical) => change({ technical })}
+        />
+        <ToggleSwitch
+          label={t("tts.fullPaths")}
+          description={t("tts.help.fullPaths")}
+          grouped
+          disabled={!selected.technical}
+          checked={selected.full_paths ?? true}
+          onChange={(full_paths) => change({ full_paths })}
+        />
+        <ToggleSwitch
+          label={t("tts.fullLinks")}
+          description={t("tts.help.fullLinks")}
+          grouped
+          disabled={!selected.technical}
+          checked={selected.full_links ?? false}
+          onChange={(full_links) => change({ full_links })}
         />
       </SettingsGroup>
     </section>

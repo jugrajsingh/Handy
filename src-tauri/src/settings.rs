@@ -448,6 +448,15 @@ pub struct AppSettings {
     pub tts_output_device: Option<String>,
     #[serde(default)]
     pub tts_read_code_blocks: bool,
+    /// Read paths, file names, flags and code names in full, using the vocabulary.
+    #[serde(default = "default_tts_technical_reading")]
+    pub tts_technical_reading: bool,
+    /// With technical reading, read every folder of a path; off reads the file name.
+    #[serde(default = "default_tts_full_paths")]
+    pub tts_full_paths: bool,
+    /// With technical reading, read the whole web address; off says only the site.
+    #[serde(default)]
+    pub tts_full_links: bool,
     #[serde(default)]
     pub tts_run_on: std::collections::BTreeMap<String, handy_tts_core::device::RunOn>,
 
@@ -1035,6 +1044,12 @@ pub const SETTINGS_STORE_PATH: &str = "settings_store.json";
 pub fn default_tts_model() -> String {
     "pocket-en".into()
 }
+pub fn default_tts_technical_reading() -> bool {
+    true
+}
+pub fn default_tts_full_paths() -> bool {
+    true
+}
 pub fn default_tts_speed() -> f32 {
     1.0
 }
@@ -1118,6 +1133,9 @@ pub fn get_default_settings() -> AppSettings {
         tts_pitch_semitones: 0.0,
         tts_output_device: None,
         tts_read_code_blocks: false,
+        tts_technical_reading: default_tts_technical_reading(),
+        tts_full_paths: default_tts_full_paths(),
+        tts_full_links: false,
         tts_run_on: std::collections::BTreeMap::new(),
         settings_schema_version: default_settings_schema_version(),
         bindings,
@@ -2389,6 +2407,9 @@ mod tts_defaults_tests {
             "tts_pitch_semitones",
             "tts_output_device",
             "tts_read_code_blocks",
+            "tts_technical_reading",
+            "tts_full_paths",
+            "tts_full_links",
             "tts_run_on",
         ] {
             value.as_object_mut().unwrap().remove(key);
@@ -2399,6 +2420,9 @@ mod tts_defaults_tests {
         assert_eq!(settings.tts_pitch_semitones, 0.0);
         assert_eq!(settings.tts_output_device, None);
         assert!(!settings.tts_read_code_blocks);
+        assert!(settings.tts_technical_reading);
+        assert!(settings.tts_full_paths);
+        assert!(!settings.tts_full_links);
         assert!(settings.tts_run_on.is_empty());
         assert_eq!(settings.tts_voice["pocket-en"], "alba");
         assert_eq!(

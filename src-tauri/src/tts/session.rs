@@ -18,6 +18,9 @@ struct Work {
     selection: Selection,
     id: u64,
 }
+/// Loads the vocabulary a document is read with; called at the start of every document.
+pub type VocabularyLoader =
+    Arc<dyn Fn() -> Arc<handy_tts_core::vocabulary::Vocabulary> + Send + Sync>;
 type CompletionWake = Arc<Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>;
 
 type MemoryProbe = Arc<dyn Fn() -> Result<u64, TtsError> + Send + Sync>;
@@ -390,6 +393,7 @@ impl ReadAloudSession {
         manager: Arc<TtsManager>,
         selection: Selection,
         handy_output: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+        vocabulary: VocabularyLoader,
         emit: Arc<dyn Fn(SessionEvent) + Send + Sync>,
     ) -> Arc<Self> {
         let worker = ManagerWorker::new(manager.clone());
@@ -399,6 +403,7 @@ impl ReadAloudSession {
             super::playback::RodioOutput::default,
             selection,
             handy_output,
+            vocabulary,
             emit,
         )
     }
@@ -421,6 +426,7 @@ impl ReadAloudSession {
             output,
             selection,
             Arc::new(move || handy_output.clone()),
+            Arc::new(|| Arc::new(handy_tts_core::vocabulary::Vocabulary::builtin())),
             emit,
         )
     }
@@ -430,6 +436,7 @@ impl ReadAloudSession {
         output: impl Fn() -> O + Send + 'static,
         selection: Selection,
         handy_output: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+        vocabulary: VocabularyLoader,
         emit: Arc<dyn Fn(SessionEvent) + Send + Sync>,
     ) -> Arc<Self>
     where
@@ -478,12 +485,13 @@ impl ReadAloudSession {
             let mut epoch = 0;
             let mut last_emit = Instant::now() - Duration::from_secs(1);
             'document: loop {
-                let mut session = match Session::new(
+                let mut session = match Session::with_vocabulary(
                     &source,
                     selected.clone(),
                     worker.clone(),
                     output(),
                     handy_output().as_deref(),
+                    Some(vocabulary()),
                 ) {
                     Ok(session) => session,
                     Err(error) => {
@@ -1247,6 +1255,109 @@ pub(super) mod tests {
         }
         panic!("session did not reach {state:?}");
     }
+    mod vocabulary_loading {
+        use super::*;
+        use handy_tts_core::vocabulary::Vocabulary;
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Clone)]
+        struct TextEngine(mpsc::Sender<String>);
+        impl Worker for TextEngine {
+            fn request(&mut self, _: Ticket, text: &str, _: &Selection) -> Result<(), String> {
+                self.0.send(text.to_owned()).unwrap();
+                Ok(())
+            }
+            fn poll(&mut self) -> Option<Completion> {
+                None
+            }
+            fn cancel(&mut self, _: Ticket) {}
+            fn selection_changed(&mut self) {}
+        }
+        fn technical_selection(technical: bool) -> Selection {
+            Selection {
+                technical,
+                ..selection()
+            }
+        }
+        fn read(
+            technical: bool,
+            loader: VocabularyLoader,
+            text: &str,
+        ) -> (Arc<ReadAloudSession>, mpsc::Receiver<String>) {
+            let (sent, texts) = mpsc::channel();
+            let reading = ReadAloudSession::spawn_with_output_settings(
+                manager(),
+                TextEngine(sent),
+                Audio::default,
+                technical_selection(technical),
+                Arc::new(|| None),
+                loader,
+                Arc::new(|_| {}),
+            );
+            reading
+                .send(SessionCommand::Replace {
+                    text: text.into(),
+                    autoplay: true,
+                    client_revision: None,
+                })
+                .unwrap();
+            (reading, texts)
+        }
+
+        #[test]
+        fn the_loaded_vocabulary_is_used_for_the_document() {
+            let loader: VocabularyLoader = Arc::new(|| {
+                let file =
+                    Vocabulary::parse(r#"{ "version": 1, "extensions": { "sh": "shell" } }"#)
+                        .unwrap();
+                Arc::new(Vocabulary::merged(&file))
+            });
+            let (reading, texts) = read(true, loader, "Edit lib.sh in the repository today.");
+            let first = texts.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(first.contains("lib dot shell"), "{first}");
+            assert!(reading.shutdown());
+        }
+
+        #[test]
+        fn technical_off_reads_prose_text_as_today() {
+            let loader: VocabularyLoader = Arc::new(|| Arc::new(Vocabulary::builtin()));
+            let (reading, texts) = read(false, loader, "Edit lib.sh in the repository today.");
+            let first = texts.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(first.contains("lib.sh"), "{first}");
+            assert!(!first.contains("dot"), "{first}");
+            assert!(reading.shutdown());
+        }
+
+        #[test]
+        fn the_vocabulary_is_loaded_again_for_each_document() {
+            let loads = Arc::new(AtomicUsize::new(0));
+            let counted = loads.clone();
+            let loader: VocabularyLoader = Arc::new(move || {
+                let call = counted.fetch_add(1, Ordering::SeqCst);
+                let say = ["zero", "one", "two", "three"][call.min(3)];
+                let file = Vocabulary::parse(&format!(
+                    r#"{{ "version": 1, "extensions": {{ "sh": "{say}" }} }}"#
+                ))
+                .unwrap();
+                Arc::new(Vocabulary::merged(&file))
+            });
+            // The session opens on an empty document (load 0) before the first text arrives.
+            let (reading, texts) = read(true, loader, "Edit lib.sh in the repository today.");
+            let first = texts.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(first.contains("lib dot one"), "{first}");
+            reading
+                .send(SessionCommand::Replace {
+                    text: "Then edit lib.sh once more today.".into(),
+                    autoplay: true,
+                    client_revision: None,
+                })
+                .unwrap();
+            let second = texts.recv_timeout(Duration::from_secs(3)).unwrap();
+            assert!(second.contains("lib dot two"), "{second}");
+            assert_eq!(loads.load(Ordering::SeqCst), 3);
+            assert!(reading.shutdown());
+        }
+    }
     mod model_selection {
         use super::*;
         #[test]
@@ -1260,6 +1371,35 @@ pub(super) mod tests {
                 |_| panic!("incomplete model must not persist"),
             );
             assert_eq!(result, Err("tts.errors.notDownloaded".into()));
+            assert!(reading.shutdown());
+        }
+        #[test]
+        fn settings_command_persists_the_technical_reading_choices() {
+            let reading = actor(Arc::new(Mutex::new(SharedAudio::default())));
+            let chosen = Selection {
+                technical: false,
+                full_paths: false,
+                full_links: true,
+                ..selection()
+            };
+            let saved = Arc::new(Mutex::new(None));
+            let store = saved.clone();
+            super::super::super::commands::select_with_store(
+                chosen.clone(),
+                true,
+                &reading,
+                crate::settings::get_default_settings,
+                move |settings| {
+                    *store.lock().unwrap() = Some(settings);
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let settings = saved.lock().unwrap().take().unwrap();
+            assert!(!settings.tts_technical_reading);
+            assert!(!settings.tts_full_paths);
+            assert!(settings.tts_full_links);
+            assert_eq!(super::super::super::service::selection(&settings), chosen);
             assert!(reading.shutdown());
         }
         #[test]
@@ -1367,6 +1507,7 @@ pub(super) mod tests {
             move || RecoveringAudio(capture.clone()),
             selection(),
             Arc::new(move || setting.lock().unwrap().clone()),
+            Arc::new(|| Arc::new(handy_tts_core::vocabulary::Vocabulary::builtin())),
             Arc::new(|_| {}),
         );
         reading

@@ -51,6 +51,7 @@ pub enum NoticeCode {
     PostProcessFailed,
     FileTranscriptionFailed,
     FilePostProcessFailed,
+    VocabularyInvalid,
 }
 
 impl NoticeCode {
@@ -65,7 +66,9 @@ impl NoticeCode {
             | Self::ReadAloudBusyPasting
             | Self::ModelLoadFailed
             | Self::FileTranscriptionFailed => NoticeLevel::Error,
-            Self::PostProcessFailed | Self::FilePostProcessFailed => NoticeLevel::Warning,
+            Self::PostProcessFailed | Self::FilePostProcessFailed | Self::VocabularyInvalid => {
+                NoticeLevel::Warning
+            }
         }
     }
 
@@ -83,6 +86,7 @@ impl NoticeCode {
             Self::PostProcessFailed => &strings.post_process_failed_title,
             Self::FileTranscriptionFailed => &strings.file_transcription_failed_title,
             Self::FilePostProcessFailed => &strings.file_post_process_failed_title,
+            Self::VocabularyInvalid => &strings.vocabulary_invalid_title,
         }
     }
 }

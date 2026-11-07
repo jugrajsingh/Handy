@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "已转录，未经后处理",
     "filePostProcessFailed": "后处理未完成，因此按原样保存转录内容。",
     "fileTranscriptionFailedTitle": "文件转录失败",
-    "transcriptionFailedTitle": "转录失败"
+    "transcriptionFailedTitle": "转录失败",
+    "vocabularyInvalidTitle": "词汇文件有错误",
+    "vocabularyInvalid": "由于无法使用你的词汇文件，朗读使用了内置词汇。请修复下方指出的文件，以使用你自己的条目。"
   },
   "notices": {
     "errorOne": "{{n}} 个错误",
@@ -1187,6 +1189,9 @@
     "output": "输出设备",
     "sameAsHandy": "与 Handy 相同",
     "readCode": "朗读代码块",
+    "technicalReading": "技术朗读",
+    "fullPaths": "朗读完整路径",
+    "fullLinks": "朗读完整链接",
     "pocketAttribution": "Pocket TTS 语音采用 CC-BY-4.0 许可。请遵守模型卡上各语音的署名和授权条款。",
     "supertonicRestrictions": "Supertonic 3 采用 OpenRAIL-M。请查阅模型卡上的使用限制。",
     "kokoroAttribution": "Kokoro 模型权重采用 Apache-2.0 许可。",
@@ -1214,7 +1219,10 @@
       "speed": "调整文本朗读的速度。",
       "pitch": "以半音为单位调整语音音高。",
       "output": "选择朗读音频的播放位置。",
-      "readCode": "朗读时包含围栏代码块。"
+      "readCode": "朗读时包含围栏代码块。",
+      "technicalReading": "借助你的词汇文件，完整朗读路径、文件名、命令行标志和代码名称。",
+      "fullPaths": "朗读路径中的每个文件夹。关闭后只朗读文件名。",
+      "fullLinks": "朗读完整的网址。关闭后只说网站名称。"
     }
   }
 }

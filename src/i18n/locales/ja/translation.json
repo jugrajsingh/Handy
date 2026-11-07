@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "後処理なしで文字起こししました",
     "filePostProcessFailed": "後処理が完了しなかったため、文字起こしをそのまま保存しました。",
     "fileTranscriptionFailedTitle": "ファイルの文字起こしに失敗しました",
-    "transcriptionFailedTitle": "文字起こしに失敗しました"
+    "transcriptionFailedTitle": "文字起こしに失敗しました",
+    "vocabularyInvalidTitle": "語彙ファイルにエラーがあります",
+    "vocabularyInvalid": "語彙ファイルを使用できなかったため、読み上げには組み込みの語彙を使用しました。ご自身の項目を使うには、下に示すファイルを修正してください。"
   },
   "notices": {
     "errorOne": "エラー {{n}} 件",
@@ -1187,6 +1189,9 @@
     "output": "出力デバイス",
     "sameAsHandy": "Handy と同じ",
     "readCode": "コードブロックを読み上げ",
+    "technicalReading": "技術的な読み上げ",
+    "fullPaths": "パスを全体で読み上げ",
+    "fullLinks": "リンクを全体で読み上げ",
     "pocketAttribution": "Pocket TTS の音声は CC-BY-4.0 でライセンスされています。モデルカードに記載された各音声のクレジット表記と同意条件に従ってください。",
     "supertonicRestrictions": "Supertonic 3 は OpenRAIL-M を使用しています。モデルカードで使用制限を確認してください。",
     "kokoroAttribution": "Kokoro のモデルウェイトは Apache-2.0 ライセンスです。",
@@ -1214,7 +1219,10 @@
       "speed": "テキストを読み上げる速さを調整します。",
       "pitch": "音声のピッチを半音単位で調整します。",
       "output": "読み上げ音声の再生先を選択します。",
-      "readCode": "読み上げ時にコードブロックを含めます。"
+      "readCode": "読み上げ時にコードブロックを含めます。",
+      "technicalReading": "パス、ファイル名、フラグ、コード名を、語彙ファイルを使って省略せずに読み上げます。",
+      "fullPaths": "パス内のすべてのフォルダを読み上げます。オフの場合はファイル名だけを読み上げます。",
+      "fullLinks": "Webアドレス全体を読み上げます。オフの場合はサイト名だけを読み上げます。"
     }
   }
 }

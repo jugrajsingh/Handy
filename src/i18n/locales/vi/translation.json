@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Đã chép lời không qua xử lý sau",
     "filePostProcessFailed": "Xử lý sau chưa hoàn tất nên bản chép lời được lưu nguyên trạng.",
     "fileTranscriptionFailedTitle": "Phiên âm tệp thất bại",
-    "transcriptionFailedTitle": "Phiên âm thất bại"
+    "transcriptionFailedTitle": "Phiên âm thất bại",
+    "vocabularyInvalidTitle": "Tệp từ vựng có lỗi",
+    "vocabularyInvalid": "Tính năng đọc thành tiếng đã dùng từ vựng tích hợp vì không thể dùng tệp từ vựng của bạn. Hãy sửa tệp được nêu bên dưới để dùng các mục của riêng bạn."
   },
   "notices": {
     "errorOne": "{{n}} lỗi",
@@ -1187,6 +1189,9 @@
     "output": "Thiết bị đầu ra",
     "sameAsHandy": "Giống Handy",
     "readCode": "Đọc khối mã",
+    "technicalReading": "Đọc kỹ thuật",
+    "fullPaths": "Đọc đầy đủ đường dẫn",
+    "fullLinks": "Đọc đầy đủ liên kết",
     "pocketAttribution": "Giọng Pocket TTS được cấp phép theo CC-BY-4.0. Hãy tuân thủ ghi công và điều khoản đồng ý của từng giọng trên thẻ mô hình.",
     "supertonicRestrictions": "Supertonic 3 dùng OpenRAIL-M. Hãy xem các hạn chế sử dụng trên thẻ mô hình.",
     "kokoroAttribution": "Trọng số mô hình Kokoro dùng giấy phép Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "Điều chỉnh tốc độ đọc văn bản.",
       "pitch": "Điều chỉnh cao độ giọng theo nửa cung.",
       "output": "Chọn nơi phát âm thanh đọc to.",
-      "readCode": "Bao gồm các khối mã khi đọc."
+      "readCode": "Bao gồm các khối mã khi đọc.",
+      "technicalReading": "Đọc đầy đủ đường dẫn, tên tệp, cờ lệnh và tên trong mã, dùng tệp từ vựng của bạn.",
+      "fullPaths": "Đọc từng thư mục trong đường dẫn. Khi tắt, chỉ đọc tên tệp.",
+      "fullLinks": "Đọc toàn bộ địa chỉ web. Khi tắt, chỉ nói tên trang web."
     }
   }
 }

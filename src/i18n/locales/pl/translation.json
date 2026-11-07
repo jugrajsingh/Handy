@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Przetranskrybowano bez postprocesu",
     "filePostProcessFailed": "Postproces nie został ukończony, więc transkrypcja została zapisana bez zmian.",
     "fileTranscriptionFailedTitle": "Transkrypcja pliku nie powiodła się",
-    "transcriptionFailedTitle": "Transkrypcja nie powiodła się"
+    "transcriptionFailedTitle": "Transkrypcja nie powiodła się",
+    "vocabularyInvalidTitle": "Plik słownika zawiera błąd",
+    "vocabularyInvalid": "Czytanie na głos użyło wbudowanego słownika, ponieważ Twojego pliku słownika nie dało się użyć. Popraw plik wskazany poniżej, aby używać własnych wpisów."
   },
   "notices": {
     "errorOne": "{{n}} błąd",
@@ -1187,6 +1189,9 @@
     "output": "Urządzenie wyjściowe",
     "sameAsHandy": "Takie samo jak w Handy",
     "readCode": "Czytaj bloki kodu",
+    "technicalReading": "Czytanie techniczne",
+    "fullPaths": "Czytaj pełne ścieżki",
+    "fullLinks": "Czytaj pełne linki",
     "pocketAttribution": "Głosy Pocket TTS są licencjonowane na zasadach CC-BY-4.0. Przestrzegaj warunków uznania autorstwa i zgody dla każdego głosu podanych na karcie modelu.",
     "supertonicRestrictions": "Supertonic 3 używa licencji OpenRAIL-M. Zapoznaj się z ograniczeniami użycia na karcie modelu.",
     "kokoroAttribution": "Wagi modelu Kokoro są objęte licencją Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "Dostosuj szybkość czytania tekstu.",
       "pitch": "Dostosuj wysokość głosu w półtonach.",
       "output": "Wybierz, gdzie odtwarzany jest dźwięk czytania na głos.",
-      "readCode": "Uwzględniaj bloki kodu w ogrodzeniu podczas czytania."
+      "readCode": "Uwzględniaj bloki kodu w ogrodzeniu podczas czytania.",
+      "technicalReading": "Wymawia w całości ścieżki, nazwy plików, flagi i nazwy w kodzie, korzystając z Twojego pliku słownika.",
+      "fullPaths": "Czyta każdy folder w ścieżce. Po wyłączeniu czyta tylko nazwę pliku.",
+      "fullLinks": "Czyta cały adres internetowy. Po wyłączeniu mówi tylko nazwę witryny."
     }
   }
 }

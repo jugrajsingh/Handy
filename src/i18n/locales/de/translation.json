@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Ohne Nachbearbeitung transkribiert",
     "filePostProcessFailed": "Die Nachbearbeitung wurde nicht abgeschlossen, daher wurde das Transkript unverändert gespeichert.",
     "fileTranscriptionFailedTitle": "Dateitranskription fehlgeschlagen",
-    "transcriptionFailedTitle": "Transkription fehlgeschlagen"
+    "transcriptionFailedTitle": "Transkription fehlgeschlagen",
+    "vocabularyInvalidTitle": "Vokabeldatei enthält einen Fehler",
+    "vocabularyInvalid": "Beim Vorlesen wurde das eingebaute Vokabular verwendet, weil deine Vokabeldatei nicht genutzt werden konnte. Behebe den Fehler in der unten genannten Datei, um deine eigenen Einträge zu nutzen."
   },
   "notices": {
     "errorOne": "{{n}} Fehler",
@@ -1187,6 +1189,9 @@
     "output": "Ausgabegerät",
     "sameAsHandy": "Wie Handy",
     "readCode": "Codeblöcke vorlesen",
+    "technicalReading": "Technisches Vorlesen",
+    "fullPaths": "Vollständige Pfade vorlesen",
+    "fullLinks": "Vollständige Links vorlesen",
     "pocketAttribution": "Pocket TTS-Stimmen stehen unter der Lizenz CC-BY-4.0. Beachte die Namensnennungs- und Einwilligungsbedingungen jeder Stimme auf der Modellkarte.",
     "supertonicRestrictions": "Supertonic 3 verwendet OpenRAIL-M. Lies die Nutzungsbeschränkungen auf der Modellkarte.",
     "kokoroAttribution": "Die Modellgewichte von Kokoro stehen unter der Apache-2.0-Lizenz.",
@@ -1214,7 +1219,10 @@
       "speed": "Stelle ein, wie schnell der Text gelesen wird.",
       "pitch": "Stelle die Tonhöhe der Stimme in Halbtönen ein.",
       "output": "Wähle, wo die Vorlese-Audioausgabe abgespielt wird.",
-      "readCode": "Umschlossene Codeblöcke beim Vorlesen einbeziehen."
+      "readCode": "Umschlossene Codeblöcke beim Vorlesen einbeziehen.",
+      "technicalReading": "Spricht Pfade, Dateinamen, Optionen und Code-Namen vollständig aus und nutzt dafür deine Vokabeldatei.",
+      "fullPaths": "Liest jeden Ordner eines Pfads vor. Ausgeschaltet wird nur der Dateiname gelesen.",
+      "fullLinks": "Liest die ganze Webadresse vor. Ausgeschaltet wird nur der Name der Website genannt."
     }
   }
 }

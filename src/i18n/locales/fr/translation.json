@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Transcrit sans post-traitement",
     "filePostProcessFailed": "Le post-traitement n'a pas abouti, la transcription a donc été enregistrée telle quelle.",
     "fileTranscriptionFailedTitle": "Échec de la transcription du fichier",
-    "transcriptionFailedTitle": "Échec de la transcription"
+    "transcriptionFailedTitle": "Échec de la transcription",
+    "vocabularyInvalidTitle": "Le fichier de vocabulaire contient une erreur",
+    "vocabularyInvalid": "La lecture à voix haute a utilisé le vocabulaire intégré, car votre fichier de vocabulaire était inutilisable. Corrigez le fichier indiqué ci-dessous pour utiliser vos propres entrées."
   },
   "notices": {
     "errorOne": "{{n}} erreur",
@@ -1187,6 +1189,9 @@
     "output": "Périphérique de sortie",
     "sameAsHandy": "Identique à Handy",
     "readCode": "Lire les blocs de code",
+    "technicalReading": "Lecture technique",
+    "fullPaths": "Lire les chemins complets",
+    "fullLinks": "Lire les liens complets",
     "pocketAttribution": "Les voix Pocket TTS sont sous licence CC-BY-4.0. Respectez les conditions d'attribution et de consentement de chaque voix indiquées sur la fiche du modèle.",
     "supertonicRestrictions": "Supertonic 3 utilise OpenRAIL-M. Consultez ses restrictions d'utilisation sur la fiche du modèle.",
     "kokoroAttribution": "Les poids du modèle Kokoro sont sous licence Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "Réglez la vitesse de lecture du texte.",
       "pitch": "Réglez la hauteur de la voix en demi-tons.",
       "output": "Choisissez où l'audio de la lecture à voix haute est diffusé.",
-      "readCode": "Inclure les blocs de code délimités lors de la lecture."
+      "readCode": "Inclure les blocs de code délimités lors de la lecture.",
+      "technicalReading": "Prononce en entier les chemins, noms de fichiers, options et noms de code, avec votre fichier de vocabulaire.",
+      "fullPaths": "Lit chaque dossier d'un chemin. Désactivé, seul le nom du fichier est lu.",
+      "fullLinks": "Lit l'adresse web complète. Désactivé, seul le nom du site est dit."
     }
   }
 }

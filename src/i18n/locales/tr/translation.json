@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Son işlem olmadan yazıya döküldü",
     "filePostProcessFailed": "Son işlem tamamlanmadı, bu yüzden metin olduğu gibi kaydedildi.",
     "fileTranscriptionFailedTitle": "Dosya transkripsiyonu başarısız oldu",
-    "transcriptionFailedTitle": "Transkripsiyon başarısız oldu"
+    "transcriptionFailedTitle": "Transkripsiyon başarısız oldu",
+    "vocabularyInvalidTitle": "Sözlük Dosyasında Hata Var",
+    "vocabularyInvalid": "Sözlük dosyanız kullanılamadığı için sesli okuma yerleşik sözlüğü kullandı. Kendi girdilerinizi kullanmak için aşağıda belirtilen dosyayı düzeltin."
   },
   "notices": {
     "errorOne": "{{n}} hata",
@@ -1187,6 +1189,9 @@
     "output": "Çıkış cihazı",
     "sameAsHandy": "Handy ile aynı",
     "readCode": "Kod bloklarını oku",
+    "technicalReading": "Teknik okuma",
+    "fullPaths": "Tam yolları oku",
+    "fullLinks": "Tam bağlantıları oku",
     "pocketAttribution": "Pocket TTS sesleri CC-BY-4.0 ile lisanslanmıştır. Model kartındaki her sesin atıf ve onay koşullarına uyun.",
     "supertonicRestrictions": "Supertonic 3 OpenRAIL-M kullanır. Model kartındaki kullanım kısıtlamalarını inceleyin.",
     "kokoroAttribution": "Kokoro model ağırlıkları Apache-2.0 lisansını kullanır.",
@@ -1214,7 +1219,10 @@
       "speed": "Metnin ne kadar hızlı okunacağını ayarlayın.",
       "pitch": "Ses perdesini yarım ton cinsinden ayarlayın.",
       "output": "Sesli okuma sesinin nerede çalınacağını seçin.",
-      "readCode": "Okurken çitli kod bloklarını dahil et."
+      "readCode": "Okurken çitli kod bloklarını dahil et.",
+      "technicalReading": "Yolları, dosya adlarını, bayrakları ve kod adlarını sözlük dosyanızı kullanarak eksiksiz seslendirir.",
+      "fullPaths": "Bir yoldaki her klasörü okur. Kapalıyken yalnızca dosya adını okur.",
+      "fullLinks": "Web adresinin tamamını okur. Kapalıyken yalnızca site adını söyler."
     }
   }
 }

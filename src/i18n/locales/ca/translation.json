@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Transcrit sense postprocessament",
     "filePostProcessFailed": "El postprocessament no ha acabat, així que la transcripció s'ha desat tal qual.",
     "fileTranscriptionFailedTitle": "La transcripció del fitxer ha fallat",
-    "transcriptionFailedTitle": "La transcripció ha fallat"
+    "transcriptionFailedTitle": "La transcripció ha fallat",
+    "vocabularyInvalidTitle": "El fitxer de vocabulari té un error",
+    "vocabularyInvalid": "La lectura en veu alta ha fet servir el vocabulari integrat perquè no s'ha pogut fer servir el vostre fitxer de vocabulari. Corregiu el fitxer indicat a sota per utilitzar les vostres entrades."
   },
   "notices": {
     "errorOne": "{{n}} error",
@@ -1187,6 +1189,9 @@
     "output": "Dispositiu de sortida",
     "sameAsHandy": "Igual que el Handy",
     "readCode": "Llegeix els blocs de codi",
+    "technicalReading": "Lectura tècnica",
+    "fullPaths": "Llegeix els camins complets",
+    "fullLinks": "Llegeix els enllaços complets",
     "pocketAttribution": "Les veus de Pocket TTS tenen llicència CC-BY-4.0. Seguiu les condicions d'atribució i consentiment de cada veu a la fitxa del model.",
     "supertonicRestrictions": "Supertonic 3 utilitza OpenRAIL-M. Reviseu-ne les restriccions d'ús a la fitxa del model.",
     "kokoroAttribution": "Els pesos del model Kokoro utilitzen la llicència Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "Ajusteu la velocitat de lectura del text.",
       "pitch": "Ajusteu el to de la veu en semitons.",
       "output": "Trieu on es reprodueix l'àudio de la lectura en veu alta.",
-      "readCode": "Inclou els blocs de codi delimitats en llegir."
+      "readCode": "Inclou els blocs de codi delimitats en llegir.",
+      "technicalReading": "Pronuncia camins, noms de fitxer, opcions i noms de codi sencers, amb el vostre fitxer de vocabulari.",
+      "fullPaths": "Llegeix totes les carpetes d'un camí. Desactivat, només llegeix el nom del fitxer.",
+      "fullLinks": "Llegeix l'adreça web sencera. Desactivat, només diu el nom del lloc."
     }
   }
 }

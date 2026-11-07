@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Trascritto senza post-elaborazione",
     "filePostProcessFailed": "La post-elaborazione non è terminata, quindi la trascrizione è stata salvata così com'è.",
     "fileTranscriptionFailedTitle": "Trascrizione del file non riuscita",
-    "transcriptionFailedTitle": "Trascrizione non riuscita"
+    "transcriptionFailedTitle": "Trascrizione non riuscita",
+    "vocabularyInvalidTitle": "Il file di vocabolario contiene un errore",
+    "vocabularyInvalid": "La lettura ad alta voce ha usato il vocabolario integrato perché il tuo file di vocabolario non era utilizzabile. Correggi il file indicato qui sotto per usare le tue voci."
   },
   "notices": {
     "errorOne": "{{n}} errore",
@@ -1187,6 +1189,9 @@
     "output": "Dispositivo di output",
     "sameAsHandy": "Come Handy",
     "readCode": "Leggi blocchi di codice",
+    "technicalReading": "Lettura tecnica",
+    "fullPaths": "Leggi i percorsi completi",
+    "fullLinks": "Leggi i link completi",
     "pocketAttribution": "Le voci Pocket TTS sono concesse con licenza CC-BY-4.0. Rispetta l'attribuzione e i termini di consenso di ogni voce indicati nella scheda del modello.",
     "supertonicRestrictions": "Supertonic 3 usa OpenRAIL-M. Consulta le restrizioni d'uso nella scheda del modello.",
     "kokoroAttribution": "I pesi del modello Kokoro usano la licenza Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "Regola la velocità di lettura del testo.",
       "pitch": "Regola il tono della voce in semitoni.",
       "output": "Scegli dove riprodurre l'audio della lettura.",
-      "readCode": "Includi i blocchi di codice delimitati durante la lettura."
+      "readCode": "Includi i blocchi di codice delimitati durante la lettura.",
+      "technicalReading": "Pronuncia per intero percorsi, nomi di file, opzioni e nomi nel codice, usando il tuo file di vocabolario.",
+      "fullPaths": "Legge ogni cartella di un percorso. Disattivato, legge solo il nome del file.",
+      "fullLinks": "Legge l'indirizzo web completo. Disattivato, dice solo il nome del sito."
     }
   }
 }

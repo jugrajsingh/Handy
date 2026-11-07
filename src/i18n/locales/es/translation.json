@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Transcrito sin post proceso",
     "filePostProcessFailed": "El post proceso no terminó, así que la transcripción se guardó tal cual.",
     "fileTranscriptionFailedTitle": "Error al transcribir el archivo",
-    "transcriptionFailedTitle": "Error de transcripción"
+    "transcriptionFailedTitle": "Error de transcripción",
+    "vocabularyInvalidTitle": "El archivo de vocabulario tiene un error",
+    "vocabularyInvalid": "La lectura en voz alta usó el vocabulario integrado porque no se pudo usar tu archivo de vocabulario. Corrige el archivo indicado abajo para usar tus propias entradas."
   },
   "notices": {
     "errorOne": "{{n}} error",
@@ -1187,6 +1189,9 @@
     "output": "Dispositivo de salida",
     "sameAsHandy": "Igual que Handy",
     "readCode": "Leer bloques de código",
+    "technicalReading": "Lectura técnica",
+    "fullPaths": "Leer rutas completas",
+    "fullLinks": "Leer enlaces completos",
     "pocketAttribution": "Las voces de Pocket TTS tienen licencia CC-BY-4.0. Sigue los términos de atribución y consentimiento de cada voz en la ficha del modelo.",
     "supertonicRestrictions": "Supertonic 3 usa OpenRAIL-M. Revisa sus restricciones de uso en la ficha del modelo.",
     "kokoroAttribution": "Los pesos del modelo Kokoro usan la licencia Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "Ajusta la velocidad a la que se lee el texto.",
       "pitch": "Ajusta el tono de la voz en semitonos.",
       "output": "Elige dónde se reproduce el audio de la lectura en voz alta.",
-      "readCode": "Incluir los bloques de código delimitados al leer."
+      "readCode": "Incluir los bloques de código delimitados al leer.",
+      "technicalReading": "Pronuncia rutas, nombres de archivo, opciones y nombres de código completos, usando tu archivo de vocabulario.",
+      "fullPaths": "Lee cada carpeta de una ruta. Desactivado, lee solo el nombre del archivo.",
+      "fullLinks": "Lee la dirección web completa. Desactivado, dice solo el nombre del sitio."
     }
   }
 }

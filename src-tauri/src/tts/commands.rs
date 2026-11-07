@@ -207,6 +207,9 @@ pub(super) fn select_with_store(
                 settings.tts_pitch_semitones = chosen.pitch;
                 settings.tts_output_device = chosen.output_device.clone();
                 settings.tts_read_code_blocks = chosen.read_code;
+                settings.tts_technical_reading = chosen.technical;
+                settings.tts_full_paths = chosen.full_paths;
+                settings.tts_full_links = chosen.full_links;
                 write(settings).map_err(|_| handy_tts_core::selection::SelectionError::Persist)
             }),
         )

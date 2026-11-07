@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Přepsáno bez následného zpracování",
     "filePostProcessFailed": "Následné zpracování se nedokončilo, takže byl přepis uložen beze změn.",
     "fileTranscriptionFailedTitle": "Přepis souboru selhal",
-    "transcriptionFailedTitle": "Přepis selhal"
+    "transcriptionFailedTitle": "Přepis selhal",
+    "vocabularyInvalidTitle": "Soubor slovníku obsahuje chybu",
+    "vocabularyInvalid": "Čtení nahlas použilo vestavěný slovník, protože váš slovníkový soubor nešlo použít. Opravte soubor uvedený níže, aby se použily vaše vlastní položky."
   },
   "notices": {
     "errorOne": "{{n}} chyba",
@@ -1187,6 +1189,9 @@
     "output": "Výstupní zařízení",
     "sameAsHandy": "Stejné jako Handy",
     "readCode": "Číst bloky kódu",
+    "technicalReading": "Technické čtení",
+    "fullPaths": "Číst celé cesty",
+    "fullLinks": "Číst celé odkazy",
     "pocketAttribution": "Hlasy Pocket TTS jsou licencovány pod CC-BY-4.0. Dodržujte podmínky uvedení autorství a souhlasu u každého hlasu na stránce modelu.",
     "supertonicRestrictions": "Supertonic 3 používá licenci OpenRAIL-M. Seznamte se s omezeními použití na stránce modelu.",
     "kokoroAttribution": "Váhy modelu Kokoro používají licenci Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "Upravte, jak rychle se text čte.",
       "pitch": "Upravte výšku hlasu v půltónech.",
       "output": "Vyberte, kde se přehrává zvuk čtení nahlas.",
-      "readCode": "Při čtení zahrnout bloky kódu v ohraničení."
+      "readCode": "Při čtení zahrnout bloky kódu v ohraničení.",
+      "technicalReading": "Vyslovuje cesty, názvy souborů, přepínače a názvy v kódu celé podle vašeho slovníkového souboru.",
+      "fullPaths": "Přečte každou složku v cestě. Když je vypnuto, přečte jen název souboru.",
+      "fullLinks": "Přečte celou webovou adresu. Když je vypnuto, řekne jen název webu."
     }
   }
 }

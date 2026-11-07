@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "已轉錄，未經後處理",
     "filePostProcessFailed": "後處理未完成，因此按原樣儲存轉錄內容。",
     "fileTranscriptionFailedTitle": "檔案轉錄失敗",
-    "transcriptionFailedTitle": "轉錄失敗"
+    "transcriptionFailedTitle": "轉錄失敗",
+    "vocabularyInvalidTitle": "詞彙檔有錯誤",
+    "vocabularyInvalid": "由於無法使用你的詞彙檔，朗讀使用了內建詞彙。請修正下方指出的檔案，以使用你自己的項目。"
   },
   "notices": {
     "errorOne": "{{n}} 個錯誤",
@@ -1187,6 +1189,9 @@
     "output": "輸出裝置",
     "sameAsHandy": "與 Handy 相同",
     "readCode": "朗讀程式碼區塊",
+    "technicalReading": "技術朗讀",
+    "fullPaths": "朗讀完整路徑",
+    "fullLinks": "朗讀完整連結",
     "pocketAttribution": "Pocket TTS 語音採用 CC-BY-4.0 授權。請遵守模型卡上各語音的署名與授權條款。",
     "supertonicRestrictions": "Supertonic 3 採用 OpenRAIL-M。請查閱模型卡上的使用限制。",
     "kokoroAttribution": "Kokoro 模型權重採用 Apache-2.0 授權。",
@@ -1214,7 +1219,10 @@
       "speed": "調整文字朗讀的速度。",
       "pitch": "以半音為單位調整語音音高。",
       "output": "選擇朗讀音訊的播放位置。",
-      "readCode": "朗讀時包含圍欄程式碼區塊。"
+      "readCode": "朗讀時包含圍欄程式碼區塊。",
+      "technicalReading": "透過你的詞彙檔，完整朗讀路徑、檔案名稱、命令列旗標和程式碼名稱。",
+      "fullPaths": "朗讀路徑中的每個資料夾。關閉後只朗讀檔案名稱。",
+      "fullLinks": "朗讀完整的網址。關閉後只說網站名稱。"
     }
   }
 }

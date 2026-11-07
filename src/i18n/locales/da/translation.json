@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Transskriberet uden efterbehandling",
     "filePostProcessFailed": "Efterbehandlingen blev ikke færdig, så transskriptionen blev gemt, som den er.",
     "fileTranscriptionFailedTitle": "Transskription af fil mislykkedes",
-    "transcriptionFailedTitle": "Transskription mislykkedes"
+    "transcriptionFailedTitle": "Transskription mislykkedes",
+    "vocabularyInvalidTitle": "Ordbogsfilen har en fejl",
+    "vocabularyInvalid": "Oplæsningen brugte den indbyggede ordbog, fordi din ordbogsfil ikke kunne bruges. Ret filen, der er nævnt nedenfor, for at bruge dine egne poster."
   },
   "notices": {
     "errorOne": "{{n}} fejl",
@@ -1187,6 +1189,9 @@
     "output": "Udgangsenhed",
     "sameAsHandy": "Samme som Handy",
     "readCode": "Læs kodeblokke op",
+    "technicalReading": "Teknisk oplæsning",
+    "fullPaths": "Læs hele stier",
+    "fullLinks": "Læs hele links",
     "pocketAttribution": "Pocket TTS-stemmer er licenseret under CC-BY-4.0. Følg hver stemmes vilkår for kreditering og samtykke på modelkortet.",
     "supertonicRestrictions": "Supertonic 3 bruger OpenRAIL-M. Gennemgå dens brugsbegrænsninger på modelkortet.",
     "kokoroAttribution": "Kokoro-modellens vægte bruger Apache-2.0-licensen.",
@@ -1214,7 +1219,10 @@
       "speed": "Juster, hvor hurtigt teksten læses op.",
       "pitch": "Juster stemmens tonehøjde i halvtoner.",
       "output": "Vælg, hvor oplæsningslyden afspilles.",
-      "readCode": "Medtag indhegnede kodeblokke ved oplæsning."
+      "readCode": "Medtag indhegnede kodeblokke ved oplæsning.",
+      "technicalReading": "Udtaler stier, filnavne, flag og kodenavne i fuld længde ved hjælp af din ordbogsfil.",
+      "fullPaths": "Læser hver mappe i en sti. Slået fra læses kun filnavnet.",
+      "fullLinks": "Læser hele webadressen. Slået fra siges kun webstedets navn."
     }
   }
 }

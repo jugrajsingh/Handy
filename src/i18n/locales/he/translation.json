@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "תומלל ללא עיבוד משלים",
     "filePostProcessFailed": "העיבוד המשלים לא הסתיים, ולכן התמלול נשמר כפי שהוא.",
     "fileTranscriptionFailedTitle": "תמלול הקובץ נכשל",
-    "transcriptionFailedTitle": "התמלול נכשל"
+    "transcriptionFailedTitle": "התמלול נכשל",
+    "vocabularyInvalidTitle": "קובץ המילון מכיל שגיאה",
+    "vocabularyInvalid": "ההקראה השתמשה במילון המובנה כי לא ניתן היה להשתמש בקובץ המילון שלך. תקן את הקובץ שמופיע למטה כדי להשתמש בערכים שלך."
   },
   "notices": {
     "errorOne": "{{n}} שגיאה",
@@ -1187,6 +1189,9 @@
     "output": "התקן פלט",
     "sameAsHandy": "זהה ל-Handy",
     "readCode": "הקרא בלוקי קוד",
+    "technicalReading": "קריאה טכנית",
+    "fullPaths": "קריאת נתיבים מלאים",
+    "fullLinks": "קריאת קישורים מלאים",
     "pocketAttribution": "קולות Pocket TTS מורשים תחת CC-BY-4.0. עקוב אחר תנאי הייחוס וההסכמה של כל קול בכרטיס המודל.",
     "supertonicRestrictions": "Supertonic 3 משתמש ב-OpenRAIL-M. עיין במגבלות השימוש בכרטיס המודל.",
     "kokoroAttribution": "משקלי המודל Kokoro מורשים תחת Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "התאם את מהירות הקראת הטקסט.",
       "pitch": "התאם את גובה הצליל בחצאי טונים.",
       "output": "בחר היכן ישמע שמע ההקראה.",
-      "readCode": "כלול בלוקי קוד מגודרים בעת ההקראה."
+      "readCode": "כלול בלוקי קוד מגודרים בעת ההקראה.",
+      "technicalReading": "מקריא נתיבים, שמות קבצים, דגלים ושמות בקוד במלואם, לפי קובץ המילון שלך.",
+      "fullPaths": "קורא כל תיקייה בנתיב. כשהאפשרות כבויה, נקרא רק שם הקובץ.",
+      "fullLinks": "קורא את כתובת האתר המלאה. כשהאפשרות כבויה, נאמר רק שם האתר."
     }
   }
 }

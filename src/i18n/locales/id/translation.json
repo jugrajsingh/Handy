@@ -1043,7 +1043,9 @@
     "filePostProcessFailedTitle": "Ditranskripsi Tanpa Pascaproses",
     "filePostProcessFailed": "Pascaproses tidak selesai, jadi transkrip disimpan apa adanya.",
     "fileTranscriptionFailedTitle": "Transkripsi File Gagal",
-    "transcriptionFailedTitle": "Transkripsi Gagal"
+    "transcriptionFailedTitle": "Transkripsi Gagal",
+    "vocabularyInvalidTitle": "File Kosakata Mengandung Kesalahan",
+    "vocabularyInvalid": "Bacakan menggunakan kosakata bawaan karena file kosakata Anda tidak dapat digunakan. Perbaiki file yang disebutkan di bawah untuk memakai entri Anda sendiri."
   },
   "notices": {
     "errorOne": "{{n}} kesalahan",
@@ -1187,6 +1189,9 @@
     "output": "Perangkat keluaran",
     "sameAsHandy": "Sama seperti Handy",
     "readCode": "Baca blok kode",
+    "technicalReading": "Pembacaan teknis",
+    "fullPaths": "Bacakan path lengkap",
+    "fullLinks": "Bacakan tautan lengkap",
     "pocketAttribution": "Suara Pocket TTS dilisensikan di bawah CC-BY-4.0. Ikuti atribusi dan ketentuan persetujuan setiap suara pada kartu model.",
     "supertonicRestrictions": "Supertonic 3 menggunakan OpenRAIL-M. Tinjau batasan penggunaannya pada kartu model.",
     "kokoroAttribution": "Bobot model Kokoro menggunakan lisensi Apache-2.0.",
@@ -1214,7 +1219,10 @@
       "speed": "Atur seberapa cepat teks dibaca.",
       "pitch": "Atur nada suara dalam semiton.",
       "output": "Pilih tempat audio baca nyaring diputar.",
-      "readCode": "Sertakan blok kode berpagar saat membaca."
+      "readCode": "Sertakan blok kode berpagar saat membaca.",
+      "technicalReading": "Mengucapkan path, nama file, flag, dan nama kode secara lengkap, menggunakan file kosakata Anda.",
+      "fullPaths": "Membacakan setiap folder dalam path. Jika nonaktif, hanya nama file yang dibacakan.",
+      "fullLinks": "Membacakan seluruh alamat web. Jika nonaktif, hanya nama situs yang disebut."
     }
   }
 }

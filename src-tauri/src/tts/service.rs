@@ -55,9 +55,9 @@ pub(crate) fn selection(settings: &crate::settings::AppSettings) -> Selection {
         pitch: settings.tts_pitch_semitones,
         output_device: settings.tts_output_device.clone(),
         read_code: settings.tts_read_code_blocks,
-        technical: false,
-        full_paths: true,
-        full_links: false,
+        technical: settings.tts_technical_reading,
+        full_paths: settings.tts_full_paths,
+        full_links: settings.tts_full_links,
     }
 }
 pub(crate) fn reading_cancel_with(effect: &Effect, set_owner: impl FnOnce(bool)) {
@@ -177,6 +177,33 @@ fn run_tray_refreshes(events: mpsc::Receiver<()>, mut refresh: impl FnMut() -> b
             break;
         }
     }
+}
+/// The vocabulary for each document: the built-in one plus the user's file, read again every
+/// time. A file that cannot be used raises one warning per distinct error.
+fn user_vocabulary(app: tauri::AppHandle) -> super::session::VocabularyLoader {
+    let reported = super::vocabulary::Reported::default();
+    Arc::new(move || {
+        let dir = match crate::portable::app_data_dir(&app) {
+            Ok(dir) => dir,
+            Err(error) => {
+                log::warn!(
+                    "Read-aloud vocabulary: no app data dir, using the built-in one: {error}"
+                );
+                return Arc::new(handy_tts_core::vocabulary::Vocabulary::builtin());
+            }
+        };
+        let path = dir.join(super::vocabulary::FILE_NAME);
+        super::vocabulary::load_vocabulary(&dir, &reported, &mut |error| {
+            crate::notices::raise(
+                &app,
+                crate::notices::Notice::new(
+                    crate::notices::NoticeCode::VocabularyInvalid,
+                    crate::notices::NoticeSource::ReadAloud,
+                )
+                .with_detail(format!("{}: {error}", path.display())),
+            )
+        })
+    })
 }
 impl TtsService {
     pub fn initialize(app: &tauri::AppHandle) -> Arc<Self> {
@@ -308,6 +335,7 @@ impl TtsService {
                 let app = self.app.clone();
                 Arc::new(move || crate::settings::get_settings(&app).selected_output_device)
             },
+            user_vocabulary(self.app.clone()),
             Arc::new(move |state| {
                 let _ = app.emit("read-aloud-state", state);
             }),
@@ -750,6 +778,24 @@ impl handy_tts_core::preview::ReadingControl for ReadAloudSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn selection_reads_technical_by_default_with_full_paths_and_short_links() {
+        let chosen = selection(&crate::settings::get_default_settings());
+        assert!(chosen.technical);
+        assert!(chosen.full_paths);
+        assert!(!chosen.full_links);
+    }
+    #[test]
+    fn selection_follows_the_technical_reading_settings() {
+        let mut settings = crate::settings::get_default_settings();
+        settings.tts_technical_reading = false;
+        settings.tts_full_paths = false;
+        settings.tts_full_links = true;
+        let chosen = selection(&settings);
+        assert!(!chosen.technical);
+        assert!(!chosen.full_paths);
+        assert!(chosen.full_links);
+    }
     #[test]
     fn wbfix3_capture_reservation_releases_on_unwind() {
         let fence = PasteFence::default();
