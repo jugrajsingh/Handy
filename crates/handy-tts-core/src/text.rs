@@ -61,6 +61,7 @@ pub struct TextCursor<'a> {
     version: Regex,
     vocabulary: Option<Arc<Vocabulary>>,
     technical: TechnicalOptions,
+    resume_byte: usize,
     #[cfg(test)]
     work_units: usize,
     #[cfg(test)]
@@ -123,6 +124,7 @@ impl<'a> TextCursor<'a> {
             version: Regex::new(r"\bv([0-9]+\.[0-9]+\.[0-9]+)")?,
             vocabulary: None,
             technical: TechnicalOptions::default(),
+            resume_byte: 0,
             #[cfg(test)]
             work_units: 0,
             #[cfg(test)]
@@ -130,6 +132,23 @@ impl<'a> TextCursor<'a> {
             #[cfg(test)]
             event_reads,
         })
+    }
+    /// Resumes preparation at `source_start`, a UTF-16 source offset such as a chunk's
+    /// `source_start`, numbering the first chunk `index`: words ending at or before the offset
+    /// are dropped, so that chunk starts there. Markdown is still parsed from the beginning, so
+    /// its context and every source offset stay those of the whole source. Call before the
+    /// first `next_chunk`.
+    pub fn resume_at(&mut self, source_start: u32, index: usize) {
+        self.index = index;
+        let mut units = 0_u32;
+        self.resume_byte = self.source.len();
+        for (byte, c) in self.source.char_indices() {
+            if units >= source_start {
+                self.resume_byte = byte;
+                break;
+            }
+            units += if c.len_utf16() == 2 { 2 } else { 1 };
+        }
     }
     /// Lowers the later-chunk ceiling without changing the first chunk or word boundaries.
     pub fn set_chunk_limit(&mut self, limit: usize) {
@@ -539,6 +558,9 @@ impl<'a> TextCursor<'a> {
         let mut synthetic_period = false;
         let mut boundary = None;
         while let Some(mut p) = self.piece() {
+            if self.resume_byte > 0 && p.range.end <= self.resume_byte {
+                continue;
+            }
             if p.text.is_empty() {
                 if words.is_empty() {
                     continue;

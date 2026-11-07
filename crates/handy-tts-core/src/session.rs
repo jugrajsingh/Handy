@@ -251,6 +251,10 @@ pub struct Session<'a, W: Worker, O: Output> {
     cursor: TextCursor<'a>,
     cursor_factory: CursorFactory,
     vocabulary: Option<Arc<Vocabulary>>,
+    /// Where cursors resume after a text option change: a UTF-16 source offset and the index of
+    /// the chunk that starts there. (0, 0) is the start of the source; playback that restarts
+    /// from the beginning returns to it.
+    text_origin: (u32, usize),
     pending_text: Option<TextChunk>,
     dsp_clock: Box<dyn Fn() -> f64 + Send>,
     reported_position: Cell<Option<ReportedPosition>>,
@@ -322,6 +326,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             cursor,
             cursor_factory: text_cursor,
             vocabulary,
+            text_origin: (0, 0),
             pending_text: None,
             dsp_clock: dsp_clock(),
             reported_position: Cell::new(None),
@@ -366,12 +371,24 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         index: usize,
         position: Option<u32>,
     ) -> Result<(TextCursor<'a>, Option<TextChunk>), String> {
+        self.cursor_from(selection, self.text_origin, index, position)
+    }
+    /// Builds the cursor for `selection` resuming at `origin` and returns its first chunk at or
+    /// after `index`, or with `position`, the first chunk that ends after that source offset.
+    fn cursor_from(
+        &self,
+        selection: &Selection,
+        origin: (u32, usize),
+        index: usize,
+        position: Option<u32>,
+    ) -> Result<(TextCursor<'a>, Option<TextChunk>), String> {
         let mut cursor = (self.cursor_factory)(
             self.source,
             selection.read_code,
             reading_vocabulary(selection, self.vocabulary.as_ref()),
             selection.technical_options(),
         )?;
+        cursor.resume_at(origin.0, origin.1);
         while let Some(text) = cursor
             .next_chunk()
             .map_err(|_| "tts.errors.text".to_string())?
@@ -383,8 +400,9 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         }
         Ok((cursor, None))
     }
-    fn seek(&mut self, index: usize) -> Result<(), String> {
-        let (cursor, pending) = self.prepare_cursor(&self.selection, index, None)?;
+    fn seek(&mut self, origin: (u32, usize), index: usize) -> Result<(), String> {
+        let (cursor, pending) = self.cursor_from(&self.selection, origin, index, None)?;
+        self.text_origin = origin;
         self.cursor = cursor;
         self.pending_text = pending;
         self.metadata.clear();
@@ -426,7 +444,12 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 self.playback.stop();
             }
             self.content_origin = self.playback.content_samples();
-            self.seek(self.queue.next_index)?;
+            let origin = if matches!(old, PlaybackState::Error | PlaybackState::Starting) {
+                self.text_origin
+            } else {
+                (0, 0)
+            };
+            self.seek(origin, self.queue.next_index)?;
             if old != PlaybackState::Error {
                 self.reported_position.set(None);
                 self.played_seconds = 0.0;
@@ -563,6 +586,18 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         let (cursor, pending) = self
             .prepare_cursor(&selection, index, position)
             .map_err(|_| SelectionError::Controls)?;
+        // The new text may chunk differently: a chunk that starts before the position also holds
+        // text already spoken, so preparation resumes at the position instead, keeping the index.
+        let (origin, (cursor, pending)) = match (position, pending) {
+            (Some(pos), Some(text)) if text.source_start < pos => {
+                let origin = (pos, text.index);
+                let resumed = self
+                    .cursor_from(&selection, origin, text.index, None)
+                    .map_err(|_| SelectionError::Controls)?;
+                (origin, resumed)
+            }
+            (_, pending) => (self.text_origin, (cursor, pending)),
+        };
         let new_index = pending.as_ref().map_or(index, |text| text.index);
         let old_tickets = self.queue.in_flight.clone();
         let reload = self.selection.model_id != selection.model_id
@@ -611,6 +646,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             self.queue.failed_index = Some(new_index);
         }
         changed.sentence_index = new_index;
+        self.text_origin = origin;
         self.cursor = cursor;
         self.pending_text = pending;
         self.metadata.clear();
@@ -1396,6 +1432,7 @@ mod tests {
         seconds: f64,
         selections: usize,
         texts: Vec<String>,
+        fail_next: bool,
     }
     impl Worker for FakeWorker {
         fn request(
@@ -1407,8 +1444,11 @@ mod tests {
             self.requested.push(ticket);
             self.texts.push(text.to_owned());
             self.native_speeds.push(Some(selection.speed));
-            let result = if self.fail_once == Some(ticket.index) {
-                self.fail_once = None;
+            let fail_this = self.fail_once == Some(ticket.index);
+            let result = if fail_this || std::mem::take(&mut self.fail_next) {
+                if fail_this {
+                    self.fail_once = None;
+                }
                 Err("tts.errors.worker".into())
             } else {
                 Ok(Pcm {
@@ -3209,6 +3249,125 @@ mod tests {
         assert!(
             !after.contains("slash") && !after.contains("lib.sh"),
             "{after}"
+        );
+    }
+    /// Plays `source` with `before` until its second chunk is audible, changes to `after` and
+    /// checks that the next request, its retry and the audible range all resume at that chunk:
+    /// the request starts with `next`, never holds `earlier`, and the position survives a
+    /// failed request's retry and Pause then Play.
+    fn assert_text_change_resumes(
+        source: &str,
+        before: Selection,
+        after: Selection,
+        next: &str,
+        earlier: &str,
+    ) {
+        let worker = FakeWorker {
+            rtf: 0.01,
+            seconds: 1.0,
+            ..FakeWorker::default()
+        };
+        let vocabulary = Some(Arc::new(Vocabulary::builtin()));
+        let mut s = Session::with_vocabulary(
+            source,
+            before,
+            worker,
+            FakeOutput::default(),
+            None,
+            vocabulary,
+        )
+        .unwrap();
+        s.play().unwrap();
+        let mut now = 0.0;
+        for _ in 0..100 {
+            step(&mut s, now);
+            now += 0.1;
+            if s.snapshot().source_start > 0 {
+                break;
+            }
+        }
+        let resume = s.snapshot().source_start;
+        assert!(resume > 0, "the second chunk never became audible");
+        let requested = s.worker.texts.len();
+        s.worker.fail_next = true;
+        s.select(after, true, |_| Ok(())).unwrap();
+        for _ in 0..50 {
+            step(&mut s, now);
+            now += 0.1;
+            if s.queue.state == PlaybackState::Error {
+                break;
+            }
+        }
+        assert_eq!(s.queue.state, PlaybackState::Error, "{source}");
+        s.play().unwrap();
+        s.pause();
+        s.play().unwrap();
+        for _ in 0..50 {
+            step(&mut s, now);
+            now += 0.1;
+            if s.queue.playing.is_some() {
+                break;
+            }
+        }
+        let after_change = &s.worker.texts[requested..];
+        assert!(after_change.len() >= 2, "{after_change:?}");
+        for text in &after_change[..2] {
+            assert!(text.starts_with(next), "{text:?} must start with {next:?}");
+        }
+        for text in after_change {
+            assert!(!text.contains(earlier), "{text:?} replays {earlier:?}");
+        }
+        let playing = s.queue.playing.as_ref().map(|audio| audio.source_start);
+        assert_eq!(playing, Some(resume), "{source}");
+        assert_eq!(s.snapshot().source_start, resume, "{source}");
+    }
+    #[test]
+    fn technical_option_change_preserves_position_after_completed_chunk() {
+        let source = "tests/a.sh tests/b.sh tests/c.sh tests/d.sh tests/e.sh tests/f.sh tests/g.sh tests/h.sh";
+        let full = Selection {
+            technical: true,
+            ..selection()
+        };
+        let short = Selection {
+            full_paths: false,
+            ..full.clone()
+        };
+        assert_text_change_resumes(
+            source,
+            full,
+            short,
+            "d dot S H e dot S H f dot S H g dot S H h dot S H",
+            "c dot S H",
+        );
+        assert_eq!(source.find("tests/d.sh"), Some(33));
+    }
+    #[test]
+    fn technical_and_link_toggles_preserve_position_after_completed_chunk() {
+        let source = "Step one edits tests/alpha.sh and keeps going with more words here. Step two edits tests/bravo.sh and keeps going with more words here. Step three edits tests/charlie.sh to finish the list.";
+        assert_text_change_resumes(
+            source,
+            selection(),
+            Selection {
+                technical: true,
+                ..selection()
+            },
+            "Step two edits tests slash bravo dot S H",
+            "alpha",
+        );
+        let source = "See https://github.com/cjpais/Handy?tab=readme#top for the first long example here. Then https://example.com/docs/readme.md is the second long example here. Last https://github.com/a/b ends it.";
+        let short_links = Selection {
+            technical: true,
+            ..selection()
+        };
+        assert_text_change_resumes(
+            source,
+            short_links.clone(),
+            Selection {
+                full_links: true,
+                ..short_links
+            },
+            "Then example dot com slash docs slash readme dot markdown",
+            "first",
         );
     }
     #[test]
