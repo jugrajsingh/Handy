@@ -680,10 +680,7 @@ impl<B: Transport> TtsManager<B> {
                         }
                     },
                 };
-                if result == Err(TtsError::Busy)
-                    && !self.cancelled(id)
-                    && std::time::Instant::now() < busy_until
-                {
+                if result == Err(TtsError::Busy) && std::time::Instant::now() < busy_until {
                     std::thread::sleep(BUSY_RETRY_DELAY);
                     continue;
                 }
