@@ -15,7 +15,8 @@ pub fn config(model_id: &str, root: &Path, device: Device, cache: &Path) -> Resu
             "mimi_decoder_int8",
         ] {
             let target = if graph == "flow_lm_main_int8"
-                || device == Device::Gpu && graph == "mimi_decoder_int8"
+                || device == Device::Gpu
+                    && matches!(graph, "mimi_decoder_int8" | "flow_lm_flow_int8")
             {
                 Device::Cpu
             } else {
@@ -169,7 +170,12 @@ mod tests {
         let pocket = config("pocket-en", Path::new("."), Device::Gpu, Path::new("cache")).unwrap();
         assert_eq!(pocket.placement["flow_lm_main_int8"], Device::Cpu);
         assert_eq!(pocket.placement["mimi_decoder_int8"], Device::Cpu);
-        assert_eq!(pocket.placement["flow_lm_flow_int8"], Device::Gpu);
+        assert_eq!(
+            pocket.placement["flow_lm_flow_int8"],
+            Device::Cpu,
+            "the int8 flow sampler clips speech on the Intel GPU"
+        );
+        assert_eq!(pocket.placement["text_conditioner"], Device::Gpu);
         let kokoro = config(
             "kokoro-82m-int8",
             Path::new("."),
