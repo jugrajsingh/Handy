@@ -221,12 +221,11 @@ impl CompiledGraph {
         Self::compile(path, device, &core, &model, fixed)
     }
     fn class_core(device: &str, cache: &Path, threads: usize, graph: &str) -> Result<SharedCore> {
-        let static_cache = cache.join("gpu-static-mixed-v1");
         Self::core(
             device,
-            &static_cache,
+            &cache.join(STATIC_CLASS_CACHE),
             threads,
-            matches!(graph, "duration_predictor" | "text_encoder"),
+            class_full_precision(graph),
         )
     }
     fn core(
@@ -404,10 +403,29 @@ pub fn probe(path: &Path, device: &str, cache: &Path) -> Result<GraphInfo> {
     Ok(CompiledGraph::load(path, device, cache, fixed, 2, false)?.info)
 }
 
+/// Cache folder for the static-shape class graphs. Bump it whenever a graph's
+/// precision changes, so blobs compiled under the old precision are never loaded.
+const STATIC_CLASS_CACHE: &str = "gpu-static-mixed-v2";
+
+/// Supertonic class graphs that compile at f32. A cached f16 vocoder adds
+/// audible hiss, so only the vector estimator, the slow graph, stays at f16.
+fn class_full_precision(graph: &str) -> bool {
+    matches!(graph, "duration_predictor" | "text_encoder" | "vocoder")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cancellation::{AsyncRequest, Wait};
+
+    #[test]
+    fn class_graphs_keep_the_vocoder_at_full_precision() {
+        assert!(class_full_precision("duration_predictor"));
+        assert!(class_full_precision("text_encoder"));
+        assert!(class_full_precision("vocoder"));
+        assert!(!class_full_precision("vector_estimator"));
+        assert_ne!(STATIC_CLASS_CACHE, "gpu-static-mixed-v1");
+    }
     use std::path::PathBuf;
     use std::sync::{
         Arc,
