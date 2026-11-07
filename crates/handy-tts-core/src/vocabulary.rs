@@ -1048,6 +1048,65 @@ fn replace_versions(token: &str) -> Option<String> {
     Some(spoken)
 }
 
+/// How much of a path or link technical reading speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TechnicalOptions {
+    /// Every path segment is read; off reads the last one (`tests/lib.sh` is "lib dot S H").
+    pub full_paths: bool,
+    /// A link's host and path are read; off keeps "link to <host>".
+    pub full_links: bool,
+}
+
+impl Default for TechnicalOptions {
+    /// Full paths, short links.
+    fn default() -> Self {
+        TechnicalOptions {
+            full_paths: true,
+            full_links: false,
+        }
+    }
+}
+
+/// The part of a path short paths read: the last segment, when the path has a directory part
+/// and looks like a file system path (it starts with `/`, `./`, `../` or `~/`, has three or more
+/// segments, or ends in a file name or hidden segment). A slash command (`/review`) and a word
+/// pair such as `and/or` or `TCP/IP` keep their full reading.
+fn short_path<'a>(path: &'a str, vocabulary: &Vocabulary) -> &'a str {
+    let trimmed = path.trim_end_matches('/');
+    let Some((directory, last)) = trimmed.rsplit_once('/') else {
+        return path;
+    };
+    if directory.is_empty() || last.is_empty() {
+        return path;
+    }
+    let rooted = ["/", "./", "../", "~/"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix));
+    let deep = trimmed.split('/').filter(|part| !part.is_empty()).count() >= 3;
+    let file = last.starts_with('.') || file_extension(last, vocabulary).is_some();
+    if rooted || deep || file { last } else { path }
+}
+
+/// Speaks a link without its scheme, query or fragment: the host through the terms and the
+/// symbol words, then each path segment through the path rules.
+fn speak_link(address: &str, vocabulary: &Vocabulary) -> String {
+    let address = address.split(['?', '#']).next().unwrap_or("");
+    let (host, path) = address.split_once('/').unwrap_or((address, ""));
+    let mut words = Vec::new();
+    for piece in vocabulary.apply_terms(host) {
+        match piece {
+            Piece::Spoken(spoken) => push_word(&mut words, &spoken),
+            Piece::Raw(raw) => speak_atoms(&raw, vocabulary, &mut words),
+        }
+    }
+    let path = path.trim_end_matches('/');
+    if !path.is_empty() {
+        words.push("/".to_string());
+        speak_path(path, vocabulary, &mut words);
+    }
+    words.join(" ")
+}
+
 /// What one token becomes before the output contract is applied.
 enum Spoken {
     /// No rule applies: the token reads exactly as it was written.
@@ -1059,15 +1118,25 @@ enum Spoken {
 }
 
 /// Applies the rules to a token core: exact `terms` first, then links and versions with today's
-/// wording, then the kind rules, then partial terms and acronyms on any other word.
-fn speak_parts(core: &str, period_follows: bool, vocabulary: &Vocabulary) -> Spoken {
+/// wording, then the kind rules, then partial terms and acronyms on any other word. `options`
+/// chooses full or short paths and links.
+fn speak_parts(
+    core: &str,
+    period_follows: bool,
+    vocabulary: &Vocabulary,
+    options: &TechnicalOptions,
+) -> Spoken {
     if let Some(say) = vocabulary.whole_term(core) {
         return Spoken::Words(say.to_string());
     }
-    if core.starts_with("https://") || core.starts_with("http://") {
-        let host = core.split_once("://").map_or("", |(_, rest)| {
-            rest.split(['/', '?', '#']).next().unwrap_or("")
-        });
+    if let Some(address) = core
+        .strip_prefix("https://")
+        .or_else(|| core.strip_prefix("http://"))
+    {
+        let host = address.split(['/', '?', '#']).next().unwrap_or("");
+        if options.full_links && !host.is_empty() {
+            return Spoken::Words(speak_link(address, vocabulary));
+        }
         return Spoken::Link(host.to_string());
     }
     if !core.contains('/')
@@ -1076,7 +1145,12 @@ fn speak_parts(core: &str, period_follows: bool, vocabulary: &Vocabulary) -> Spo
         return Spoken::Words(versioned);
     }
     let (head, line) = split_line(core, vocabulary);
-    if classify(head, vocabulary, line.is_none() && period_follows).is_some() {
+    if let Some(kind) = classify(head, vocabulary, line.is_none() && period_follows) {
+        let head = if kind == Kind::Path && !options.full_paths {
+            short_path(head, vocabulary)
+        } else {
+            head
+        };
         let mut spoken = speak_core(head, vocabulary);
         if let Some((line, column)) = line {
             let _ = write!(spoken, " at line {line}");
@@ -1107,14 +1181,15 @@ fn speak_parts(core: &str, period_follows: bool, vocabulary: &Vocabulary) -> Spo
 /// Speaks one token the way an engineer reads it aloud; a token nothing applies to comes back
 /// unchanged. Every other result passes through `speakable`, so it holds only letters, digits,
 /// single spaces and digit dots, followed by the token's trailing sentence punctuation; the one
-/// exemption is the host in "link to <host>". Wrapping punctuation is dropped.
-pub fn speak_technical(token: &str, vocabulary: &Vocabulary) -> String {
+/// exemption is the host in "link to <host>". Wrapping punctuation is dropped. `options` chooses
+/// full or short paths and links.
+pub fn speak_technical(token: &str, vocabulary: &Vocabulary, options: &TechnicalOptions) -> String {
     let parts = split_token(token);
     if parts.core.is_empty() {
         return token.to_string();
     }
     let ending = parts.ending.as_str();
-    match speak_parts(parts.core, ending.starts_with('.'), vocabulary) {
+    match speak_parts(parts.core, ending.starts_with('.'), vocabulary, options) {
         Spoken::Unchanged => token.to_string(),
         Spoken::Link(host) => format!("link to {host}{ending}"),
         Spoken::Words(words) => format!("{}{ending}", speakable(&words, vocabulary)),
@@ -1138,7 +1213,7 @@ pub fn run_examples(vocabulary: &Vocabulary) -> Vec<ExampleResult> {
         .map(|example| ExampleResult {
             text: example.text.clone(),
             expected: example.spoken.clone(),
-            actual: speak_technical(&example.text, vocabulary),
+            actual: speak_technical(&example.text, vocabulary, &TechnicalOptions::default()),
         })
         .collect()
 }
@@ -1156,7 +1231,7 @@ mod tests {
     use super::*;
 
     fn say(token: &str) -> String {
-        speak_technical(token, &Vocabulary::builtin())
+        speak_technical(token, &Vocabulary::builtin(), &TechnicalOptions::default())
     }
 
     fn with_user(json: &str) -> Vocabulary {
@@ -1449,55 +1524,102 @@ mod tests {
         #[test]
         fn terms_override_rules() {
             let builtin = Vocabulary::builtin();
-            assert_eq!(speak_technical("fooBar", &builtin), "foo bar");
+            assert_eq!(
+                speak_technical("fooBar", &builtin, &TechnicalOptions::default()),
+                "foo bar"
+            );
             let user = with_user(
                 r#"{"version":1,"terms":{"fooBar":"FOO BAR TERM","lib.sh":"the library"}}"#,
             );
-            assert_eq!(speak_technical("fooBar", &user), "FOO BAR TERM");
             assert_eq!(
-                speak_technical("tests/lib.sh", &user),
+                speak_technical("fooBar", &user, &TechnicalOptions::default()),
+                "FOO BAR TERM"
+            );
+            assert_eq!(
+                speak_technical("tests/lib.sh", &user, &TechnicalOptions::default()),
                 "tests slash the library"
             );
-            assert_eq!(speak_technical("lib.sh", &user), "the library");
             assert_eq!(
-                speak_technical("notes/fooBar/x", &user),
+                speak_technical("lib.sh", &user, &TechnicalOptions::default()),
+                "the library"
+            );
+            assert_eq!(
+                speak_technical("notes/fooBar/x", &user, &TechnicalOptions::default()),
                 "notes slash FOO BAR TERM slash x"
             );
-            assert_eq!(speak_technical("kubectl", &user), "cube control");
+            assert_eq!(
+                speak_technical("kubectl", &user, &TechnicalOptions::default()),
+                "cube control"
+            );
         }
 
         #[test]
         fn term_match_types() {
             let whole = with_user(r#"{"version":1,"terms":{"fooBar":{"say":"ZED"}}}"#);
-            assert_eq!(speak_technical("fooBar", &whole), "ZED");
-            assert_ne!(speak_technical("fooBarput", &whole), "ZED");
-            assert!(!speak_technical("fooBarput", &whole).contains("ZED"));
+            assert_eq!(
+                speak_technical("fooBar", &whole, &TechnicalOptions::default()),
+                "ZED"
+            );
+            assert_ne!(
+                speak_technical("fooBarput", &whole, &TechnicalOptions::default()),
+                "ZED"
+            );
+            assert!(
+                !speak_technical("fooBarput", &whole, &TechnicalOptions::default()).contains("ZED")
+            );
 
             let anywhere =
                 with_user(r#"{"version":1,"terms":{"Bar":{"say":"ZED","match":"anywhere"}}}"#);
-            assert_eq!(speak_technical("fooBarput", &anywhere), "foo ZED put");
+            assert_eq!(
+                speak_technical("fooBarput", &anywhere, &TechnicalOptions::default()),
+                "foo ZED put"
+            );
 
             let prefix =
                 with_user(r#"{"version":1,"terms":{"pre":{"say":"PRE","match":"prefix"}}}"#);
-            assert_eq!(speak_technical("prefix_x", &prefix), "PRE fix underscore x");
-            assert_eq!(speak_technical("xpre_y", &prefix), "xpre underscore y");
+            assert_eq!(
+                speak_technical("prefix_x", &prefix, &TechnicalOptions::default()),
+                "PRE fix underscore x"
+            );
+            assert_eq!(
+                speak_technical("xpre_y", &prefix, &TechnicalOptions::default()),
+                "xpre underscore y"
+            );
 
             let suffix =
                 with_user(r#"{"version":1,"terms":{"ing":{"say":"ING","match":"suffix"}}}"#);
-            assert_eq!(speak_technical("run_ing", &suffix), "run underscore ING");
-            assert_eq!(speak_technical("ingot_x", &suffix), "ingot underscore x");
+            assert_eq!(
+                speak_technical("run_ing", &suffix, &TechnicalOptions::default()),
+                "run underscore ING"
+            );
+            assert_eq!(
+                speak_technical("ingot_x", &suffix, &TechnicalOptions::default()),
+                "ingot underscore x"
+            );
 
             let insensitive =
                 with_user(r#"{"version":1,"terms":{"foobar":{"say":"ZED","case":false}}}"#);
-            assert_eq!(speak_technical("FOOBAR", &insensitive), "ZED");
+            assert_eq!(
+                speak_technical("FOOBAR", &insensitive, &TechnicalOptions::default()),
+                "ZED"
+            );
             let sensitive = with_user(r#"{"version":1,"terms":{"foobar":{"say":"ZED"}}}"#);
-            assert_eq!(speak_technical("FOOBAR", &sensitive), "FOOBAR");
+            assert_eq!(
+                speak_technical("FOOBAR", &sensitive, &TechnicalOptions::default()),
+                "FOOBAR"
+            );
 
             let regex = with_user(
                 r#"{"version":1,"terms":{"^v(\\d+)$":{"say":"version $1","match":"regex"}}}"#,
             );
-            assert_eq!(speak_technical("v12", &regex), "version 12");
-            assert_eq!(speak_technical("v12x", &regex), "v12x");
+            assert_eq!(
+                speak_technical("v12", &regex, &TechnicalOptions::default()),
+                "version 12"
+            );
+            assert_eq!(
+                speak_technical("v12x", &regex, &TechnicalOptions::default()),
+                "v12x"
+            );
         }
 
         #[test]
@@ -1509,7 +1631,7 @@ mod tests {
                     "x(.)":{"say":"R $1","match":"regex"}}}"#,
             );
             assert_eq!(
-                speak_technical("zabz_xq", &user),
+                speak_technical("zabz_xq", &user, &TechnicalOptions::default()),
                 "z FIRST z underscore R q"
             );
         }
@@ -1559,13 +1681,22 @@ mod tests {
                 r#"{"version":1,"extensions":{"ZZ":"zed"},"acronyms":["ZZZ"],
                     "examples":[{"text":"file.zz","spoken":"file dot zed"}]}"#,
             );
-            assert_eq!(speak_technical("file.zz", &user), "file dot zed");
             assert_eq!(
-                speak_technical("tests/lib.sh", &user),
+                speak_technical("file.zz", &user, &TechnicalOptions::default()),
+                "file dot zed"
+            );
+            assert_eq!(
+                speak_technical("tests/lib.sh", &user, &TechnicalOptions::default()),
                 "tests slash lib dot S H"
             );
-            assert_eq!(speak_technical("ZZZ", &user), "Z Z Z");
-            assert_eq!(speak_technical("GPU", &user), "G P U");
+            assert_eq!(
+                speak_technical("ZZZ", &user, &TechnicalOptions::default()),
+                "Z Z Z"
+            );
+            assert_eq!(
+                speak_technical("GPU", &user, &TechnicalOptions::default()),
+                "G P U"
+            );
             assert_eq!(
                 user.examples().len(),
                 Vocabulary::builtin().examples().len() + 1
@@ -1579,7 +1710,10 @@ mod tests {
                 r#"{"version":1,"symbols":{"-":"minus"},
                     "examples":[{"text":"a-b.sh","spoken":"a minus b dot S H"}]}"#,
             );
-            assert_eq!(speak_technical("a-b.sh", &user), "a minus b dot S H");
+            assert_eq!(
+                speak_technical("a-b.sh", &user, &TechnicalOptions::default()),
+                "a minus b dot S H"
+            );
             let failed: Vec<String> = check_examples(&user).into_iter().map(|r| r.text).collect();
             assert_eq!(
                 failed,
@@ -1672,14 +1806,17 @@ mod tests {
                 ("id#5/x", "id number hash 5 over x"),
                 ("id@7", "id number at 7"),
             ] {
-                let spoken = speak_technical(token, &user);
+                let spoken = speak_technical(token, &user, &TechnicalOptions::default());
                 assert_eq!(spoken, expected);
                 assert!(
                     spoken.chars().all(|c| c.is_alphanumeric() || c == ' '),
                     "{token} -> {spoken}"
                 );
             }
-            assert_eq!(speak_technical("customtool?!", &user), "custom tool?!");
+            assert_eq!(
+                speak_technical("customtool?!", &user, &TechnicalOptions::default()),
+                "custom tool?!"
+            );
         }
 
         #[test]
@@ -1709,19 +1846,25 @@ mod tests {
                 ("tool-name,", "utility dash label,"),
                 ("(tool@x)?!", "utility at x?!"),
             ] {
-                let spoken = speak_technical(token, &user);
+                let spoken = speak_technical(token, &user, &TechnicalOptions::default());
                 assert_eq!(spoken, expected, "{token}");
             }
             let tool =
                 with_user(r#"{"version":1,"terms":{"tool":{"say":"utility","match":"prefix"}}}"#);
-            assert_eq!(speak_technical("tool-name", &tool), "utility dash name");
-            assert_eq!(speak_technical("tool@name", &tool), "utility at name");
+            assert_eq!(
+                speak_technical("tool-name", &tool, &TechnicalOptions::default()),
+                "utility dash name"
+            );
+            assert_eq!(
+                speak_technical("tool@name", &tool, &TechnicalOptions::default()),
+                "utility at name"
+            );
             let renamed = with_user(
                 r#"{"version":1,"symbols":{"@":"around"},
                     "terms":{"tool":{"say":"utility","match":"prefix"}}}"#,
             );
             assert_eq!(
-                speak_technical("tool@name", &renamed),
+                speak_technical("tool@name", &renamed, &TechnicalOptions::default()),
                 "utility around name"
             );
         }
@@ -1787,6 +1930,90 @@ mod tests {
         }
     }
 
+    mod options {
+        use super::*;
+
+        fn say_with(token: &str, full_paths: bool, full_links: bool) -> String {
+            speak_technical(
+                token,
+                &Vocabulary::builtin(),
+                &TechnicalOptions {
+                    full_paths,
+                    full_links,
+                },
+            )
+        }
+
+        #[test]
+        fn defaults_are_full_paths_and_short_links() {
+            assert_eq!(
+                TechnicalOptions::default(),
+                TechnicalOptions {
+                    full_paths: true,
+                    full_links: false,
+                }
+            );
+        }
+
+        #[test]
+        fn short_paths_keep_the_last_segment_and_line() {
+            assert_eq!(say_with("tests/lib.sh", false, false), "lib dot S H");
+            assert_eq!(
+                say_with("notes/.cache/demo/.tests", false, false),
+                "dot tests"
+            );
+            assert_eq!(
+                say_with("src/tts/manager.rs:684", false, false),
+                "manager dot R S at line 684"
+            );
+            assert_eq!(
+                say_with("src/tts/manager.rs:684:7,", false, false),
+                "manager dot R S at line 684 column 7,"
+            );
+            assert_eq!(
+                say_with("~/notes/todo.md.", false, false),
+                "todo dot markdown."
+            );
+            assert_eq!(say_with("./b.txt", false, false), "b dot text");
+            assert_eq!(
+                say_with("tests/lib.sh", true, false),
+                "tests slash lib dot S H"
+            );
+        }
+
+        #[test]
+        fn short_paths_keep_slash_commands_and_word_pairs() {
+            assert_eq!(say_with("/review", false, false), "slash review");
+            for pair in ["and/or", "TCP/IP", "provider/model", "GPU3/Vulkan"] {
+                assert_eq!(
+                    say_with(pair, false, false),
+                    say_with(pair, true, false),
+                    "{pair}"
+                );
+            }
+            assert_eq!(
+                say_with("provider/model", false, false),
+                "provider slash model"
+            );
+        }
+
+        #[test]
+        fn full_links_drop_scheme_query_and_fragment() {
+            let link = "https://github.com/cjpais/Handy?tab=readme#top";
+            assert_eq!(
+                say_with(link, true, true),
+                "github dot com slash cjpais slash Handy"
+            );
+            assert_eq!(say_with(link, true, false), "link to github.com");
+            assert_eq!(
+                say_with("(https://example.com/docs/readme.md).", true, true),
+                "example dot com slash docs slash readme dot markdown."
+            );
+            assert_eq!(say_with("http://github.com/", true, true), "github dot com");
+            assert_eq!(say_with("https://", true, true), "link to ");
+        }
+    }
+
     mod output_contract {
         use super::*;
 
@@ -1837,6 +2064,12 @@ mod tests {
                     }
                     cores.push(format!("dir/{base}.{extension}"));
                 }
+            }
+            for base in BASES {
+                cores.push(format!("https://example.com/{base}/{base}.md?x=1#top"));
+                cores.push(format!("http://{base}.org"));
+                cores.push(format!("~/src/{base}/.cache"));
+                cores.push(format!("{base}/{base}:7"));
             }
             let mut tokens = Vec::with_capacity(cores.len() * 2);
             for (index, core) in cores.iter().enumerate() {
@@ -1898,15 +2131,24 @@ mod tests {
             assert!(tokens.len() >= 500, "only {} tokens", tokens.len());
             let mut transformed = 0;
             let mut violations = Vec::new();
-            for vocabulary in [&Vocabulary::builtin(), &user] {
-                for token in &tokens {
-                    let spoken = speak_technical(token, vocabulary);
-                    if spoken == *token {
-                        continue;
-                    }
-                    transformed += 1;
-                    if let Some(problem) = contract_violation(token, &spoken) {
-                        violations.push(format!("{token} -> {spoken:?}: {problem}"));
+            let all_options = [false, true].into_iter().flat_map(|full_paths| {
+                [false, true].map(|full_links| TechnicalOptions {
+                    full_paths,
+                    full_links,
+                })
+            });
+            for options in all_options {
+                for vocabulary in [&Vocabulary::builtin(), &user] {
+                    for token in &tokens {
+                        let spoken = speak_technical(token, vocabulary, &options);
+                        if spoken == *token {
+                            continue;
+                        }
+                        transformed += 1;
+                        if let Some(problem) = contract_violation(token, &spoken) {
+                            violations
+                                .push(format!("{token} {options:?} -> {spoken:?}: {problem}"));
+                        }
                     }
                 }
             }

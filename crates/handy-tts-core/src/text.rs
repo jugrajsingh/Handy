@@ -2,7 +2,10 @@ use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use regex::Regex;
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::sync::Arc;
 use thiserror::Error;
+
+use crate::vocabulary::{TechnicalOptions, Vocabulary, speak_technical};
 
 /// Request size used by the streaming session to keep synthesis lanes supplied.
 pub const STREAMING_CHUNK_CHARS: usize = 100;
@@ -56,6 +59,8 @@ pub struct TextCursor<'a> {
     utf16_cursor: u32,
     emoji: Regex,
     version: Regex,
+    vocabulary: Option<Arc<Vocabulary>>,
+    technical: TechnicalOptions,
     #[cfg(test)]
     work_units: usize,
     #[cfg(test)]
@@ -66,8 +71,21 @@ pub struct TextCursor<'a> {
 impl<'a> TextCursor<'a> {
     /// Creates a cursor with the streaming request budget.
     pub fn streaming(source: &'a str, read_code: bool) -> Result<Self, TextError> {
+        Self::streaming_with(source, read_code, None, TechnicalOptions::default())
+    }
+    /// Creates a streaming cursor that reads technical tokens with `vocabulary` when one is
+    /// given (technical reading on); `None` prepares text exactly as `streaming` always has.
+    /// `technical` chooses full or short paths and links.
+    pub fn streaming_with(
+        source: &'a str,
+        read_code: bool,
+        vocabulary: Option<Arc<Vocabulary>>,
+        technical: TechnicalOptions,
+    ) -> Result<Self, TextError> {
         let mut cursor = Self::new(source, read_code)?;
         cursor.set_chunk_limit(STREAMING_CHUNK_CHARS);
+        cursor.vocabulary = vocabulary;
+        cursor.technical = technical;
         Ok(cursor)
     }
     /// Creates a cursor that reads or skips fenced code blocks.
@@ -103,6 +121,8 @@ impl<'a> TextCursor<'a> {
                 r"[0-9#*]\x{FE0F}?\x{20E3}|[\p{Extended_Pictographic}\p{Regional_Indicator}\x{1F3FB}-\x{1F3FF}\x{FE0E}\x{FE0F}\x{200D}\x{20E3}]",
             )?,
             version: Regex::new(r"\bv([0-9]+\.[0-9]+\.[0-9]+)")?,
+            vocabulary: None,
+            technical: TechnicalOptions::default(),
             #[cfg(test)]
             work_units: 0,
             #[cfg(test)]
@@ -165,6 +185,14 @@ impl<'a> TextCursor<'a> {
         }
         self.emoji.replace_all(&spoken, "").trim().to_string()
     }
+    /// The technical reading of one word, when a vocabulary is set and the reading differs from
+    /// the word; a word it leaves unchanged takes the ordinary path, so prose reads as before.
+    fn technical_word(&self, word: &str) -> Option<String> {
+        let vocabulary = self.vocabulary.as_deref()?;
+        let word = self.emoji.replace_all(word, "");
+        let spoken = speak_technical(&word, vocabulary, &self.technical);
+        (spoken != word).then_some(spoken)
+    }
     fn set_fragment(
         &mut self,
         value: pulldown_cmark::CowStr<'a>,
@@ -190,7 +218,10 @@ impl<'a> TextCursor<'a> {
         let raw = std::mem::take(&mut self.word);
         let range = self.word_range.take()?;
         let code = std::mem::take(&mut self.word_code);
-        let text = self.normalize(&raw, &code);
+        let text = match self.technical_word(&raw) {
+            Some(spoken) => spoken,
+            None => self.normalize(&raw, &code),
+        };
         if text.trim().is_empty() {
             None
         } else {
@@ -446,6 +477,34 @@ impl<'a> TextCursor<'a> {
         }
         (pause, synthetic_period)
     }
+    /// Where an over-long first piece is cut: at `cut`, the character limit, or with technical
+    /// reading on, at the last space before it so no spoken word is split. Returns the end of
+    /// the kept text and the start of the remainder.
+    fn spoken_word_cut(&self, text: &str, cut: usize) -> (usize, usize) {
+        if self.vocabulary.is_none() {
+            return (cut, cut);
+        }
+        let window = cut + text[cut..].chars().next().map_or(0, char::len_utf8);
+        match text[..window].rfind(' ') {
+            Some(space) if space > 0 => (space, space + 1),
+            _ => (cut, cut),
+        }
+    }
+    /// With technical reading on, moves the proportional source cut of a split piece to the
+    /// nearest point just after a separator such as `/`, `.` or `_`, so each part's highlight
+    /// ends between source segments instead of inside one.
+    fn source_cut_near(&self, source: &str, proportional: usize) -> usize {
+        if self.vocabulary.is_none() {
+            return proportional;
+        }
+        source
+            .char_indices()
+            .filter(|(_, c)| !c.is_alphanumeric())
+            .map(|(index, c)| index + c.len_utf8())
+            .filter(|end| *end < source.len())
+            .min_by_key(|end| end.abs_diff(proportional))
+            .unwrap_or(proportional)
+    }
     fn source_range(&mut self, range: Range<usize>) -> Result<(u32, u32), TextError> {
         let start = range.start.max(self.byte_cursor);
         self.utf16_cursor = self
@@ -497,17 +556,20 @@ impl<'a> TextCursor<'a> {
                 let source = &self.source[p.range.clone()];
                 let source_count = source.chars().count();
                 let spoken_count = p.text.chars().count();
+                let (cut, resume) = self.spoken_word_cut(&p.text, cut);
                 let source_cut = if source == p.text {
                     cut
                 } else {
-                    let count = ((limit - 1) * source_count / spoken_count).max(1);
-                    source
+                    let count =
+                        (p.text[..cut].chars().count() * source_count / spoken_count).max(1);
+                    let proportional = source
                         .char_indices()
                         .nth(count)
-                        .map_or(source.len(), |(i, _)| i)
+                        .map_or(source.len(), |(i, _)| i);
+                    self.source_cut_near(source, proportional)
                 };
                 let remainder = Piece {
-                    text: p.text[cut..].to_owned(),
+                    text: p.text[resume..].to_owned(),
                     range: p.range.start + source_cut..p.range.end,
                     pause: p.pause,
                 };
@@ -1003,5 +1065,283 @@ mod fixes {
             spoken("words continue\nonto next line."),
             "words continue onto next line."
         );
+    }
+}
+#[cfg(test)]
+mod technical {
+    use super::*;
+    use crate::vocabulary::speak_technical;
+
+    const OWNER_LINE: &str = "Cached files go here: tests/lib.sh has a cache_dir helper that returns notes/.cache/demo/.tests.";
+
+    fn chunks_with(
+        source: &str,
+        vocabulary: Option<Arc<Vocabulary>>,
+        options: TechnicalOptions,
+    ) -> Vec<TextChunk> {
+        let mut cursor = TextCursor::streaming_with(source, false, vocabulary, options).unwrap();
+        std::iter::from_fn(|| cursor.next_chunk().unwrap()).collect()
+    }
+    fn technical_chunks(source: &str, options: TechnicalOptions) -> Vec<TextChunk> {
+        chunks_with(source, Some(Arc::new(Vocabulary::builtin())), options)
+    }
+    fn joined(chunks: &[TextChunk]) -> String {
+        chunks
+            .iter()
+            .map(|chunk| chunk.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+    fn technical_text(source: &str) -> String {
+        joined(&technical_chunks(source, TechnicalOptions::default()))
+    }
+    fn today(source: &str) -> Vec<TextChunk> {
+        let mut cursor = TextCursor::streaming(source, false).unwrap();
+        std::iter::from_fn(|| cursor.next_chunk().unwrap()).collect()
+    }
+    fn utf16(source: &str, byte: usize) -> u32 {
+        source[..byte].encode_utf16().count() as u32
+    }
+    fn short_paths() -> TechnicalOptions {
+        TechnicalOptions {
+            full_paths: false,
+            full_links: false,
+        }
+    }
+
+    #[test]
+    fn technical_paragraph_reads_owner_examples() {
+        assert_eq!(
+            technical_text(OWNER_LINE),
+            "Cached files go here: tests slash lib dot S H has a cache underscore dir helper that returns notes slash dot cache slash demo slash dot tests."
+        );
+        assert_eq!(
+            technical_text("Run /review with --dry-run on every .sh file."),
+            "Run slash review with dash dash dry dash run on every dot S H file."
+        );
+    }
+
+    #[test]
+    fn technical_off_is_unchanged() {
+        let off = chunks_with(OWNER_LINE, None, TechnicalOptions::default());
+        assert_eq!(off, today(OWNER_LINE));
+        assert_eq!(
+            joined(&off),
+            "Cached files go here: lib.sh has a cache_dir helper that returns .tests."
+        );
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/text");
+        let cases: std::collections::BTreeMap<String, Vec<String>> =
+            serde_json::from_str(include_str!("../tests/fixtures/text/goldens.json")).unwrap();
+        for name in cases.keys() {
+            let source = std::fs::read_to_string(fixtures.join(name)).unwrap();
+            let expected = today(&source);
+            for full_paths in [false, true] {
+                for full_links in [false, true] {
+                    let options = TechnicalOptions {
+                        full_paths,
+                        full_links,
+                    };
+                    assert_eq!(chunks_with(&source, None, options), expected, "{name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn technical_on_keeps_prose_as_today() {
+        for source in [
+            "Read me & you, then AT&amp;T and foo*bar.",
+            "<div>Read me &amp; you</div>\n\nEnd.",
+            "Then the deadline is October 12, 2026, at 18:45 today. Read it; remember it.",
+            "For example e.g. the U.S. rate is 3.14 at 10:59, done.",
+            "Flags 🇺🇸 keycap 1️⃣ skin 👍🏽 family 👨‍👩‍👧‍👦 done.",
+            "Naïve first sentence is long enough to pass forty chars. 😀😀 Ünïcödé second sentence follows here.",
+        ] {
+            assert_eq!(
+                technical_chunks(source, TechnicalOptions::default()),
+                today(source),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn technical_highlight_covers_source_token() {
+        let source =
+            "Café notes 😀 here.\n\n**tests/lib.sh**\n\n(/review),\n\nNaïve `fixture_base` text.";
+        let out = technical_chunks(source, TechnicalOptions::default());
+        let chunk = |text: &str| out.iter().find(|chunk| chunk.text == text).unwrap();
+        let path = chunk("tests slash lib dot S H.");
+        let start = source.find("tests/lib.sh").unwrap();
+        assert_eq!(
+            (path.source_start, path.source_end),
+            (
+                utf16(source, start),
+                utf16(source, start + "tests/lib.sh".len())
+            )
+        );
+        let command = chunk("slash review,");
+        let start = source.find("(/review),").unwrap();
+        assert_eq!(
+            (command.source_start, command.source_end),
+            (
+                utf16(source, start),
+                utf16(source, start + "(/review),".len())
+            )
+        );
+        let code = chunk("Naïve fixture underscore base text.");
+        let start = source.find("Naïve").unwrap();
+        assert_eq!(
+            (code.source_start, code.source_end),
+            (utf16(source, start), utf16(source, source.len()))
+        );
+    }
+
+    #[test]
+    fn long_technical_paragraph_chunks_within_limit() {
+        let paths: Vec<String> = (0..10)
+            .map(|n| format!("src/mod_{n}/lib.rs:{}", 100 + n))
+            .collect();
+        let source = format!("Paths: {}.", paths.join(" "));
+        let out = technical_chunks(&source, TechnicalOptions::default());
+        let vocabulary = Vocabulary::builtin();
+        let mut tokens: Vec<String> = vec!["Paths:".into()];
+        for (index, path) in paths.iter().enumerate() {
+            let token = if index == paths.len() - 1 {
+                format!("{path}.")
+            } else {
+                path.clone()
+            };
+            let spoken = speak_technical(&token, &vocabulary, &TechnicalOptions::default());
+            assert!(
+                spoken.chars().count() < 70 && spoken.chars().count() > 40,
+                "{spoken}"
+            );
+            tokens.push(spoken);
+        }
+        assert_eq!(joined(&out), tokens.join(" "));
+        assert!(out.len() >= 5, "{} chunks", out.len());
+        let source_tokens: Vec<&str> = source.split(' ').collect();
+        let mut next_token = 0;
+        let mut previous_end = 0;
+        for chunk in &out {
+            assert!(
+                chunk.text.chars().count() <= STREAMING_CHUNK_CHARS,
+                "{:?} exceeds the limit",
+                chunk.text
+            );
+            let mut rest = chunk.text.as_str();
+            let first = next_token;
+            for spoken in &tokens[next_token..] {
+                match rest.strip_prefix(spoken.as_str()) {
+                    Some(after) => {
+                        rest = after.trim_start();
+                        next_token += 1;
+                    }
+                    None => break,
+                }
+            }
+            assert!(rest.is_empty(), "{:?} splits a spoken token", chunk.text);
+            assert!(chunk.source_start >= previous_end);
+            previous_end = chunk.source_end;
+            let covered = &source[chunk.source_start as usize..chunk.source_end as usize];
+            assert_eq!(covered, source_tokens[first..next_token].join(" "));
+        }
+        assert_eq!(next_token, tokens.len());
+    }
+
+    #[test]
+    fn oversized_technical_token_splits_between_spoken_words() {
+        let token = "/home/user/projects/app/src/modules/library/crates/handy-tts-core/src/deeply/nested/module_folder/text.rs:118";
+        let source = format!("See {token} now.");
+        let spoken = speak_technical(token, &Vocabulary::builtin(), &TechnicalOptions::default());
+        assert!(spoken.chars().count() > 2 * STREAMING_CHUNK_CHARS);
+        let out = technical_chunks(&source, TechnicalOptions::default());
+        assert_eq!(joined(&out), format!("See {spoken} now."));
+        let token_start = source.find(token).unwrap() as u32;
+        let token_end = token_start + token.len() as u32;
+        let parts: Vec<&TextChunk> = out
+            .iter()
+            .filter(|chunk| chunk.source_start >= token_start && chunk.source_start < token_end)
+            .collect();
+        assert!(parts.len() >= 3, "{} parts", parts.len());
+        assert_eq!(parts[0].source_start, token_start);
+        for pair in parts.windows(2) {
+            assert_eq!(pair[0].source_end, pair[1].source_start);
+            let before = source[..pair[0].source_end as usize].chars().next_back();
+            assert!(
+                before.is_some_and(|c| !c.is_alphanumeric()),
+                "a part ends inside a source segment at {}",
+                pair[0].source_end
+            );
+        }
+        for chunk in &out {
+            assert!(chunk.text.chars().count() <= STREAMING_CHUNK_CHARS);
+            for word in chunk.text.trim_end_matches('.').split(' ') {
+                assert!(
+                    spoken.split(' ').any(|spoken_word| spoken_word == word)
+                        || ["See", "now"].contains(&word),
+                    "{word:?} is not a whole spoken word"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_code_span_is_technical() {
+        assert_eq!(
+            technical_text("Call `fixture_base` and `lib.sh` now."),
+            "Call fixture underscore base and lib dot S H now."
+        );
+        assert_eq!(
+            technical_text("```\nfixture_base\n```"),
+            "code block skipped."
+        );
+        let mut cursor = TextCursor::streaming_with(
+            "```\nrun fixture_base\n```",
+            true,
+            Some(Arc::new(Vocabulary::builtin())),
+            TechnicalOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            cursor.next_chunk().unwrap().unwrap().text,
+            "run fixture underscore base."
+        );
+    }
+
+    #[test]
+    fn short_paths_read_the_last_segment() {
+        let source = "Edit tests/lib.sh and src/tts/manager.rs:684 today.";
+        assert_eq!(
+            joined(&technical_chunks(source, short_paths())),
+            "Edit lib dot S H and manager dot R S at line 684 today."
+        );
+        assert_eq!(
+            technical_text(source),
+            "Edit tests slash lib dot S H and src slash tts slash manager dot R S at line 684 today."
+        );
+        let token = "src/tts/manager.rs:684";
+        let alone = technical_chunks(token, short_paths());
+        assert_eq!(alone.len(), 1);
+        assert_eq!(alone[0].text, "manager dot R S at line 684.");
+        assert_eq!(
+            (alone[0].source_start, alone[0].source_end),
+            (0, token.len() as u32)
+        );
+    }
+
+    #[test]
+    fn full_links_read_host_and_path() {
+        let source = "See https://github.com/cjpais/Handy?tab=readme#top today.";
+        let full_links = TechnicalOptions {
+            full_paths: true,
+            full_links: true,
+        };
+        assert_eq!(
+            joined(&technical_chunks(source, full_links)),
+            "See github dot com slash cjpais slash Handy today."
+        );
+        assert_eq!(technical_text(source), "See link to github.com today.");
     }
 }

@@ -4,17 +4,38 @@ use crate::{
     playback::segment::{Output, OutputEvent, Playback},
     protocol::Pcm,
     scheduler::{AudioChunk, PlaybackState, QUEUED_AUDIO_CEILING, Queue, Ticket},
-    selection::{Selection, SelectionChange, SelectionError, select_with},
+    selection::{Selection, SelectionChange, SelectionError, select_with, text_changed},
     text::{TextChunk, TextCursor},
+    vocabulary::{TechnicalOptions, Vocabulary},
 };
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::sync::Arc;
 
 type ReportedPosition = (u32, u32, f64, f64);
-type CursorFactory = for<'s> fn(&'s str, bool) -> Result<TextCursor<'s>, String>;
+type CursorFactory = for<'s> fn(
+    &'s str,
+    bool,
+    Option<Arc<Vocabulary>>,
+    TechnicalOptions,
+) -> Result<TextCursor<'s>, String>;
 
-fn text_cursor(source: &str, read_code: bool) -> Result<TextCursor<'_>, String> {
-    TextCursor::streaming(source, read_code).map_err(|_| "tts.errors.text".to_string())
+fn text_cursor(
+    source: &str,
+    read_code: bool,
+    vocabulary: Option<Arc<Vocabulary>>,
+    technical: TechnicalOptions,
+) -> Result<TextCursor<'_>, String> {
+    TextCursor::streaming_with(source, read_code, vocabulary, technical)
+        .map_err(|_| "tts.errors.text".to_string())
+}
+
+/// The vocabulary a selection reads with: the session's, and only when technical reading is on.
+fn reading_vocabulary(
+    selection: &Selection,
+    vocabulary: Option<&Arc<Vocabulary>>,
+) -> Option<Arc<Vocabulary>> {
+    vocabulary.filter(|_| selection.technical).cloned()
 }
 
 fn dsp_clock() -> Box<dyn Fn() -> f64 + Send> {
@@ -229,6 +250,7 @@ pub struct Session<'a, W: Worker, O: Output> {
     handy_output: Option<String>,
     cursor: TextCursor<'a>,
     cursor_factory: CursorFactory,
+    vocabulary: Option<Arc<Vocabulary>>,
     pending_text: Option<TextChunk>,
     dsp_clock: Box<dyn Fn() -> f64 + Send>,
     reported_position: Cell<Option<ReportedPosition>>,
@@ -267,8 +289,24 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         output: O,
         handy_output: Option<&str>,
     ) -> Result<Self, String> {
-        let cursor = TextCursor::streaming(source, selection.read_code)
-            .map_err(|_| "tts.errors.text".to_string())?;
+        Self::with_vocabulary(source, selection, worker, output, handy_output, None)
+    }
+    /// Creates an idle session that reads technical tokens with `vocabulary` whenever the
+    /// selection has technical reading on, including cursors rebuilt after a selection change.
+    pub fn with_vocabulary(
+        source: &'a str,
+        selection: Selection,
+        worker: W,
+        output: O,
+        handy_output: Option<&str>,
+        vocabulary: Option<Arc<Vocabulary>>,
+    ) -> Result<Self, String> {
+        let cursor = text_cursor(
+            source,
+            selection.read_code,
+            reading_vocabulary(&selection, vocabulary.as_ref()),
+            selection.technical_options(),
+        )?;
         let playback = Playback::idle(output);
         Ok(Self {
             source,
@@ -283,6 +321,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             handy_output: handy_output.map(str::to_owned),
             cursor,
             cursor_factory: text_cursor,
+            vocabulary,
             pending_text: None,
             dsp_clock: dsp_clock(),
             reported_position: Cell::new(None),
@@ -323,11 +362,16 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
     }
     fn prepare_cursor(
         &self,
-        read_code: bool,
+        selection: &Selection,
         index: usize,
         position: Option<u32>,
     ) -> Result<(TextCursor<'a>, Option<TextChunk>), String> {
-        let mut cursor = (self.cursor_factory)(self.source, read_code)?;
+        let mut cursor = (self.cursor_factory)(
+            self.source,
+            selection.read_code,
+            reading_vocabulary(selection, self.vocabulary.as_ref()),
+            selection.technical_options(),
+        )?;
         while let Some(text) = cursor
             .next_chunk()
             .map_err(|_| "tts.errors.text".to_string())?
@@ -340,7 +384,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
         Ok((cursor, None))
     }
     fn seek(&mut self, index: usize) -> Result<(), String> {
-        let (cursor, pending) = self.prepare_cursor(self.selection.read_code, index, None)?;
+        let (cursor, pending) = self.prepare_cursor(&self.selection, index, None)?;
         self.cursor = cursor;
         self.pending_text = pending;
         self.metadata.clear();
@@ -513,11 +557,11 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
                 .store(true, std::sync::atomic::Ordering::Release);
         }
         let index = self.queue.next_unspoken();
-        let position = (self.selection.read_code != selection.read_code)
+        let position = text_changed(&self.selection, &selection)
             .then(|| self.metadata.get(&index).map(|text| text.source_start))
             .flatten();
         let (cursor, pending) = self
-            .prepare_cursor(selection.read_code, index, position)
+            .prepare_cursor(&selection, index, position)
             .map_err(|_| SelectionError::Controls)?;
         let new_index = pending.as_ref().map_or(index, |text| text.index);
         let old_tickets = self.queue.in_flight.clone();
@@ -1134,7 +1178,7 @@ impl<'a, W: Worker, O: Output> Session<'a, W, O> {
             && self.parts.is_empty()
             && self.queue.ready.is_empty()
         {
-            let (cursor, pending) = self.prepare_cursor(self.selection.read_code, index, None)?;
+            let (cursor, pending) = self.prepare_cursor(&self.selection, index, None)?;
             self.cursor = cursor;
             self.pending_text = pending;
             self.metadata.retain(|i, _| *i < index);
@@ -1351,15 +1395,17 @@ mod tests {
         busy_once: bool,
         seconds: f64,
         selections: usize,
+        texts: Vec<String>,
     }
     impl Worker for FakeWorker {
         fn request(
             &mut self,
             ticket: Ticket,
-            _: &str,
+            text: &str,
             selection: &Selection,
         ) -> Result<(), String> {
             self.requested.push(ticket);
+            self.texts.push(text.to_owned());
             self.native_speeds.push(Some(selection.speed));
             let result = if self.fail_once == Some(ticket.index) {
                 self.fail_once = None;
@@ -1545,6 +1591,9 @@ mod tests {
             pitch: 0.0,
             output_device: None,
             read_code: false,
+            technical: false,
+            full_paths: true,
+            full_links: false,
         }
     }
     fn session(source: &str, rtf: f64) -> Session<'_, FakeWorker, FakeOutput> {
@@ -2850,7 +2899,7 @@ mod tests {
                 s.playback.output.stops,
             );
             if seek_error {
-                s.cursor_factory = |_, _| Err("tts.errors.text".into());
+                s.cursor_factory = |_, _, _, _| Err("tts.errors.text".into());
             } else {
                 s.playback.output.fail_open = true;
             }
@@ -3083,6 +3132,84 @@ mod tests {
             }
             assert_eq!(s.snapshot().source_start, target);
         }
+    }
+    #[test]
+    fn technical_selection_uses_vocabulary_and_off_does_not() {
+        let source = "First we edit tests/lib.sh in the repository today.\n\nThen we run tests/lib.sh again to check the result.\n\nLast we commit tests/lib.sh and close the task.";
+        let start = |chosen: Selection, vocabulary: Option<Arc<Vocabulary>>| {
+            let worker = FakeWorker {
+                rtf: 0.01,
+                seconds: 1.0,
+                ..FakeWorker::default()
+            };
+            let mut s = Session::with_vocabulary(
+                source,
+                chosen,
+                worker,
+                FakeOutput::default(),
+                None,
+                vocabulary,
+            )
+            .unwrap();
+            s.play().unwrap();
+            s
+        };
+        let finish = |s: &mut Session<'_, FakeWorker, FakeOutput>, mut now: f64| {
+            for _ in 0..500 {
+                step(s, now);
+                now += 0.1;
+                if s.queue.state == PlaybackState::Finished {
+                    break;
+                }
+            }
+            assert_eq!(s.queue.state, PlaybackState::Finished);
+            now
+        };
+        let vocabulary = Some(Arc::new(Vocabulary::builtin()));
+        let technical = Selection {
+            technical: true,
+            ..selection()
+        };
+        let mut on = start(technical.clone(), vocabulary.clone());
+        finish(&mut on, 0.0);
+        let spoken = on.worker.texts.join(" ");
+        assert_eq!(
+            spoken.matches("tests slash lib dot S H").count(),
+            3,
+            "{spoken}"
+        );
+        assert!(!spoken.contains("lib.sh"), "{spoken}");
+        for (chosen, vocabulary) in [(selection(), vocabulary.clone()), (technical.clone(), None)] {
+            let mut off = start(chosen, vocabulary);
+            finish(&mut off, 0.0);
+            let spoken = off.worker.texts.join(" ");
+            assert_eq!(spoken.matches("lib.sh").count(), 3, "{spoken}");
+            assert!(!spoken.contains("slash"), "{spoken}");
+        }
+        let mut changed = start(selection(), vocabulary);
+        let mut now = 0.0;
+        for _ in 0..50 {
+            step(&mut changed, now);
+            now += 0.1;
+            if !changed.worker.texts.is_empty() {
+                break;
+            }
+        }
+        assert!(changed.worker.texts[0].contains("lib.sh"));
+        let chosen = Selection {
+            speed: 1.5,
+            full_paths: false,
+            ..technical
+        };
+        changed.select(chosen, true, |_| Ok(())).unwrap();
+        let before = changed.worker.texts.len();
+        finish(&mut changed, now);
+        let after = changed.worker.texts[before..].join(" ");
+        assert_eq!(after.matches("lib dot S H").count(), 3, "{after}");
+        assert!(
+            !after.contains("slash") && !after.contains("lib.sh"),
+            "{after}"
+        );
     }
     #[test]
     fn repeated_play_and_idle_pause_do_not_stall_output() {

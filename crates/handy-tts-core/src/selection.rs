@@ -7,12 +7,20 @@ pub struct SelectionChange {
     pub resume: bool,
     pub missing_download: bool,
 }
+/// True when the two selections prepare the source into different spoken text, so the cursor
+/// must be rebuilt: code blocks, technical reading, or full paths and links changed.
+pub fn text_changed(current: &Selection, next: &Selection) -> bool {
+    current.read_code != next.read_code
+        || current.technical != next.technical
+        || current.full_paths != next.full_paths
+        || current.full_links != next.full_links
+}
 /// Identifies controls changes that retain the current sentence and worker.
 pub fn speed_pitch_only(current: &Selection, next: &Selection) -> bool {
     current.model_id == next.model_id
         && current.voice == next.voice
         && current.output_device == next.output_device
-        && current.read_code == next.read_code
+        && !text_changed(current, next)
         && (current.speed != next.speed || current.pitch != next.pitch)
 }
 /// Validates and persists a selection before invalidating current audio.
@@ -72,6 +80,9 @@ mod tests {
             pitch: 0.0,
             output_device: None,
             read_code: false,
+            technical: false,
+            full_paths: true,
+            full_links: false,
         }
     }
     #[test]
@@ -154,6 +165,9 @@ mod tests {
             pitch: 0.0,
             output_device: None,
             read_code: false,
+            technical: false,
+            full_paths: true,
+            full_links: false,
         };
         assert_eq!(clamp_selection(selection.clone()).unwrap().speed, 2.0);
         selection.model_id = "pocket-en".into();

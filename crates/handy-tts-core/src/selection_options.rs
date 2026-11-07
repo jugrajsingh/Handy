@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::vocabulary::TechnicalOptions;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 pub struct Selection {
     pub model_id: String,
@@ -9,6 +11,28 @@ pub struct Selection {
     pub pitch: f32,
     pub output_device: Option<String>,
     pub read_code: bool,
+    /// Paths, file names, flags and identifiers are read with the vocabulary. Older payloads
+    /// lack it and read with it off.
+    #[serde(default)]
+    pub technical: bool,
+    /// With technical reading, every path segment is read; off reads the last one.
+    #[serde(default = "full_paths_default")]
+    pub full_paths: bool,
+    /// With technical reading, a link's host and path are read; off keeps "link to <host>".
+    #[serde(default)]
+    pub full_links: bool,
+}
+fn full_paths_default() -> bool {
+    TechnicalOptions::default().full_paths
+}
+impl Selection {
+    /// The full or short path and link choice technical reading uses.
+    pub fn technical_options(&self) -> TechnicalOptions {
+        TechnicalOptions {
+            full_paths: self.full_paths,
+            full_links: self.full_links,
+        }
+    }
 }
 #[derive(Debug, Error, Clone, PartialEq)]
 pub enum SelectionError {

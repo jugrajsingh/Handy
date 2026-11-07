@@ -519,6 +519,9 @@ pub fn continuity(
         pitch: 0.0,
         output_device: None,
         read_code: false,
+        technical: false,
+        full_paths: true,
+        full_links: false,
     };
     let capture = CaptureOutput::new(0, Some(options.wav))?;
     let mut session =
@@ -1713,6 +1716,9 @@ mod continuity_tests {
             pitch: 0.0,
             output_device: None,
             read_code: false,
+            technical: false,
+            full_paths: true,
+            full_links: false,
         };
         let mut session = Session::new(
             source,

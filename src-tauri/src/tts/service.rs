@@ -55,6 +55,9 @@ pub(crate) fn selection(settings: &crate::settings::AppSettings) -> Selection {
         pitch: settings.tts_pitch_semitones,
         output_device: settings.tts_output_device.clone(),
         read_code: settings.tts_read_code_blocks,
+        technical: false,
+        full_paths: true,
+        full_links: false,
     }
 }
 pub(crate) fn reading_cancel_with(effect: &Effect, set_owner: impl FnOnce(bool)) {

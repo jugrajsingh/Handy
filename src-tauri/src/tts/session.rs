@@ -1118,6 +1118,9 @@ pub(super) mod tests {
             pitch: 0.0,
             output_device: None,
             read_code: false,
+            technical: false,
+            full_paths: true,
+            full_links: false,
         }
     }
     fn manager() -> Arc<TtsManager> {

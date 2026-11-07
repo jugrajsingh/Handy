@@ -43,6 +43,9 @@ pub fn prepare(ready: &Ready, model: &str, choice: RunOn) -> Result<(), String> 
         pitch: 0.0,
         output_device: None,
         read_code: false,
+        technical: false,
+        full_paths: true,
+        full_links: false,
     };
     ready
         .preparer
