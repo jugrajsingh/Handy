@@ -32,18 +32,16 @@ pub trait Control: Clone + Send + Sync + 'static {
     }
 }
 /// Maps a non-Ok chunk reply to its error; a busy worker is retryable.
-fn reply_error(header: &handy_tts_core::protocol::Header) -> Result<Pcm, TtsError> {
-    let message = header.message.as_deref().unwrap_or("no message");
-    log::warn!(
-        "TTS worker replied {:?} to request {}: {message}",
-        header.status,
-        header.id
-    );
-    if header.status == Status::Error && message == "busy" {
+fn reply_error(header: &Header) -> Result<Pcm, TtsError> {
+    if header.status == Status::Error && header.message.as_deref() == Some("busy") {
         Err(TtsError::Busy)
     } else {
         Err(TtsError::Worker)
     }
+}
+/// Production log sink for worker diagnostics and failed replies.
+fn warn(line: &str) {
+    log::warn!("{line}");
 }
 /// Returns the worker's own failure line, without its prefix and line ending.
 fn worker_failure_line(line: &str) -> Option<&str> {
@@ -52,6 +50,7 @@ fn worker_failure_line(line: &str) -> Option<&str> {
 fn read_worker_diagnostics(
     mut reader: impl std::io::BufRead,
     preparation: &Arc<Mutex<Option<handy_tts_core::device::Preparation>>>,
+    mut log: impl FnMut(&str),
 ) {
     let mut bytes = Vec::new();
     loop {
@@ -62,7 +61,7 @@ fn read_worker_diagnostics(
         }
         let line = String::from_utf8_lossy(&bytes);
         if let Some(failure) = worker_failure_line(&line) {
-            log::warn!("TTS worker reported: {failure}");
+            log(&format!("TTS worker reported: {failure}"));
         }
         if let Some(json) = line.strip_prefix("HANDY_TTS_PROGRESS ") {
             if let Ok(value) = serde_json::from_str(json) {
@@ -118,12 +117,75 @@ impl WorkerControl {
         }
     }
 }
-struct Reply {
+pub(super) struct Reply {
     header: Header,
     pcm: Option<Pcm>,
 }
-type PendingReplies =
+pub(super) type PendingReplies =
     Arc<Mutex<std::collections::BTreeMap<u64, mpsc::Sender<Result<Pcm, TtsError>>>>>;
+
+/// Reads worker replies until the stream ends or breaks. Every failed or cancelled reply
+/// header is logged once, whatever its route; id 0 goes to `control`, any other id to its
+/// pending sender, and a reply whose sender is gone is dropped after logging.
+pub(super) fn route_replies(
+    mut reader: impl std::io::BufRead,
+    pending: &PendingReplies,
+    control: &mpsc::Sender<Result<Reply, TtsError>>,
+    mut log: impl FnMut(&str),
+) {
+    loop {
+        let result: Result<Reply, TtsError> = (|| {
+            let header = read_header(&mut reader).map_err(|_| TtsError::Protocol)?;
+            let pcm = if header.status == Status::Ok {
+                Some(
+                    read_pcm_after_header(&mut reader, header.clone(), header.id)
+                        .map_err(|_| TtsError::Protocol)?,
+                )
+            } else {
+                None
+            };
+            Ok(Reply { header, pcm })
+        })();
+        let reply = match result {
+            Ok(reply) => reply,
+            Err(error) => {
+                let requests =
+                    std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
+                for sender in requests.into_values() {
+                    let _ = sender.send(Err(error.clone()));
+                }
+                let _ = control.send(Err(error));
+                break;
+            }
+        };
+        if matches!(reply.header.status, Status::Error | Status::Cancelled) {
+            log(&format!(
+                "TTS worker replied {:?} to request {}: {}",
+                reply.header.status,
+                reply.header.id,
+                reply.header.message.as_deref().unwrap_or("no message")
+            ));
+        }
+        if reply.header.id == 0 {
+            if control.send(Ok(reply)).is_err() {
+                break;
+            }
+            continue;
+        }
+        let sender = pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&reply.header.id);
+        if let Some(sender) = sender {
+            let result = if reply.header.status == Status::Ok {
+                reply.pcm.ok_or(TtsError::Protocol)
+            } else {
+                reply_error(&reply.header)
+            };
+            let _ = sender.send(result);
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct WorkerBackend {
@@ -214,7 +276,7 @@ impl WorkerBackend {
             std::thread::Builder::new()
                 .name("tts-stderr".into())
                 .spawn(move || {
-                    read_worker_diagnostics(BufReader::new(stderr), &preparation);
+                    read_worker_diagnostics(BufReader::new(stderr), &preparation, warn);
                 })
                 .map_err(|_| TtsError::Start)?;
         }
@@ -222,57 +284,7 @@ impl WorkerBackend {
         let pending = self.pending.clone();
         std::thread::Builder::new()
             .name("tts-replies".into())
-            .spawn(move || {
-                let mut reader = BufReader::new(output);
-                loop {
-                    let result: Result<Reply, TtsError> = (|| {
-                        let header = read_header(&mut reader).map_err(|_| TtsError::Protocol)?;
-                        let pcm = if header.status == Status::Ok {
-                            Some(
-                                read_pcm_after_header(&mut reader, header.clone(), header.id)
-                                    .map_err(|_| TtsError::Protocol)?,
-                            )
-                        } else {
-                            None
-                        };
-                        Ok(Reply { header, pcm })
-                    })();
-                    let failed = result.is_err();
-                    match result {
-                        Ok(reply) if reply.header.id == 0 => {
-                            if tx.send(Ok(reply)).is_err() {
-                                break;
-                            }
-                        }
-                        Ok(reply) => {
-                            let sender = pending
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .remove(&reply.header.id);
-                            if let Some(sender) = sender {
-                                let result = if reply.header.status == Status::Ok {
-                                    reply.pcm.ok_or(TtsError::Protocol)
-                                } else {
-                                    reply_error(&reply.header)
-                                };
-                                let _ = sender.send(result);
-                            }
-                        }
-                        Err(error) => {
-                            let requests = std::mem::take(
-                                &mut *pending.lock().unwrap_or_else(|p| p.into_inner()),
-                            );
-                            for sender in requests.into_values() {
-                                let _ = sender.send(Err(error.clone()));
-                            }
-                            let _ = tx.send(Err(error));
-                        }
-                    }
-                    if failed {
-                        break;
-                    }
-                }
-            })
+            .spawn(move || route_replies(BufReader::new(output), &pending, &tx, warn))
             .map_err(|_| TtsError::Start)?;
         self.replies = Some(rx);
         self.send(&Request::Load {
@@ -508,6 +520,7 @@ mod tests {
                 b"bad byte \xff\nHANDY_TTS_PROGRESS {\"state\":\"ready\",\"device\":\"gpu\"}",
             ),
             &progress,
+            warn,
         );
         assert_eq!(
             *progress.lock().unwrap(),
@@ -516,7 +529,7 @@ mod tests {
             }),
             "invalid diagnostics must not stop progress parsing"
         );
-        read_worker_diagnostics(std::io::Cursor::new(b"HANDY_TTS_PROGRESS {\"state\":\"preparing\",\"device\":\"gpu\",\"completed\":1,\"total\":2,\"graph\":\"graph-\xff\"}\n"), &progress);
+        read_worker_diagnostics(std::io::Cursor::new(b"HANDY_TTS_PROGRESS {\"state\":\"preparing\",\"device\":\"gpu\",\"completed\":1,\"total\":2,\"graph\":\"graph-\xff\"}\n"), &progress, warn);
         assert_eq!(
             *progress.lock().unwrap(),
             Some(Preparation::Preparing {
@@ -564,6 +577,7 @@ mod tests {
         read_worker_diagnostics(
             std::io::Cursor::new(b"fixture-key /private/fixture/model\n"),
             &progress,
+            warn,
         );
         assert!(
             LOGS.0.lock().unwrap().is_empty(),
@@ -572,6 +586,7 @@ mod tests {
         read_worker_diagnostics(
             std::io::Cursor::new(b"HANDY_TTS_PROGRESS {\"state\":\"ready\",\"device\":\"gpu\"}\n"),
             &progress,
+            warn,
         );
         assert_eq!(
             *progress.lock().unwrap(),
@@ -808,5 +823,107 @@ for line in sys.stdin:
         assert!(matches!(result, Err(TtsError::Memory)));
         assert!(!backend.alive());
         assert!(backend.control.child.lock().unwrap().is_none());
+    }
+
+    mod reply_routing {
+        use super::*;
+        use handy_tts_core::protocol::write_reply;
+
+        fn header(id: u64, status: Status, message: Option<&str>) -> Header {
+            Header {
+                device: None,
+                placement: None,
+                id,
+                status,
+                sample_rate: None,
+                samples: None,
+                message: message.map(str::to_owned),
+            }
+        }
+
+        #[test]
+        fn logs_each_failed_reply_once_whatever_its_route() {
+            let (chunk, chunk_reply) = mpsc::channel();
+            let (busy, busy_reply) = mpsc::channel();
+            let pending: PendingReplies =
+                Arc::new(Mutex::new([(7, chunk), (3, busy)].into_iter().collect()));
+            let mut bytes = Vec::new();
+            for reply in [
+                header(0, Status::Ready, None),
+                header(0, Status::Error, Some("not_enough_memory")),
+                header(7, Status::Error, Some("chunk_failed")),
+                header(3, Status::Error, Some("busy")),
+                header(9, Status::Cancelled, Some("cancelled")),
+            ] {
+                write_reply(&mut bytes, &reply, &[]).unwrap();
+            }
+            let late_ok = Header {
+                sample_rate: Some(24000),
+                samples: Some(1),
+                ..header(5, Status::Ok, None)
+            };
+            write_reply(&mut bytes, &late_ok, &[0.5]).unwrap();
+            let (control, control_replies) = mpsc::channel();
+            let mut logged = Vec::new();
+            route_replies(std::io::Cursor::new(bytes), &pending, &control, |line| {
+                logged.push(line.to_owned())
+            });
+            assert_eq!(
+                logged,
+                [
+                    "TTS worker replied Error to request 0: not_enough_memory",
+                    "TTS worker replied Error to request 7: chunk_failed",
+                    "TTS worker replied Error to request 3: busy",
+                    "TTS worker replied Cancelled to request 9: cancelled",
+                ],
+                "every failed reply is logged once and successful replies are not"
+            );
+            assert_eq!(chunk_reply.try_recv(), Ok(Err(TtsError::Worker)));
+            assert_eq!(busy_reply.try_recv(), Ok(Err(TtsError::Busy)));
+            let control: Vec<_> = control_replies
+                .try_iter()
+                .map(|reply| reply.map(|reply| (reply.header.status, reply.header.message)))
+                .collect();
+            assert_eq!(
+                control,
+                [
+                    Ok((Status::Ready, None)),
+                    Ok((Status::Error, Some("not_enough_memory".into()))),
+                    Err(TtsError::Protocol),
+                ],
+                "id 0 replies reach the load path and the end of the stream fails it"
+            );
+            assert!(pending.lock().unwrap().is_empty());
+        }
+    }
+
+    mod worker_diagnostics {
+        use super::*;
+
+        #[test]
+        fn logs_failure_lines_and_not_progress_lines() {
+            let progress = Arc::default();
+            let mut logged = Vec::new();
+            read_worker_diagnostics(
+                std::io::Cursor::new(
+                    b"handy-tts: chunk failed: kind=OpenVinoGeneralError\n\
+                      HANDY_TTS_PROGRESS {\"state\":\"ready\",\"device\":\"gpu\"}\n\
+                      SYNTH_START lane=1 id=4\n",
+                ),
+                &progress,
+                |line| logged.push(line.to_owned()),
+            );
+            assert_eq!(
+                logged,
+                ["TTS worker reported: chunk failed: kind=OpenVinoGeneralError"],
+                "only the worker's own failure lines are logged"
+            );
+            assert_eq!(
+                *progress.lock().unwrap(),
+                Some(handy_tts_core::device::Preparation::Ready {
+                    device: handy_tts_core::device::Device::Gpu
+                })
+            );
+        }
     }
 }
