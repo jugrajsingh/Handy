@@ -25,6 +25,23 @@ const BUSY_RETRY_WINDOW: Duration = Duration::from_secs(10);
 /// Pause between resubmissions of a request the worker reported busy.
 const BUSY_RETRY_DELAY: Duration = Duration::from_millis(25);
 
+/// Bounds and pacing for resubmitting a request the worker reported busy.
+#[derive(Clone)]
+struct BusyRetry {
+    window: Duration,
+    delay: Duration,
+    pause: Arc<dyn Fn(Duration) + Send + Sync>,
+}
+impl Default for BusyRetry {
+    fn default() -> Self {
+        Self {
+            window: BUSY_RETRY_WINDOW,
+            delay: BUSY_RETRY_DELAY,
+            pause: Arc::new(std::thread::sleep),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ManagerConfig {
     pub root: PathBuf,
@@ -97,6 +114,7 @@ pub struct TtsManager<B: Transport = WorkerBackend> {
     idle_wake: mpsc::SyncSender<()>,
     idle_events: Mutex<Option<mpsc::Receiver<()>>>,
     status_changed: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    busy_retry: BusyRetry,
 }
 fn verify_model(
     root: &Path,
@@ -155,6 +173,7 @@ impl<B: Transport> TtsManager<B> {
             idle_wake,
             idle_events: Mutex::new(Some(idle_events)),
             status_changed: Mutex::new(None),
+            busy_retry: BusyRetry::default(),
             checks,
             started: Instant::now(),
             cancelled_ids: Mutex::default(),
@@ -637,7 +656,7 @@ impl<B: Transport> TtsManager<B> {
                 }
                 return Err(TtsError::Cancelled);
             }
-            let busy_until = std::time::Instant::now() + BUSY_RETRY_WINDOW;
+            let busy_until = std::time::Instant::now() + self.busy_retry.window;
             let (result, generation) = loop {
                 let (receive, timeout, generation) = {
                     let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -681,7 +700,7 @@ impl<B: Transport> TtsManager<B> {
                     },
                 };
                 if result == Err(TtsError::Busy) && std::time::Instant::now() < busy_until {
-                    std::thread::sleep(BUSY_RETRY_DELAY);
+                    (self.busy_retry.pause)(self.busy_retry.delay);
                     continue;
                 }
                 break (result, generation);
@@ -844,6 +863,8 @@ mod tests {
         memory_at_load: bool,
         submit_failures: usize,
         busy_replies: usize,
+        routed: bool,
+        routed_log: Vec<String>,
         limits: Vec<usize>,
         start_gate: Option<Arc<std::sync::Barrier>>,
         start_hook: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -910,6 +931,10 @@ mod tests {
                 return Err(TtsError::Protocol);
             }
             let (send, receive) = mpsc::channel();
+            if trace.routed {
+                route_worker_reply(&mut trace, id, send);
+                return Ok(receive);
+            }
             if trace.busy_replies > 0 {
                 trace.busy_replies -= 1;
                 send.send(Err(TtsError::Busy)).unwrap();
@@ -940,6 +965,33 @@ mod tests {
             self.control.kill();
             self.trace.lock().unwrap().stopped += 1;
         }
+    }
+    /// Answers one submission with real worker reply bytes read by the backend's reply router:
+    /// `busy` for the first `busy_replies` submissions, then one PCM sample.
+    fn route_worker_reply(trace: &mut Trace, id: u64, send: mpsc::Sender<Result<Pcm, TtsError>>) {
+        use crate::tts::backend::{route_replies, PendingReplies};
+        use handy_tts_core::protocol::{write_reply, Header, Status};
+        let busy = trace.busy_replies > 0;
+        let header = Header {
+            device: None,
+            placement: None,
+            id,
+            status: if busy { Status::Error } else { Status::Ok },
+            sample_rate: (!busy).then_some(24000),
+            samples: (!busy).then_some(1),
+            message: busy.then(|| "busy".into()),
+        };
+        if busy {
+            trace.busy_replies -= 1;
+        }
+        let mut bytes = Vec::new();
+        let samples: &[f32] = if busy { &[] } else { &[0.0] };
+        write_reply(&mut bytes, &header, samples).unwrap();
+        let pending: PendingReplies = Arc::new(Mutex::new(BTreeMap::from([(id, send)])));
+        let (control, _control_replies) = mpsc::channel();
+        route_replies(std::io::Cursor::new(bytes), &pending, &control, |line| {
+            trace.routed_log.push(line.to_owned())
+        });
     }
     fn config(choice: RunOn) -> ManagerConfig {
         use device::{DeviceRating, ModelRating};
@@ -1301,6 +1353,94 @@ mod tests {
         assert_eq!(result, Err(TtsError::Cancelled));
         assert!(began.elapsed() < BUSY_RETRY_WINDOW);
         assert_eq!(trace.lock().unwrap().starts.len(), 1);
+    }
+    mod busy_retry {
+        use super::*;
+
+        #[test]
+        fn gives_up_on_the_same_worker_once_the_window_ends() {
+            let trace = Arc::new(Mutex::new(Trace {
+                busy_replies: usize::MAX,
+                ..Default::default()
+            }));
+            let mut model = manager(RunOn::Cpu, trace.clone(), enough);
+            let window = Duration::from_millis(200);
+            let delay = Duration::from_millis(5);
+            let pauses = Arc::new(Mutex::new(Vec::new()));
+            let recorded = pauses.clone();
+            Arc::get_mut(&mut model).unwrap().busy_retry = BusyRetry {
+                window,
+                delay,
+                pause: Arc::new(move |pause| {
+                    recorded.lock().unwrap().push(pause);
+                    std::thread::sleep(pause);
+                }),
+            };
+            model.ensure(&selection()).unwrap();
+            let failed_starts = model.inner.lock().unwrap().lifecycle.failed_starts;
+            let (done, outcome) = mpsc::channel();
+            let request = model.clone();
+            std::thread::spawn(move || {
+                let _ = done.send(request.synthesize(&selection(), 44, "Never gets a lane"));
+            });
+            let Ok(result) = outcome.recv_timeout(Duration::from_secs(5)) else {
+                model.cancel(44);
+                panic!("an always-busy worker must end the retry once its window ends");
+            };
+            assert_eq!(result, Err(TtsError::Busy));
+            assert_eq!(model.status(), State::Ready);
+            assert_eq!(
+                model.inner.lock().unwrap().lifecycle.failed_starts,
+                failed_starts,
+                "busy exhaustion is not a start failure"
+            );
+            let trace = trace.lock().unwrap();
+            assert_eq!(
+                trace.starts.len(),
+                1,
+                "busy replies never restart the worker"
+            );
+            assert_eq!(trace.stopped, 0);
+            let submits = trace.speeds.len();
+            let pauses = pauses.lock().unwrap();
+            assert!(submits >= 2, "a busy reply is resubmitted");
+            assert!(
+                submits as u128 <= window.as_millis() / delay.as_millis() + 1,
+                "{submits} submissions exceed the window"
+            );
+            assert_eq!(pauses.len(), submits - 1, "every resubmission waits first");
+            assert!(
+                pauses.iter().all(|pause| *pause == delay),
+                "every wait lasts the configured delay"
+            );
+        }
+
+        #[test]
+        fn busy_reply_bytes_are_resubmitted_on_the_same_worker() {
+            let trace = Arc::new(Mutex::new(Trace {
+                busy_replies: 2,
+                routed: true,
+                ..Default::default()
+            }));
+            let model = manager(RunOn::Cpu, trace.clone(), enough);
+            model.ensure(&selection()).unwrap();
+            let pcm = model
+                .synthesize(&selection(), 45, "Wait for the lane")
+                .unwrap();
+            assert_eq!((pcm.id, pcm.samples), (45, vec![0.0]));
+            let trace = trace.lock().unwrap();
+            assert_eq!(
+                trace.starts.len(),
+                1,
+                "a busy reply must not restart the worker"
+            );
+            assert_eq!(trace.speeds.len(), 3, "two busy replies then one success");
+            assert_eq!(trace.stopped, 0);
+            assert_eq!(
+                trace.routed_log,
+                ["TTS worker replied Error to request 45: busy"; 2]
+            );
+        }
     }
     #[test]
     fn submission_failure_after_worker_exit_retries_once() {
