@@ -2027,9 +2027,9 @@ mod technical_flag_tests {
 
     #[test]
     fn vocabulary_file_changes_the_prepared_text_for_its_model_only() {
-        let scratch = std::env::var_os("HANDY_TTS_TEST_SCRATCH").unwrap();
-        let directory = std::path::PathBuf::from(scratch)
-            .join(format!("tr4-vocabulary-flag-{}", std::process::id()));
+        let scratch = std::env::var_os("HANDY_TTS_TEST_SCRATCH")
+            .map_or_else(std::env::temp_dir, std::path::PathBuf::from);
+        let directory = scratch.join(format!("tr4-vocabulary-flag-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("vocabulary.json");
         std::fs::write(
@@ -2079,7 +2079,6 @@ mod technical_flag_tests {
             text.push_str(&chunk.text);
             text.push(' ');
         }
-        println!("prepared chunk texts: {text}");
         for expected in [
             "tests slash lib dot S H",
             "fixture underscore base",
