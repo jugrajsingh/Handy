@@ -56,6 +56,20 @@ fn style(component: Component) -> Result<Array3<f32>> {
         component.data.into_iter().flatten().flatten().collect(),
     )?)
 }
+/// Maps prepared text to model token ids, dropping characters the model has no id for.
+fn token_ids(indexer: &[i64], prepared: &str) -> Vec<i64> {
+    let mut previous = None;
+    prepared
+        .chars()
+        .filter(|c| indexer.get(*c as usize).is_some_and(|id| *id >= 0))
+        .filter(|c| {
+            let repeat = *c == ' ' && previous == Some(' ');
+            previous = Some(*c);
+            !repeat
+        })
+        .map(|c| indexer[c as usize])
+        .collect()
+}
 pub(crate) fn prepare_text(text: &str) -> String {
     // Model-specific character normalization from the pinned inference path.
     let mut text: String = text.nfkd().collect();
@@ -148,11 +162,7 @@ impl Supertonic {
         self.cfg.ae.sample_rate
     }
     pub fn synth(&mut self, text: &str, speed: f32) -> Result<Vec<f32>> {
-        let tagged = prepare_text(text);
-        let ids: Vec<i64> = tagged
-            .chars()
-            .map(|c| self.indexer.get(c as usize).copied().unwrap_or(-1))
-            .collect();
+        let ids = token_ids(&self.indexer, &prepare_text(text));
         let n = ids.len();
         let ids = Value::from_array(Array::from_shape_vec((1, n), ids)?)?;
         let text_mask = Value::from_array(Array3::<f32>::ones((1, 1, n)))?;
@@ -212,5 +222,25 @@ impl Supertonic {
             .to_vec();
         pcm.truncate(samples);
         Ok(pcm)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn characters_without_a_model_id_are_dropped() {
+        let mut indexer = vec![-1_i64; 0x2600];
+        for (id, c) in "<en>/ Hiok.".chars().enumerate() {
+            indexer[c as usize] = id as i64;
+        }
+        let prepared = prepare_text("│ Hi ✓ ok ☃");
+        assert!(prepared.contains('│'), "box drawing reaches the indexer");
+        let expected: Vec<i64> = "<en> Hi ok .</en>"
+            .chars()
+            .map(|c| indexer[c as usize])
+            .collect();
+        assert_eq!(token_ids(&indexer, &prepared), expected);
     }
 }
