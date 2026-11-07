@@ -1960,6 +1960,7 @@ mod technical_flag_tests {
             text.push_str(&chunk.text);
             text.push(' ');
         }
+        println!("prepared chunk texts: {text}");
         for expected in [
             "tests slash lib dot S H",
             "fixture underscore base",
