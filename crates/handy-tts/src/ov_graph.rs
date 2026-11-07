@@ -403,12 +403,10 @@ pub fn probe(path: &Path, device: &str, cache: &Path) -> Result<GraphInfo> {
     Ok(CompiledGraph::load(path, device, cache, fixed, 2, false)?.info)
 }
 
-/// Cache folder for the static-shape class graphs. Bump it whenever a graph's
-/// precision changes, so blobs compiled under the old precision are never loaded.
+/// Versioned cache directory for static GPU class graphs.
 const STATIC_CLASS_CACHE: &str = "gpu-static-mixed-v2";
 
-/// Supertonic class graphs that compile at f32. A cached f16 vocoder adds
-/// audible hiss, so only the vector estimator, the slow graph, stays at f16.
+/// Supertonic class graphs compiled with f32 inference precision.
 fn class_full_precision(graph: &str) -> bool {
     matches!(graph, "duration_predictor" | "text_encoder" | "vocoder")
 }
