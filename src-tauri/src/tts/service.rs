@@ -116,11 +116,26 @@ fn read_shortcut_with(
     refused.store(false, Ordering::Release);
     referee.apply(event)
 }
-/// Remembers the popup text after an owner edit so a later capture compares against it.
-fn record_popup_text(referee: &mut Referee, command: &SessionCommand) {
-    if let SessionCommand::Replace { text, .. } = command {
+/// Sends a popup command to the session. A replacement is remembered as the popup text so a
+/// later capture is compared with the owner's edit. Play and autoplay replacements are refused
+/// during a dictation.
+fn forward_reading_command(
+    referee: &mut Referee,
+    command: SessionCommand,
+    send: impl FnOnce(SessionCommand) -> Result<(), String>,
+) -> Result<(), String> {
+    if referee.activity == Activity::Dictating
+        && matches!(
+            command,
+            SessionCommand::Play | SessionCommand::Replace { autoplay: true, .. }
+        )
+    {
+        return Err("tts.errors.busy".into());
+    }
+    if let SessionCommand::Replace { text, .. } = &command {
         referee.popup_text.clone_from(text);
     }
+    send(command)
 }
 fn unavailable_with(error: &str, log: impl FnOnce(&str), notify: impl FnOnce()) {
     log(error);
@@ -384,17 +399,12 @@ impl TtsService {
         }
         self.preview.reading_command(|| {
             let mut referee = self.referee.lock().unwrap_or_else(|p| p.into_inner());
-            if referee.activity == Activity::Dictating
-                && matches!(
-                    command,
-                    SessionCommand::Play | SessionCommand::Replace { autoplay: true, .. }
-                )
-            {
-                return Err("tts.errors.busy".into());
-            }
-            let session = self.ready()?.session;
-            record_popup_text(&mut referee, &command);
-            session.send(command).map_err(|e| e.to_string())
+            forward_reading_command(&mut referee, command, |command| {
+                self.ready()?
+                    .session
+                    .send(command)
+                    .map_err(|e| e.to_string())
+            })
         })
     }
     pub fn preview(&self, chosen: Selection, text: String) -> Result<(), String> {
@@ -1056,49 +1066,62 @@ mod tests {
         };
         ticket
     }
+    fn edit(text: &str) -> SessionCommand {
+        SessionCommand::Replace {
+            client_revision: Some(1),
+            text: text.into(),
+            autoplay: false,
+        }
+    }
     #[test]
-    fn owner_edits_become_the_text_a_later_capture_is_compared_with() {
-        let mut referee = open_popup_referee("copied");
-        record_popup_text(
-            &mut referee,
-            &SessionCommand::Replace {
-                client_revision: Some(1),
-                text: "copied, then edited".into(),
-                autoplay: false,
-            },
-        );
-        let ticket = shortcut_capture(&mut referee);
-        assert_eq!(
-            referee.apply(Event::Clipboard {
-                ticket,
-                text: "copied, then edited".into()
-            }),
-            [Effect::StopReading, Effect::ClosePopup]
-        );
-        let mut referee = open_popup_referee("copied");
-        record_popup_text(
-            &mut referee,
-            &SessionCommand::Replace {
-                client_revision: Some(1),
-                text: "copied, then edited".into(),
-                autoplay: false,
-            },
-        );
-        let ticket = shortcut_capture(&mut referee);
-        assert_eq!(
-            referee.apply(Event::Clipboard {
-                ticket,
-                text: "copied".into()
-            }),
-            [Effect::OpenPopup {
-                text: "copied".into()
-            }]
-        );
+    fn owner_edits_sent_through_the_command_path_are_what_a_later_capture_is_compared_with() {
+        for (clipboard, expected) in [
+            (
+                "copied, then edited",
+                vec![Effect::StopReading, Effect::ClosePopup],
+            ),
+            (
+                "copied",
+                vec![Effect::OpenPopup {
+                    text: "copied".into(),
+                }],
+            ),
+        ] {
+            let mut referee = open_popup_referee("copied");
+            let mut sent = 0;
+            forward_reading_command(&mut referee, edit("copied, then edited"), |_| {
+                sent += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(sent, 1);
+            let ticket = shortcut_capture(&mut referee);
+            assert_eq!(
+                referee.apply(Event::Clipboard {
+                    ticket,
+                    text: clipboard.into()
+                }),
+                expected
+            );
+        }
     }
     #[test]
     fn commands_other_than_a_replacement_leave_the_remembered_popup_text() {
         let mut referee = open_popup_referee("copied");
-        record_popup_text(&mut referee, &SessionCommand::Play);
+        forward_reading_command(&mut referee, SessionCommand::Play, |_| Ok(())).unwrap();
+        assert_eq!(referee.popup_text, "copied");
+    }
+    #[test]
+    fn refused_commands_during_dictation_are_neither_sent_nor_remembered() {
+        let mut referee = open_popup_referee("copied");
+        referee.apply(Event::DictationStart);
+        let command = SessionCommand::Replace {
+            client_revision: None,
+            text: "autoplayed".into(),
+            autoplay: true,
+        };
+        let result = forward_reading_command(&mut referee, command, |_| panic!("sent"));
+        assert_eq!(result, Err("tts.errors.busy".into()));
         assert_eq!(referee.popup_text, "copied");
     }
     #[test]
