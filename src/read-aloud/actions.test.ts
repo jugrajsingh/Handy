@@ -239,3 +239,64 @@ assert.deepEqual(
     "popup Read clipboard: command, ordering and error assertions passed",
   );
 }
+
+for (const interrupt of ["edit", "stop", "close"] as const) {
+  const trace: string[] = [];
+  const settle: (() => void)[] = [];
+  const view: PopupSnapshot = {
+    ...snapshot,
+    text: "typed",
+    state: "playing",
+  };
+  const queued = createPopupActions(
+    () => view,
+    () => {},
+    {
+      play: async () => {},
+      pause: async () => {},
+      stop: async () => {
+        trace.push("stop");
+      },
+      replaceText: async (text) => {
+        await new Promise<void>((resolve) => settle.push(resolve));
+        trace.push(`replace:${text}`);
+      },
+      close: async () => {
+        trace.push("close");
+      },
+      readClipboard: async () => {
+        trace.push("readClipboard");
+      },
+      error: (key) => {
+        trace.push(key);
+      },
+    },
+  );
+  const first = queued.edit("A");
+  const reading = queued.readClipboard();
+  const second =
+    interrupt === "edit"
+      ? queued.edit("B")
+      : interrupt === "stop"
+        ? queued.stop()
+        : queued.close();
+  for (let i = 0; i < 20; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    settle.splice(0).forEach((resolve) => resolve());
+  }
+  await Promise.all([first, reading, second]);
+  assert.equal(
+    trace.includes("readClipboard"),
+    false,
+    `a newer ${interrupt} cancels the queued Read clipboard: ${trace.join(",")}`,
+  );
+  if (interrupt === "edit")
+    assert.equal(
+      trace.includes("replace:B"),
+      true,
+      "the newer edit still lands",
+    );
+}
+console.log(
+  "popup Read clipboard: queued action cancelled by edit, Stop and Close",
+);

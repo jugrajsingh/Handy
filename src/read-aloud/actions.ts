@@ -119,8 +119,9 @@ export function createPopupActions(
     async readClipboard() {
       if (closed) return;
       cancelIntent();
+      const requested = intent;
       if (editing) await writes;
-      if (closed) return;
+      if (requested !== intent || closed) return;
       await attempt(dependencies.readClipboard);
     },
     async close() {
